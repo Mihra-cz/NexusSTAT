@@ -12,7 +12,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from nexusstat.core import ALERT_STATES, State, active_problems, overall_state
+from nexusstat.core import ALERT_STATES, Measurement, State, active_problems, overall_state
 from nexusstat.oled import UNKNOWN_SYMBOL, OledController, home_symbol, page_lines
 from nexusstat.config import CollectorConfig, OledConfig
 from nexusstat.simulate import sample_results
@@ -243,6 +243,20 @@ class CollectTest(FixtureCase):
         self.assertEqual(results[CPU_USAGE_ID].state, State.INFO)
         self.assertEqual(results[CPU_USAGE_ID].summary, "CPU 20 %")
 
+    def test_numeric_values_and_units(self):
+        results = self.by_id(self.collect_twice())
+        # Nezaokrouhlené hodnoty pro prahy; text zůstává zaokrouhlený jako dřív.
+        self.assertEqual(results[CPU_USAGE_ID].measurement, Measurement(20.0, "%"))
+        self.assertEqual(results[CPU_TEMP_ID].measurement, Measurement(55.4, "°C"))
+        self.assertEqual(results[MEMORY_ID].measurement, Measurement(25.0, "%"))
+        self.assertEqual(results[DISK_ROOT_ID].measurement.unit, "%")
+        self.assertAlmostEqual(results[DISK_ROOT_ID].measurement.value, 100 * 10 / 47.5)
+        self.assertEqual(results[CPU_TEMP_ID].summary, "Teplota CPU 55 °C")
+
+    def test_first_cpu_sample_has_no_value(self):
+        cpu = self.by_id(self.monitor().collect(0, OBSERVED))[CPU_USAGE_ID]
+        self.assertEqual((cpu.state, cpu.measurement), (State.UNKNOWN, None))
+
     def test_unchanged_counters_give_unknown(self):
         monitor = self.monitor()
         monitor.collect(10, OBSERVED)
@@ -260,6 +274,13 @@ class CollectTest(FixtureCase):
         monitor = SystemMonitor(validity, proc_dir=self.proc, thermal_dir=self.thermal, statvfs=self.fake_statvfs)
         for result in monitor.collect(100, OBSERVED):
             self.assertEqual(result.expires_monotonic, 121)
+
+    def test_non_finite_validity_is_rejected(self):
+        # Regrese: NaN i nekonečno prošly jako "kladné" a výsledky by nikdy nevypršely.
+        for validity in (float("nan"), float("inf"), 10**400):
+            with self.subTest(validity=validity):
+                with self.assertRaises(ValueError):
+                    SystemMonitor(validity, proc_dir=self.proc)
 
     def test_invalid_validity_is_rejected(self):
         for validity in (0, -30, True, "30", None):
@@ -288,6 +309,7 @@ class PartialFailureTest(FixtureCase):
         results = self.by_id(results)
         self.assertEqual(results[failed_id].state, State.UNKNOWN)
         self.assertEqual(results[failed_id].summary, summary)
+        self.assertIsNone(results[failed_id].measurement)  # chyba měření = hodnota nedostupná
         others = [r for check_id, r in results.items() if check_id not in (failed_id, CPU_USAGE_ID)]
         self.assertTrue(all(result.state is State.INFO for result in others), others)
 
@@ -345,6 +367,7 @@ class PartialFailureTest(FixtureCase):
         results = monitor.collect(10, OBSERVED)
         self.assertEqual(len(results), 4)
         self.assertEqual({result.state for result in results}, {State.UNKNOWN})
+        self.assertEqual({result.measurement for result in results}, {None})
 
 
 class SimulatedFlagTest(FixtureCase):

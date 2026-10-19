@@ -4,10 +4,14 @@ import unittest
 from pathlib import Path
 
 from nexusstat.config import (
+    THRESHOLD_LIMITS,
+    AlarmRule,
+    AlarmsConfig,
     CollectorConfig,
     Config,
     ConfigError,
     OledConfig,
+    alarms_config_from_dict,
     collector_config_from_dict,
     load_config,
     oled_config_from_dict,
@@ -31,7 +35,14 @@ class DefaultsTest(unittest.TestCase):
         # Ostatní sekce (web, alarms, storage) jsou v ukázce jen jako komentář,
         # aby nevypadaly funkčně, dokud je kód nenačítá.
         with open(EXAMPLE_CONFIG, "rb") as file:
-            self.assertEqual(set(tomllib.load(file)), {"oled", "collector"})
+            self.assertEqual(set(tomllib.load(file)), {"oled", "collector", "alarms"})
+
+    def test_example_config_has_no_active_thresholds(self):
+        # Ukázka nesmí obsahovat neodsouhlasené prahy, ani vypnuté.
+        alarms = load_config(EXAMPLE_CONFIG).alarms
+        for rule in (alarms.cpu_temp, alarms.disk_root):
+            self.assertFalse(rule.enabled)
+            self.assertEqual((rule.warning, rule.error, rule.hysteresis), (None, None, None))
 
     def test_missing_keys_use_defaults(self):
         self.assertEqual(oled_config_from_dict({}), OledConfig())
@@ -121,6 +132,142 @@ class CollectorConfigTest(unittest.TestCase):
             collector_config_from_dict(10)
 
 
+# Ilustrační prahy jen pro testy validace; nejde o schválené hodnoty.
+VALID_RULE = {"enabled": True, "warning": 70, "error": 80, "hysteresis": 5}
+
+
+def alarms(name="cpu_temp", **rule):
+    return alarms_config_from_dict({name: rule})
+
+
+class AlarmsConfigTest(unittest.TestCase):
+    def test_defaults_are_disabled_without_thresholds(self):
+        for rule in (AlarmsConfig().cpu_temp, AlarmsConfig().disk_root, AlarmRule()):
+            self.assertFalse(rule.enabled)
+            self.assertEqual((rule.warning, rule.error, rule.hysteresis), (None, None, None))
+            self.assertEqual((rule.confirm_count, rule.clear_count), (3, 2))
+        self.assertEqual(Config().alarms, AlarmsConfig())
+        self.assertEqual(alarms_config_from_dict({}), AlarmsConfig())
+
+    def test_valid_rules(self):
+        config = alarms(**VALID_RULE)
+        self.assertEqual(config.cpu_temp, AlarmRule(True, 70, 80, 5))
+        self.assertEqual(config.disk_root, AlarmRule())
+        disk = alarms("disk_root", enabled=True, warning=85.5, error=95, hysteresis=0, confirm_count=1, clear_count=5)
+        self.assertEqual(disk.disk_root, AlarmRule(True, 85.5, 95, 0, 1, 5))
+
+    def test_disabled_rule_may_keep_prepared_thresholds(self):
+        rule = alarms(**{**VALID_RULE, "enabled": False}).cpu_temp
+        self.assertFalse(rule.enabled)
+        self.assertEqual(rule.warning, 70)
+
+    def test_enabled_requires_all_thresholds(self):
+        for missing in ("warning", "error", "hysteresis"):
+            rule = {key: value for key, value in VALID_RULE.items() if key != missing}
+            with self.subTest(missing=missing):
+                with self.assertRaises(ConfigError):
+                    alarms(**rule)
+        with self.assertRaises(ConfigError):
+            alarms(enabled=True)
+
+    def test_partial_thresholds_rejected_even_when_disabled(self):
+        with self.assertRaises(ConfigError):
+            alarms(enabled=False, warning=70)
+
+    def test_error_must_be_above_warning(self):
+        for warning, error in ((80, 80), (80, 70)):
+            with self.subTest(warning=warning, error=error):
+                with self.assertRaises(ConfigError):
+                    alarms(**{**VALID_RULE, "warning": warning, "error": error})
+
+    def test_hysteresis_range(self):
+        # Záporná, nebo tak velká, že by pásmo ERROR sahalo pod práh WARNING.
+        for hysteresis in (-1, 10, 15):
+            with self.subTest(hysteresis=hysteresis):
+                with self.assertRaises(ConfigError):
+                    alarms(**{**VALID_RULE, "hysteresis": hysteresis})
+        self.assertEqual(alarms(**{**VALID_RULE, "hysteresis": 9.9}).cpu_temp.hysteresis, 9.9)
+
+    def test_clear_level_must_be_reachable(self):
+        # Disk nemůže mít méně než 0 %: závada s warning − hysteresis ≤ 0 by nikdy neodezněla.
+        with self.assertRaises(ConfigError):
+            alarms("disk_root", enabled=True, warning=5, error=90, hysteresis=5)
+        self.assertTrue(alarms("disk_root", enabled=True, warning=5, error=90, hysteresis=4.9).disk_root.enabled)
+
+    def test_thresholds_within_quantity_range(self):
+        invalid = [
+            ("cpu_temp", 0, 80), ("cpu_temp", -10, 80), ("cpu_temp", 70, 126),
+            ("disk_root", 0, 90), ("disk_root", 85, 101),
+        ]
+        for name, warning, error in invalid:
+            with self.subTest(name=name, warning=warning, error=error):
+                with self.assertRaises(ConfigError):
+                    alarms(name, enabled=True, warning=warning, error=error, hysteresis=0)
+        self.assertEqual(alarms("cpu_temp", enabled=True, warning=100, error=125, hysteresis=1).cpu_temp.error, 125)
+        self.assertEqual(alarms("disk_root", enabled=True, warning=90, error=100, hysteresis=1).disk_root.error, 100)
+
+    def test_temperature_limit_matches_collector_plausibility(self):
+        from nexusstat.system_monitor import MAX_PLAUSIBLE_CELSIUS, MIN_PLAUSIBLE_CELSIUS
+        self.assertEqual(THRESHOLD_LIMITS["cpu_temp"], (MIN_PLAUSIBLE_CELSIUS, MAX_PLAUSIBLE_CELSIUS))
+
+    def test_invalid_types(self):
+        cases = [
+            {"enabled": "true"}, {"enabled": 1},
+            {"warning": True}, {"warning": "70"}, {"warning": float("nan")}, {"error": float("inf")},
+            {"hysteresis": None},
+        ]
+        for change in cases:
+            with self.subTest(change=change):
+                with self.assertRaises(ConfigError):
+                    alarms(**{**VALID_RULE, **change})
+
+    def test_non_finite_thresholds_and_hysteresis(self):
+        for key in ("warning", "error", "hysteresis"):
+            for value in (float("nan"), float("inf"), -float("inf"), True, False):
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(ConfigError):
+                        alarms(**{**VALID_RULE, key: value})
+
+    def test_huge_integer_is_config_error(self):
+        # Regrese: TOML dovolí libovolně velké celé číslo; dříve OverflowError místo ConfigError.
+        for key in ("warning", "error", "hysteresis"):
+            with self.subTest(key=key):
+                with self.assertRaises(ConfigError):
+                    alarms(**{**VALID_RULE, key: 10**400})
+
+    def test_hysteresis_equal_to_decimal_gap_is_rejected(self):
+        # Regrese: 75.2 − 70.1 je ve float 5.1000000000000085, takže hystereze 5.1
+        # (přesně rovná odstupu prahů) dříve prošla.
+        with self.assertRaises(ConfigError):
+            alarms(enabled=True, warning=70.1, error=75.2, hysteresis=5.1)
+        self.assertEqual(alarms(enabled=True, warning=70.1, error=75.2, hysteresis=5.0).cpu_temp.error_hold, 70.2)
+
+    def test_invalid_counts(self):
+        for key in ("confirm_count", "clear_count"):
+            for value in (0, -1, 61, 2.5, True, "3"):
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(ConfigError):
+                        alarms(**{key: value})
+
+    def test_unknown_names_and_keys(self):
+        for section in ({"cpu_usage": {}}, {"show_warning_triangle": False},
+                        {"cpu_temp": {"critical": 90}}, {"cpu_temp": {"enable": True}}):
+            with self.subTest(section=section):
+                with self.assertRaises(ConfigError):
+                    alarms_config_from_dict(section)
+
+    def test_rule_must_be_table(self):
+        with self.assertRaises(ConfigError):
+            alarms_config_from_dict({"cpu_temp": True})
+        with self.assertRaises(ConfigError):
+            alarms_config_from_dict(5)
+
+    def test_error_message_names_rule(self):
+        with self.assertRaises(ConfigError) as raised:
+            alarms("disk_root", enabled=True, warning=95, error=85, hysteresis=1)
+        self.assertIn("[alarms.disk_root]", str(raised.exception))
+
+
 class LoadFileTest(unittest.TestCase):
     def load_text(self, text):
         with tempfile.TemporaryDirectory() as directory:
@@ -168,6 +315,26 @@ class LoadFileTest(unittest.TestCase):
         # že ji volající (např. simulátor) zrovna nepotřebuje.
         with self.assertRaises(ConfigError):
             self.load_text("[oled]\npage_seconds = 6\n\n[collector]\ninterval = 10\n")
+
+    def test_alarms_from_file(self):
+        config = self.load_text(
+            "[alarms.cpu_temp]\nenabled = true\nwarning = 70\nerror = 80.5\nhysteresis = 4\n"
+        )
+        self.assertEqual(config.alarms.cpu_temp, AlarmRule(True, 70, 80.5, 4))
+        self.assertEqual(config.alarms.disk_root, AlarmRule())
+        self.assertEqual((config.oled, config.collector), (OledConfig(), CollectorConfig()))
+
+    def test_invalid_alarms_reject_whole_file(self):
+        for text in (
+            "[alarms.cpu_temp]\nwarning = 1" + "0" * 400 + "\nerror = 80\nhysteresis = 1\n",
+            "[alarms.cpu_temp]\nenabled = true\n",
+            "[alarms.cpu_temp]\nenabled = true\nwarning = 80\nerror = 70\nhysteresis = 1\n",
+            "[alarms.cpu_temp]\nwarning = inf\nerror = 80\nhysteresis = 1\n",
+            "[alarms.fan]\nenabled = false\n",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ConfigError):
+                    self.load_text(text)
 
     def test_strict_oled_validation_is_kept(self):
         for text in ("[oled]\npage_second = 6\n", "[oled]\nwidth = 256\n", "[oled]\nhome_title = \"X\"\n"):

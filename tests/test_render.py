@@ -2,13 +2,24 @@
 
 import unittest
 from datetime import datetime, timezone
+from itertools import product
 
 from nexusstat.config import OledConfig
 from nexusstat.core import CheckResult, State
-from nexusstat.oled import CAROUSEL_PAGES, OledController
+from nexusstat.oled import CAROUSEL_PAGES, STATE_TEXT, OledController, service_rows
+from nexusstat.services import SERVICE_LABELS, complete_service_results
+from nexusstat.simulate import sample_results
 
 try:
-    from nexusstat.render import SYMBOL_BOX, render_screen
+    from PIL import Image, ImageDraw
+
+    from nexusstat.render import (
+        SERVICES_ROWS_PER_PAGE,
+        SYMBOL_BOX,
+        font,
+        layout_service_rows,
+        render_screen,
+    )
 except ImportError:  # Pillow není nainstalované
     render_screen = None
 
@@ -130,6 +141,132 @@ class PagesRenderTest(RenderCase):
         # Zbyl jediný problém: vykreslí se poslední existující stránka, žádná výjimka.
         image = self.render(many[:1], now=3)
         self.assertFalse(is_blank(image))
+
+
+@unittest.skipIf(render_screen is None, "Pillow není dostupné")
+class ServicesRenderTest(RenderCase):
+    def services(self, results):
+        self.controller = OledController(OledConfig())
+        self.controller.press(0, problem_count=0)
+        self.assertEqual(self.controller.current_page(30), "SERVICES")  # čtvrtá stránka po 30 s
+        return self.render(results, now=30)
+
+    def test_layout_fits_128x64_for_every_label_and_state(self):
+        draw = ImageDraw.Draw(Image.new("1", (128, 64)))
+        row_font = font(11)
+        self.assertLessEqual(len(SERVICE_LABELS), SERVICES_ROWS_PER_PAGE)
+        # Nejhorší kombinace: každý název s každým textem stavu na každém řádku.
+        for label, state in product(SERVICE_LABELS.values(), set(STATE_TEXT.values())):
+            rows = [(label, state)] * SERVICES_ROWS_PER_PAGE
+            boxes = [
+                (draw.textbbox(label_xy, label, font=row_font), draw.textbbox(state_xy, state, font=row_font))
+                for label_xy, state_xy in layout_service_rows(draw, rows)
+            ]
+            for index, (label_box, state_box) in enumerate(boxes):
+                with self.subTest(label=label, state=state, row=index):
+                    # textbbox: levý a horní okraj včetně, pravý a dolní bez (jako crop).
+                    for box in (label_box, state_box):
+                        self.assertGreater(box[1], 15)  # pod oddělovací čarou nadpisu
+                        self.assertLessEqual(box[3], 64)
+                        self.assertGreaterEqual(box[0], 0)
+                        self.assertLessEqual(box[2], 128)
+                    self.assertLess(label_box[2] + 4, state_box[0])  # název a stav se nedotýkají
+                    if index + 1 < len(boxes):
+                        self.assertLess(max(label_box[3], state_box[3]), min(boxes[index + 1][0][1], boxes[index + 1][1][1]))
+
+    def test_title_and_sim_mark_do_not_overlap(self):
+        draw = ImageDraw.Draw(Image.new("1", (128, 64)))
+        title = draw.textbbox((0, 0), "SLUŽBY", font=font(12, bold=True))
+        mark_font = font(9, bold=True)
+        sim_left = 127 - draw.textlength("SIM", font=mark_font)
+        self.assertLess(title[2] + 4, sim_left)
+
+    def test_state_text_is_not_clipped(self):
+        # Stav vpravo končí sloupcem 126; sloupec 127 zůstává prázdný (žádné oříznutí).
+        for state in set(STATE_TEXT.values()):
+            rows = [("NAS", state)]
+            image = Image.new("1", (128, 64))
+            draw = ImageDraw.Draw(image)
+            [(_, state_xy)] = layout_service_rows(draw, rows)
+            draw.text(state_xy, state, font=font(11), fill=1)
+            with self.subTest(state=state):
+                self.assertIsNone(image.crop((127, 0, 128, 64)).getbbox())
+                self.assertIsNotNone(image.crop((120, 0, 127, 64)).getbbox())
+
+    def test_every_row_is_drawn_left_and_right(self):
+        image = self.services(sample_results(OBSERVED))
+        for index in range(SERVICES_ROWS_PER_PAGE):
+            top = 14 + index * 12
+            with self.subTest(row=index):
+                self.assertIsNotNone(image.crop((0, top + 2, 60, top + 13)).getbbox())  # název
+                self.assertIsNotNone(image.crop((90, top + 2, 128, top + 13)).getbbox())  # stav
+
+    def test_simulated_services_have_sim_mark(self):
+        simulated = self.services(sample_results(OBSERVED))
+        self.assertIsNotNone(simulated.crop((100, 0, 128, 13)).getbbox())
+        real = self.services(complete_service_results([], OBSERVED, 1000))
+        self.assertIsNone(real.crop((100, 0, 128, 13)).getbbox())
+
+    def test_unknown_services_differ_from_ok(self):
+        ok = [CheckResult(i, State.OK, "ok", OBSERVED, 1000, simulated=False) for i in SERVICE_LABELS]
+        self.assertNotEqual(self.services(ok).tobytes(), self.services([]).tobytes())
+        # Bez kolektorů nikde OK: UNKN a N/A se kreslí jinak.
+        unmonitored = complete_service_results([], OBSERVED, 1000)
+        self.assertEqual(service_rows(unmonitored, 30)[0], ("NEXUS", "UNKN"))
+        self.assertNotEqual(self.services(unmonitored).tobytes(), self.services(ok).tobytes())
+
+    def test_services_page_differs_from_value_pages(self):
+        results = sample_results(OBSERVED)
+        services = self.services(results).tobytes()
+        self.controller = OledController(OledConfig())
+        self.controller.press(0, problem_count=0)
+        disk = self.render(results, now=20).tobytes()
+        self.assertNotEqual(services, disk)
+
+
+@unittest.skipIf(render_screen is None, "Pillow není dostupné")
+class ServiceConsistencyRenderTest(RenderCase):
+    """Neznámé služby jsou vidět i na stránce NEXUS ("?") a ve STATUS, nejen na SLUŽBY."""
+
+    def real_results(self):
+        system = [CheckResult(i, State.INFO, "50 %", OBSERVED, 1000, simulated=False) for i in ("a", "b")]
+        return complete_service_results(system, OBSERVED, 1000)
+
+    def test_nexus_page_shows_question_mark(self):
+        question = symbol_area(self.nexus([result("u", State.UNKNOWN)]))
+        self.assertEqual(symbol_area(self.nexus(self.real_results())), question)
+
+    def test_status_lists_unknown_services(self):
+        # Tři neznámé služby: STATUS není "NO ACTIVE ISSUES" (to by tvrdilo, že nic nechybí).
+        with_unknown = self.status(self.real_results()).tobytes()
+        no_issues = self.status([result("ok", State.OK)]).tobytes()
+        self.assertNotEqual(with_unknown, no_issues)
+
+
+@unittest.skipIf(render_screen is None, "Pillow není dostupné")
+class TextFitTest(unittest.TestCase):
+    """Zkrácený text se měří podle skutečně vykreslených znaků, ne podle šířky pro posun."""
+
+    def test_fitted_text_ink_stays_inside(self):
+        from nexusstat.render import fit_text, ink_width
+        draw = ImageDraw.Draw(Image.new("1", (400, 40)))
+        # Regrese: tyto texty se vešly podle šířky pro posun, ale inkoust přesáhl o 1 px.
+        cases = [("chybí disk.smart: v", 10, 95), ("Záloha Teplota Čas", 10, 95), ("pro 26 h v Záloha čtení", 11, 128)]
+        for text, size, max_width in cases:
+            with self.subTest(text=text):
+                self.assertLessEqual(ink_width(draw, fit_text(draw, text, font(size), max_width), font(size)), max_width)
+
+    def test_many_czech_texts_fit(self):
+        import random
+        from nexusstat.render import fit_text, ink_width
+        draw = ImageDraw.Draw(Image.new("1", (400, 40)))
+        rng = random.Random(4)
+        alphabet = "aábcčdďeéěfghiíjklmnňoópqrřsštťuúůvwxyýzžAÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ0123456789 %°/:.,-"
+        for _ in range(300):  # explicitní regrese jsou v testu výše; tady šíře vzorku
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randint(3, 35)))
+            for size, max_width in ((10, 95), (11, 128)):
+                fitted = fit_text(draw, text, font(size), max_width)
+                self.assertLessEqual(ink_width(draw, fitted, font(size)), max_width, (text, fitted))
 
 
 @unittest.skipIf(render_screen is None, "Pillow není dostupné")

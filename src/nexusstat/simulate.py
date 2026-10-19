@@ -18,6 +18,7 @@ from pathlib import Path
 from .config import Config, load_config
 from .core import CheckResult, State, active_problems
 from .oled import CAROUSEL_PAGES, Mode, OledController
+from .services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
 
 # Snímky se ukládají zvětšené, aby byly 128 × 64 pixely na monitoru čitelné.
@@ -25,9 +26,11 @@ PNG_SCALE = 4
 
 
 def sample_results(observed_utc):
-    """Fiktivní výsledky kontrol: od t=5 s 5 aktivních problémů, tj. 2 stránky STATUS.
+    """Fiktivní výsledky kontrol: od t=5 s 6 aktivních problémů, tj. 2 stránky STATUS.
 
     Všechny jsou označené simulated=True, takže displej ukazuje značku SIM.
+    Služby odpovídají ukázce stránky SLUŽBY (NEXUS, ANIMEDB a NAS OK, BACKUP WARN);
+    ostatní fiktivní problémy jim proto neodporují.
     """
     valid = 10_000  # monotónní sekundy, dost dlouho na celý scénář
 
@@ -36,12 +39,12 @@ def sample_results(observed_utc):
 
     return [
         sim("system.load", State.OK, "Zátěž v normě"),
-        sim("backup.restic", State.ERROR, "Záloha starší 26 h"),
-        sim("nas.anime", State.CRITICAL, "NAS anime nedostupný"),
+        sim("disk.root_readonly", State.CRITICAL, "Disk / jen pro čtení"),
+        sim("system.time_sync", State.ERROR, "Čas nesynchronizován"),
         sim("disk.nvme_temp", State.WARNING, "NVMe 71 °C"),
         sim("docker.engine", State.UNKNOWN, "Docker: stav neznámý"),
         # N/A s krátkou platností: neexpiruje, zůstane N/A po celý scénář.
-        sim("animedb", State.NA, "AnimeDB není nasazena", expires=1),
+        sim("public.status", State.NA, "Veřejný status vypnut", expires=1),
         # Výsledek s prošlou platností: v čase scénáře se z OK stane UNKNOWN.
         sim("disk.smart", State.OK, "SMART bez chyb", expires=5),
         # Fiktivní hodnoty pro stránky SYSTEM a DISK (stejná id jako kolektor).
@@ -49,6 +52,11 @@ def sample_results(observed_utc):
         sim(CPU_TEMP_ID, State.INFO, "Teplota CPU 48 °C"),
         sim(MEMORY_ID, State.INFO, "RAM 24 % z 7,9 GiB"),
         sim(DISK_ROOT_ID, State.INFO, "Disk / 31 % z 117 GiB"),
+        # Fiktivní stavy služeb pro stránku SLUŽBY (skutečné kolektory zatím nejsou).
+        sim(NEXUS_SERVICES_ID, State.OK, "Služby Nexusu běží"),
+        sim(ANIMEDB_ID, State.OK, "AnimeDB odpovídá"),
+        sim(NAS_ID, State.OK, "NAS dostupný"),
+        sim(BACKUP_ID, State.WARNING, "Záloha starší 26 h"),
     ]
 
 
@@ -56,14 +64,16 @@ def sample_results(observed_utc):
 SCENARIO = [
     (0, "wait"),
     (1, "press"),  # probuzení na NEXUS
-    (11, "wait"),  # další stránka kolotoče
-    (21, "wait"),
-    (25, "press"),  # STATUS 1/2
-    (30, "press"),  # STATUS 2/2
-    (35, "press"),  # z poslední stránky zpět na NEXUS, nové okno
-    (40, "press"),  # STATUS 1/2
-    (70, "wait"),  # 30 s bez stisku → zpět do kolotoče
-    (370, "wait"),  # 300 s od návratu → spánek
+    (11, "wait"),  # SYSTEM
+    (21, "wait"),  # DISK
+    (31, "wait"),  # SERVICES (na displeji SLUŽBY)
+    (41, "wait"),  # kolotoč dokola: znovu NEXUS
+    (45, "press"),  # STATUS 1/2
+    (50, "press"),  # STATUS 2/2
+    (55, "press"),  # z poslední stránky zpět na NEXUS, nové okno
+    (60, "press"),  # STATUS 1/2
+    (90, "wait"),  # 30 s bez stisku → zpět do kolotoče
+    (390, "wait"),  # 300 s od návratu → spánek
 ]
 
 
@@ -118,7 +128,12 @@ def run_live(output_dir, config):
     monitor.collect(time.monotonic(), datetime.now(timezone.utc))  # první vzorek CPU
     time.sleep(1)
     now = time.monotonic()
-    results = monitor.collect(now, datetime.now(timezone.utc))
+    observed_utc = datetime.now(timezone.utc)
+    # Kolektory služeb zatím nejsou: NEXUS, NAS a BACKUP jsou UNKNOWN (bez dat)
+    # na všech obrazovkách, AnimeDB je známě nenasazená, tedy N/A.
+    results = complete_service_results(
+        monitor.collect(now, observed_utc), observed_utc, now + config.collector.validity_seconds
+    )
     for result in results:
         print(f"{result.id:<17} {result.state.value:<8} {result.summary}")
 

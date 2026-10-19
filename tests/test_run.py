@@ -8,8 +8,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from nexusstat.config import CollectorConfig, OledConfig
-from nexusstat.core import CheckResult, State, active_problems, effective, overall_state
+from nexusstat.alarms import AlarmEvaluator
+from nexusstat.config import AlarmRule, AlarmsConfig, CollectorConfig, OledConfig
+from nexusstat.core import CheckResult, Measurement, State, active_problems, effective, overall_state
 from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol, page_lines
 from nexusstat.run import failed_results, format_line, main, run_loop
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS, MEMORY_ID
@@ -68,6 +69,7 @@ class FakeCollector:
         self.duration = duration  # doba jednoho měření
         self.stalls = {}  # pořadí měření (od 1) -> sekundy navíc (zaseknuté měření)
         self.errors = {}  # pořadí měření (od 1) -> výjimka místo výsledků
+        self.temperatures = []  # volitelně: číselná teplota CPU pro jednotlivá měření
         self.calls = []  # monotónní časy `now` předané kolektoru
         self.finished = []  # kdy byly výsledky k dispozici (konec měření)
         self.returned = []
@@ -84,18 +86,29 @@ class FakeCollector:
             CheckResult(check_id, State.INFO, summary, observed_utc, now + CONFIG.validity_seconds, simulated=True)
             for check_id, summary in VALUES.items()
         ]
+        if self.temperatures:
+            celsius = self.temperatures[number - 1]
+            results[1] = CheckResult(
+                CPU_TEMP_ID, State.INFO, f"Teplota CPU {celsius:.0f} °C", observed_utc, now + CONFIG.validity_seconds,
+                simulated=True, measurement=Measurement(celsius, "°C"),
+            )
         self.finished.append(self.clock.now)
         self.returned.append(results)
         return results
 
 
-def run(clock, collector, config=CONFIG, utc_clock=None):
+def run(clock, collector, config=CONFIG, utc_clock=None, alarms=AlarmsConfig()):
     """Spustí smyčku se simulovaným časem; vrací (poslední výsledky, řádky výpisu)."""
     lines = []
     results = run_loop(
-        collector, config, clock=clock, utc_clock=utc_clock or clock.utc, sleep=clock.sleep, output=lines.append
+        collector, config, AlarmEvaluator(alarms),
+        clock=clock, utc_clock=utc_clock or clock.utc, sleep=clock.sleep, output=lines.append,
     )
     return results, lines
+
+
+# Ilustrační prahy jen pro testy; nejde o schválené provozní hodnoty.
+TEMP_RULE = AlarmsConfig(cpu_temp=AlarmRule(enabled=True, warning=70, error=80, hysteresis=5))
 
 
 def offsets(times):
@@ -305,7 +318,7 @@ class TerminationTest(unittest.TestCase):
         self.assertFalse(any("selhalo" in line for line in lines))
         self.assertEqual(lines[-1], "\nUkončeno (Ctrl+C), počet měření: 2.")
         # Vrátí poslední dokončené měření, ne náhradní UNKNOWN.
-        self.assertIs(results, collector.returned[-1])
+        self.assertEqual(results, collector.returned[-1])
 
     def test_ctrl_c_before_first_measurement(self):
         clock = FakeClock(stop_at=START + 1000)
@@ -321,6 +334,7 @@ class OutputTest(unittest.TestCase):
         clock = FakeClock(stop_at=START + 15)
         _, lines = run(clock, FakeCollector(clock))
         self.assertIn("každých 10 s, platnost výsledků 30 s", lines[0])
+        self.assertIn("Prahy: Teplota CPU vypnuto; Disk / vypnuto", lines[0])
         self.assertIn("Ctrl+C", lines[0])
         self.assertEqual(
             lines[1],
@@ -334,6 +348,50 @@ class OutputTest(unittest.TestCase):
 
     def test_no_results_are_not_ok(self):
         self.assertIn(" UNKNOWN ", format_line([], START, START_UTC, ""))
+
+
+class AlarmLoopTest(unittest.TestCase):
+    def test_default_config_never_raises_alarm(self):
+        clock = FakeClock(stop_at=START + 55)
+        collector = FakeCollector(clock)
+        collector.temperatures = [95] * 6
+        results, lines = run(clock, collector)
+        self.assertNotIn("WARNING", "".join(lines[1:]))
+        self.assertNotIn("ERROR", "".join(lines[1:]))
+        self.assertIs(overall_state(results, START + 50), State.INFO)
+
+    def test_loop_reports_confirmed_alarm_and_which_value(self):
+        clock = FakeClock(stop_at=START + 55)
+        collector = FakeCollector(clock)
+        collector.temperatures = [60, 72, 72, 72, 85, 85]
+        results, lines = run(clock, collector, alarms=TEMP_RULE)
+        self.assertIn("Prahy: Teplota CPU WARNING od 70 °C, ERROR od 80 °C; Disk / vypnuto", lines[0])
+        states = [line.split()[4] for line in lines[1:7]]  # za "UTC  SIM"
+        self.assertEqual(states, ["INFO", "INFO", "INFO", "WARNING", "WARNING", "WARNING"])
+        self.assertIn("Teplota CPU 72 °C [WARNING]", lines[4])
+        self.assertIn("CPU 5 % |", lines[4])  # ostatní hodnoty beze značky
+        self.assertTrue(lines[4].startswith("2026-10-19 12:00:30 UTC  SIM WARNING"))  # simulace je vidět
+        temperature = results[1]
+        self.assertEqual((temperature.state, temperature.measurement.value), (State.WARNING, 85))
+
+    def test_collector_failure_interrupts_confirmation(self):
+        clock = FakeClock(stop_at=START + 55)
+        collector = FakeCollector(clock)
+        collector.temperatures = [72, 72, None, 72, 72, 72]
+        collector.errors = {3: RuntimeError("simulovaný výpadek")}
+        _, lines = run(clock, collector, alarms=TEMP_RULE)
+        states = [line.split()[4] for line in lines[1:7]]
+        # Výpadek přeruší řadu: WARNING až po třech platných měřeních po něm.
+        self.assertEqual(states, ["INFO", "INFO", "UNKNOWN", "INFO", "INFO", "WARNING"])
+
+    def test_collector_failure_does_not_resolve_alarm(self):
+        clock = FakeClock(stop_at=START + 65)
+        collector = FakeCollector(clock)
+        collector.temperatures = [72, 72, 72, None, 50, 50, 50]
+        collector.errors = {4: RuntimeError("simulovaný výpadek")}
+        _, lines = run(clock, collector, alarms=TEMP_RULE)
+        states = [line.split()[4] for line in lines[1:8]]
+        self.assertEqual(states, ["INFO", "INFO", "WARNING", "UNKNOWN", "WARNING", "INFO", "INFO"])
 
 
 class OledCompatibilityTest(unittest.TestCase):
@@ -373,16 +431,23 @@ class MainTest(unittest.TestCase):
 
     def test_validity_derived_from_configured_interval(self):
         run_loop_mock, _ = self.run_main(["--config", self.write_config("[collector]\ninterval_seconds = 5\n")])
-        monitor, config = run_loop_mock.call_args.args
+        monitor, config, _ = run_loop_mock.call_args.args
         self.assertEqual(config, CollectorConfig(interval_seconds=5))
         self.assertEqual(monitor.validity_seconds, 15)
         self.assertFalse(monitor.simulated)  # skutečný read-only kolektor
 
     def test_defaults_without_config(self):
         run_loop_mock, _ = self.run_main([])
-        monitor, config = run_loop_mock.call_args.args
+        monitor, config, evaluator = run_loop_mock.call_args.args
         self.assertEqual(config, CollectorConfig())
         self.assertEqual(monitor.validity_seconds, 30)
+        self.assertFalse(any(rule.enabled for rule, _ in evaluator.rules.values()))
+
+    def test_alarm_rules_from_config(self):
+        text = "[alarms.disk_root]\nenabled = true\nwarning = 85\nerror = 95\nhysteresis = 3\n"
+        run_loop_mock, _ = self.run_main(["--config", self.write_config(text)])
+        _, _, evaluator = run_loop_mock.call_args.args
+        self.assertEqual(evaluator.describe(), "Teplota CPU vypnuto; Disk / WARNING od 85 %, ERROR od 95 %")
 
     def test_invalid_config_stops_before_measuring(self):
         cases = {
@@ -390,6 +455,8 @@ class MainTest(unittest.TestCase):
             "neznámý klíč": "[collector]\nvalidity_seconds = 30\n",
             "neplatné OLED": "[oled]\npage_seconds = 0\n",
             "neznámá sekce": "[web]\nadmin_port = 8765\n",
+            # Regrese: obří celé číslo shodilo main() tracebackem (OverflowError, kód 1).
+            "obří číslo": "[alarms.cpu_temp]\nwarning = 1" + "0" * 400 + "\nerror = 80\nhysteresis = 1\n",
         }
         for name, text in cases.items():
             with self.subTest(name):

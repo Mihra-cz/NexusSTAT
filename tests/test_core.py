@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from nexusstat.core import (
     CheckResult,
+    Measurement,
     State,
     active_problems,
     effective,
@@ -120,6 +121,57 @@ class OverallStateTest(unittest.TestCase):
         self.assertEqual(overall_state(results, now=10), State.UNKNOWN)
 
 
+class MeasurementTest(unittest.TestCase):
+    def test_valid_measurement(self):
+        self.assertEqual(Measurement(55.4, "°C").value, 55.4)
+        self.assertEqual(Measurement(21, "%").unit, "%")
+
+    def test_invalid_value(self):
+        for value in (float("nan"), float("inf"), -float("inf"), True, "55", None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    Measurement(value, "°C")
+
+    def test_huge_integer_is_rejected_as_value_error(self):
+        # Regrese: 10**400 vyvolalo OverflowError místo srozumitelné ValueError.
+        with self.assertRaises(ValueError):
+            Measurement(10**400, "°C")
+
+    def test_invalid_unit(self):
+        for unit in ("", None, 5):
+            with self.subTest(unit=unit):
+                with self.assertRaises(ValueError):
+                    Measurement(1.0, unit)
+
+    def test_result_keeps_measurement(self):
+        check = CheckResult("t", State.INFO, "Teplota 55 °C", OBSERVED, 60, simulated=False,
+                            measurement=Measurement(55.4, "°C"))
+        self.assertEqual(effective(check, now=10).measurement, Measurement(55.4, "°C"))
+        self.assertIsNone(result("x", State.INFO).measurement)  # výchozí: bez číselné hodnoty
+
+    def test_unknown_and_na_cannot_have_value(self):
+        # Neznámý stav s číslem by se dal omylem vyhodnotit jako platné měření.
+        for state in (State.UNKNOWN, State.NA):
+            with self.subTest(state=state):
+                with self.assertRaises(ValueError):
+                    CheckResult("x", state, "popis", OBSERVED, 60, simulated=False, measurement=Measurement(1, "%"))
+
+    def test_measurement_type_is_checked(self):
+        with self.assertRaises(TypeError):
+            CheckResult("x", State.INFO, "popis", OBSERVED, 60, simulated=False, measurement=55.4)
+
+    def test_expiry_removes_value(self):
+        for state in (State.INFO, State.WARNING, State.ERROR):
+            with self.subTest(state=state):
+                check = CheckResult("t", state, "Teplota 90 °C", OBSERVED, 60, simulated=True,
+                                    measurement=Measurement(90, "°C"))
+                stale = effective(check, now=60)
+                self.assertIs(stale.state, State.UNKNOWN)
+                self.assertIsNone(stale.measurement)
+                self.assertTrue(stale.simulated)
+                self.assertEqual(stale.observed_utc, OBSERVED)
+
+
 class MonitorDataTest(unittest.TestCase):
     def test_has_monitor_data(self):
         self.assertFalse(has_monitor_data([]))
@@ -152,6 +204,13 @@ class CheckResultTest(unittest.TestCase):
         for expires in (OBSERVED, True, "60"):
             with self.subTest(expires=expires):
                 with self.assertRaises(TypeError):
+                    CheckResult("x", State.OK, "popis", OBSERVED, expires, simulated=False)
+
+    def test_expiry_must_be_finite(self):
+        # Regrese: NaN nebo nekonečná platnost by nikdy nevypršela na UNKNOWN.
+        for expires in (float("nan"), float("inf"), -float("inf"), 10**400):
+            with self.subTest(expires=expires):
+                with self.assertRaises(ValueError):
                     CheckResult("x", State.OK, "popis", OBSERVED, expires, simulated=False)
 
     def test_simulated_flag_is_explicit(self):

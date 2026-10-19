@@ -8,6 +8,7 @@ a nemusí skutečně čekat.
 from enum import Enum
 
 from .core import ALERT_STATES, State, effective, overall_state
+from .services import SERVICE_LABELS
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS, MEMORY_ID
 
 
@@ -18,7 +19,8 @@ class Mode(Enum):
 
 
 # Stránky kolotoče. První musí být NEXUS, protože na ni vede každý návrat.
-CAROUSEL_PAGES = ("NEXUS", "SYSTEM", "DISK")
+# SERVICES se na displeji jmenuje SLUŽBY.
+CAROUSEL_PAGES = ("NEXUS", "SYSTEM", "DISK", "SERVICES")
 
 # Které výsledky (podle id) ukazují stránky s hodnotami, řádek po řádku.
 PAGE_CHECKS = {
@@ -29,6 +31,17 @@ PAGE_CHECKS = {
 # Text nedostupné hodnoty na displeji. Jde jen o text: diagnostický stav
 # takového výsledku zůstává UNKNOWN a nesouvisí se stavem State.NA.
 VALUE_NOT_AVAILABLE = "N/A"
+
+# Krátký text stavu pro STATUS a stránku SLUŽBY (128 px na šířku).
+STATE_TEXT = {
+    State.OK: "OK",
+    State.INFO: "INFO",
+    State.WARNING: "WARN",
+    State.ERROR: "ERR",
+    State.CRITICAL: "CRIT",
+    State.UNKNOWN: "UNKN",
+    State.NA: "N/A",
+}
 
 
 def page_lines(page, results, now):
@@ -44,6 +57,22 @@ def page_lines(page, results, now):
         else:
             lines.append(result.summary)
     return lines
+
+def service_rows(results, now):
+    """Řádky stránky SLUŽBY: (název, text stavu) v pořadí katalogu služeb.
+
+    Výsledky mají projít services.complete_service_results(), aby sledovaná
+    služba bez dat byla UNKNOWN stejně v SLUŽBY, v symbolu NEXUS i ve STATUS.
+    Prošlý výsledek je UNKN; N/A (nenasazená AnimeDB) zůstává N/A. Kdyby
+    doplnění chybělo, chybějící služba se tu i tak ukáže jako UNKN, nikdy OK.
+    """
+    current = {result.id: effective(result, now) for result in results}
+    rows = []
+    for service_id, label in SERVICE_LABELS.items():
+        result = current.get(service_id)
+        state = result.state if result is not None else State.UNKNOWN
+        rows.append((label, STATE_TEXT[state]))
+    return rows
 
 # Počet řádků s problémy na jedné stránce STATUS (128 × 64 px).
 STATUS_LINES_PER_PAGE = 4

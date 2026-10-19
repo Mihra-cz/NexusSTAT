@@ -4,8 +4,10 @@ Použití:
   PYTHONPATH=src python3 -m nexusstat.run [--config SOUBOR]
 
 Každých `interval_seconds` (sekce [collector], výchozí 10 s) změří vytížení CPU,
-teplotu CPU, RAM a obsazenost / a vypíše jeden řádek. Ukončení: Ctrl+C.
+teplotu CPU, RAM a obsazenost /, vyhodnotí zapnuté prahy ([alarms], výchozí
+vypnuto) a vypíše jeden řádek. Ukončení: Ctrl+C.
 Nic nezapisuje, neotevírá port a nepřistupuje k displeji, NAS ani jinému hardwaru.
+Alarm se jen vypíše; žádná automatická akce (vypnutí, ventilátory) neexistuje.
 """
 
 import argparse
@@ -13,8 +15,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .alarms import AlarmEvaluator
 from .config import Config, ConfigError, load_config
-from .core import CheckResult, State, overall_state
+from .core import ALERT_STATES, CheckResult, State, overall_state
 from .system_monitor import LABELS, SystemMonitor
 
 
@@ -43,6 +46,13 @@ def failed_results(monitor, now, observed_utc, validity_seconds):
     ]
 
 
+def result_text(result):
+    # U závady je ve výpisu vidět, které hodnoty se týká; ostatní text beze změny.
+    if result.state in ALERT_STATES:
+        return f"{result.summary} [{result.state.value}]"
+    return result.summary
+
+
 def format_line(results, now, observed_utc, text):
     """Řádek výpisu: čas měření (UTC), značka SIM, celkový stav a text."""
     # Simulovaná data se nesmí ani ve výpisu plést se skutečným měřením.
@@ -51,17 +61,19 @@ def format_line(results, now, observed_utc, text):
     return f"{observed_utc:%Y-%m-%d %H:%M:%S} UTC  {sim}{state:<8} {text}"
 
 
-def run_loop(monitor, config, clock=time.monotonic, utc_clock=utc_now, sleep=time.sleep, output=print_now):
-    """Hlavní smyčka měření. Běží do Ctrl+C a vrací poslední výsledky.
+def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now, sleep=time.sleep,
+             output=print_now):
+    """Hlavní smyčka měření. Běží do Ctrl+C a vrací poslední vyhodnocené výsledky.
 
-    `config` je CollectorConfig. `clock` jsou monotónní hodiny pro plánování
-    a platnost výsledků, `utc_clock` dává jen čas měření. Testy dodají
-    simulované hodiny i `sleep`, takže nic skutečně nečekají.
+    `config` je CollectorConfig, `evaluator` AlarmEvaluator s pravidly [alarms].
+    `clock` jsou monotónní hodiny pro plánování a platnost výsledků, `utc_clock`
+    dává jen čas měření. Testy dodají simulované hodiny i `sleep`, takže nic
+    skutečně nečekají.
     """
     interval = config.interval_seconds
     output(
         f"NexusSTAT: měření každých {interval} s, platnost výsledků {config.validity_seconds} s. "
-        "Stav INFO = změřeno, bez alarmových prahů. Ukončení: Ctrl+C."
+        f"Prahy: {evaluator.describe()} (bez prahu je platné měření INFO). Ukončení: Ctrl+C."
     )
     results = []
     measurements = 0
@@ -86,11 +98,16 @@ def run_loop(monitor, config, clock=time.monotonic, utc_clock=utc_now, sleep=tim
             observed_utc = utc_clock()
             try:
                 results = monitor.collect(now, observed_utc)
-                text = " | ".join(result.summary for result in results)
+                text = None
             except Exception as error:
                 # Ctrl+C (KeyboardInterrupt) není Exception a smyčku ukončí níže.
                 results = failed_results(monitor, now, observed_utc, config.validity_seconds)
                 text = f"měření selhalo: {type(error).__name__}: {error}"
+            # Prahy se vyhodnotí i po selhání: UNKNOWN přeruší řadu měření pro
+            # potvrzení závady, ale závadu nevyřeší.
+            results = evaluator.evaluate(results, now)
+            if text is None:
+                text = " | ".join(result_text(result) for result in results)
             measurements += 1
             output(format_line(results, now, observed_utc, text))
 
@@ -113,7 +130,8 @@ def main(argv=None):
         # Neplatná konfigurace = žádné měření, ne tiché použití výchozích hodnot.
         parser.error(str(error))
     collector = config.collector
-    run_loop(SystemMonitor(validity_seconds=collector.validity_seconds), collector)
+    monitor = SystemMonitor(validity_seconds=collector.validity_seconds)
+    run_loop(monitor, collector, AlarmEvaluator(config.alarms))
 
 
 if __name__ == "__main__":

@@ -3,9 +3,9 @@
 Jen čte /proc, /sys/class/thermal a os.statvfs("/"). Nic nezapisuje, nespouští
 příkazy a neprochází /mnt, NAS ani jiné souborové systémy.
 
-Bez alarmových prahů: platná hodnota má stav INFO (změřeno, nevyhodnoceno).
-WARNING/ERROR přijdou až s konfiguračním kontraktem pro prahy. Nedostupná
-nebo neplatná hodnota má stav UNKNOWN.
+Kolektor prahy nevyhodnocuje: platná hodnota má stav INFO (změřeno) a číselnou
+hodnotu s jednotkou (`measurement`). WARNING/ERROR určuje až alarms.AlarmEvaluator.
+Nedostupná nebo neplatná hodnota má stav UNKNOWN a žádnou číselnou hodnotu.
 
 Ukázkové čtení skutečného systému:  PYTHONPATH=src python3 -m nexusstat.system_monitor
 """
@@ -17,12 +17,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import CollectorConfig
-from .core import CheckResult, State
+from .core import CheckResult, Measurement, State, is_finite_number
 
 CPU_USAGE_ID = "system.cpu_usage"
 CPU_TEMP_ID = "system.cpu_temp"
 MEMORY_ID = "system.memory"
 DISK_ROOT_ID = "disk.root"
+
+# Jednotky číselných hodnot. Prahy v konfiguraci jsou ve stejných jednotkách.
+PERCENT = "%"
+CELSIUS = "°C"
 
 # Krátké popisky pro displej a popisy výsledků.
 LABELS = {
@@ -174,8 +178,7 @@ class SystemMonitor:
         # intervalu měření). Kolektor nemá vlastní výchozí hodnotu, aby se nemohla
         # rozejít s intervalem spouštění. Když měření přestanou přicházet, hodnoty
         # zestárnou na UNKNOWN místo tichého zamrznutí.
-        is_number = isinstance(validity_seconds, (int, float)) and not isinstance(validity_seconds, bool)
-        if not is_number or validity_seconds <= 0:
+        if not is_finite_number(validity_seconds) or validity_seconds <= 0:
             raise ValueError(f"validity_seconds musí být kladný počet sekund, ne {validity_seconds!r}")
         self.validity_seconds = validity_seconds
         self.proc_dir = Path(proc_dir)
@@ -202,9 +205,12 @@ class SystemMonitor:
 
     def _check(self, check_id, measure, now, observed_utc):
         # Každá kontrola ošetřuje své chyby sama, aby selhání jedné neshodilo ostatní.
+        # Při chybě zůstane measurement None: hodnota je nedostupná, stav UNKNOWN.
         label = LABELS[check_id]
+        measurement = None
         try:
-            state, summary = State.INFO, f"{label} {measure()}"
+            measurement, text = measure()
+            state, summary = State.INFO, f"{label} {text}"
         except Unavailable as reason:
             state, summary = State.UNKNOWN, f"{label}: {reason}"
         except OSError:
@@ -214,8 +220,12 @@ class SystemMonitor:
             # float přeteče (OverflowError). Je to vadný údaj, ne pád celého měření.
             state, summary = State.UNKNOWN, f"{label}: neplatná data"
         expires = now + self.validity_seconds
-        return CheckResult(check_id, state, summary, observed_utc, expires, simulated=self.simulated)
+        return CheckResult(
+            check_id, state, summary, observed_utc, expires, simulated=self.simulated, measurement=measurement
+        )
 
+    # Každé měření vrací (Measurement, text pro displej). Text se zaokrouhluje,
+    # hodnota pro prahy ne.
     def _cpu_usage(self):
         current = parse_cpu_sample(read_text(self.proc_dir / "stat"))
         previous, self.previous_cpu = self.previous_cpu, current
@@ -224,23 +234,24 @@ class SystemMonitor:
         percent = cpu_usage_percent(previous, current)
         if percent is None:
             raise Unavailable("neplatný interval")
-        return f"{percent:.0f} %"
+        return Measurement(percent, PERCENT), f"{percent:.0f} %"
 
     def _cpu_temperature(self):
         zone = find_cpu_thermal_zone(self.thermal_dir)
         if zone is None:
             raise Unavailable("senzor nenalezen")
-        return f"{parse_temperature(read_text(zone / 'temp')):.0f} °C"
+        celsius = parse_temperature(read_text(zone / "temp"))
+        return Measurement(celsius, CELSIUS), f"{celsius:.0f} °C"
 
     def _memory(self):
         total_kib, available_kib = parse_meminfo(read_text(self.proc_dir / "meminfo"))
         used_percent = 100 * (total_kib - available_kib) / total_kib
-        return f"{used_percent:.0f} % z {format_size(total_kib * 1024)}"
+        return Measurement(used_percent, PERCENT), f"{used_percent:.0f} % z {format_size(total_kib * 1024)}"
 
     def _disk_root(self):
         # Výhradně kořenový souborový systém, nikdy /mnt ani síťové mounty.
         percent, size_bytes = disk_usage(self.statvfs("/"))
-        return f"{percent:.0f} % z {format_size(size_bytes)}"
+        return Measurement(percent, PERCENT), f"{percent:.0f} % z {format_size(size_bytes)}"
 
 
 def main():

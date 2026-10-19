@@ -46,7 +46,8 @@ last_restore_test = "not-tested"
 
 [integrations]
 pironman5 = "replacement-planned; existing-service-must-remain-running"
-oled = "planned; offline-simulator-only (local tests); hardware-not-integrated"
+oled = "planned; offline-simulator-only (local tests, 4 carousel pages); hardware-not-integrated"
+service_collectors = "not-implemented" # stránka SLUŽBY jen zobrazuje; Docker, NAS, Restic, AnimeDB se nečtou
 rgb = "planned; not-integrated"
 animedb = "future; not-deployed"
 
@@ -62,14 +63,15 @@ dependencies_optional = ["Pillow"] # jen obrazová simulace OLED; ověřeno 10.2
 # Lokální vývoj na notebooku. Nic z toho neběží na Nexusu (viz platform.deployment).
 location = "developer-notebook-only"
 last_verified = "2026-10-19"
-implemented_locally = ["core-state-model", "oled-state-machine", "oled-image-simulator", "system-collector-readonly", "periodic-collection-loop-terminal"]
+implemented_locally = ["core-state-model", "oled-state-machine", "oled-image-simulator", "system-collector-readonly", "periodic-collection-loop-terminal", "numeric-measurements", "threshold-evaluator", "oled-services-page-display-only"]
 system_collector_sources = ["/proc/stat", "/proc/meminfo", "/sys/class/thermal", "statvfs(/)"]
 collector_interval_default_seconds = 10 # [collector] interval_seconds; platnost výsledků = 3 × interval
 periodic_loop = "foreground-terminal-only; not-a-service"
-verified_on = "x86_64 Linux Mint (unit tests + read-only run + periodic loop in terminal)"
+verified_on = "x86_64 Linux Mint (unit tests + read-only run + periodic loop in terminal, incl. illustrative test thresholds)"
 raspberry_pi_tested = false
 hardware_display_tested = false
-alarm_thresholds = "not-defined"
+alarm_thresholds = "configurable (cpu_temp, disk_root); disabled-by-default; no-approved-values"
+alarm_actions = "none" # alarm jen mění stav a výpis; žádné vypínání ani řízení ventilátorů
 version_control = "git" # lokální repozitář od 2026-10-19, větev main; commity a push jen po schválení
 repository = "https://github.com/Mihra-cz/NexusSTAT" # veřejný; bez interního standardu a údajů o síti
 local_backup = "unverified"

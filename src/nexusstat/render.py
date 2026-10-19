@@ -9,15 +9,27 @@ from functools import lru_cache
 from PIL import Image, ImageDraw, ImageFont
 
 from .config import DISPLAY_HEIGHT, DISPLAY_WIDTH
-from .core import State, active_problems, has_monitor_data
-from .oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, Mode, home_symbol, page_lines, split_status_pages
+from .core import active_problems, has_monitor_data
+from .oled import (
+    ALERT_SYMBOL,
+    STATE_TEXT,
+    UNKNOWN_SYMBOL,
+    Mode,
+    home_symbol,
+    page_lines,
+    service_rows,
+    split_status_pages,
+)
 
-STATE_LABELS = {
-    State.CRITICAL: "CRIT",
-    State.ERROR: "ERR",
-    State.WARNING: "WARN",
-    State.UNKNOWN: "UNKN",
-}
+# Nadpisy stránek na displeji; ostatní stránky mají nadpis stejný jako interní název.
+PAGE_TITLES = {"SERVICES": "SLUŽBY"}
+
+# Rozvržení stránky SLUŽBY: 4 řádky písmem 11 px pod čarou na y = 15.
+# Inkoust řádku leží zhruba 3–12 px pod jeho y, takže řádky 17–62 px
+# nepřekrývají čáru ani sebe navzájem a vejdou se do 64 px.
+SERVICES_ROW_TOP = 14
+SERVICES_ROW_STEP = 12
+SERVICES_ROWS_PER_PAGE = 4
 
 # Oblast symbolu (trojúhelník nebo "?") v pravém horním rohu stránky NEXUS (x, y, velikost).
 SYMBOL_BOX = (112, 1, 15)
@@ -36,11 +48,20 @@ def font(size, bold=False):
         return ImageFont.load_default()
 
 
+def ink_width(draw, text, text_font):
+    """Šířka skutečně vykreslených znaků od počátku textu (pravý okraj inkoustu).
+
+    Šířka pro posun (textlength) bývá o zlomek pixelu menší, takže poslední
+    sloupec písmene by na okraji displeje mohl chybět.
+    """
+    return draw.textbbox((0, 0), text, font=text_font)[2]
+
+
 def fit_text(draw, text, text_font, max_width):
-    """Zkrátí text s „…“, aby se vešel do max_width pixelů."""
-    if draw.textlength(text, font=text_font) <= max_width:
+    """Zkrátí text s „…“, aby se jeho vykreslené znaky vešly do max_width pixelů."""
+    if ink_width(draw, text, text_font) <= max_width:
         return text
-    while text and draw.textlength(text + "…", font=text_font) > max_width:
+    while text and ink_width(draw, text + "…", text_font) > max_width:
         text = text[:-1]
     return text + "…"
 
@@ -92,6 +113,26 @@ def draw_value_page(draw, title, lines, simulated):
         draw.text((0, 19 + row * 15), fit_text(draw, line, font(11), DISPLAY_WIDTH), font=font(11), fill=1)
 
 
+def layout_service_rows(draw, rows):
+    """Pozice textů stránky SLUŽBY: [(label_xy, state_xy)], název vlevo, stav zarovnaný vpravo."""
+    positions = []
+    for index, (label, state) in enumerate(rows[:SERVICES_ROWS_PER_PAGE]):
+        y = SERVICES_ROW_TOP + index * SERVICES_ROW_STEP
+        # Zarovnání podle skutečného inkoustu, ne podle šířky pro posun.
+        positions.append(((0, y), (DISPLAY_WIDTH - 1 - ink_width(draw, state, font(11)), y)))
+    return positions
+
+
+def draw_services_page(draw, rows, simulated):
+    draw.text((0, 0), PAGE_TITLES["SERVICES"], font=font(12, bold=True), fill=1)
+    if simulated:
+        draw_sim_mark(draw, DISPLAY_WIDTH - 1, 2)
+    draw.line([(0, 15), (DISPLAY_WIDTH - 1, 15)], fill=1)
+    for (label, state), (label_xy, state_xy) in zip(rows, layout_service_rows(draw, rows)):
+        draw.text(label_xy, label, font=font(11), fill=1)
+        draw.text(state_xy, state, font=font(11), fill=1)
+
+
 def draw_status_page(draw, problems, page_number, page_total, has_data, simulated):
     draw.text((0, 0), "STATUS", font=font(11, bold=True), fill=1)
     counter = f"{page_number}/{page_total}"
@@ -112,7 +153,7 @@ def draw_status_page(draw, problems, page_number, page_total, has_data, simulate
 
     for row, problem in enumerate(problems):
         y = 15 + row * 12
-        draw.text((0, y), STATE_LABELS[problem.state], font=font(9, bold=True), fill=1)
+        draw.text((0, y), STATE_TEXT[problem.state], font=font(9, bold=True), fill=1)
         summary = fit_text(draw, problem.summary, font(10), DISPLAY_WIDTH - 33)
         draw.text((33, y), summary, font=font(10), fill=1)
 
@@ -141,6 +182,8 @@ def render_screen(controller, now, results, wall_time):
     page = controller.current_page(now)
     if page == "NEXUS":
         draw_nexus_page(draw, wall_time, home_symbol(results, now), simulated)
+    elif page == "SERVICES":
+        draw_services_page(draw, service_rows(results, now), simulated)
     else:
         draw_value_page(draw, page, page_lines(page, results, now), simulated)
     return image

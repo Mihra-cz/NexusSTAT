@@ -20,7 +20,7 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 ## OLED 128 × 64 (schválený směr UX)
 
 1. Displej nejprve spí. První **krátký stisk** zobrazí první stránku s nápisem `NEXUS`, hodinami (24h) a datem.
-2. Režim **CAROUSEL** automaticky mění stránky každých **10 s**; celkově je aktivní **300 s** a následně OLED usne. Výchozí hodnoty jsou konfigurovatelné, později změnitelné přes LAN web.
+2. Režim **CAROUSEL** automaticky mění stránky v pořadí **NEXUS → SYSTEM → DISK → SLUŽBY** a pak znovu NEXUS, každých **10 s**; celkově je aktivní **300 s** a následně OLED usne. Výchozí hodnoty jsou konfigurovatelné, později změnitelné přes LAN web.
 3. Každý další krátký stisk během kolotoče otevře **STATUS**, což je přehled konkrétních závad pod sebou.
 4. **STATUS bez závad nebo s jednou stránkou:** další krátký stisk vrací do CAROUSEL.
 5. **STATUS s více stránkami:** další stisky listují po stránkách; ze **závěrečné stránky** další krátký stisk vrací do CAROUSEL (bez cyklení uvnitř STATUS).
@@ -30,7 +30,8 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 9. OLED v běžném stavu není nuceně rozsvěcen pouze kvůli upozornění. Ovládání a uspání musí zůstat funkční i při chybách.
 10. Vše nejprve testovat jako monochromatický bitmapový simulátor 128 × 64 bez hardware.
 11. STATUS bez sledovaných dat zobrazí `NO MONITOR DATA`, bez aktivních problémů při platných datech `NO ACTIVE ISSUES`. Obrazovky se simulovanými daty nesou značku `SIM`.
-12. Stránky SYSTEM a DISK ukazují hodnoty ze systémového kolektoru. Nedostupná hodnota se zobrazí jako text `N/A`, její diagnostický stav je `UNKNOWN`. Bez schválených prahů se z hodnot neodvozuje WARNING ani ERROR.
+12. Stránky SYSTEM a DISK ukazují hodnoty ze systémového kolektoru. Nedostupná hodnota se zobrazí jako text `N/A`, její diagnostický stav je `UNKNOWN`. Bez zapnutých prahů (`[alarms]`, výchozí vypnuto) se z hodnot neodvozuje WARNING ani ERROR.
+13. Stránka **SLUŽBY** (interně `SERVICES`) má řádky NEXUS, ANIMEDB, NAS a BACKUP: název vlevo, stav vpravo (`OK`, `INFO`, `WARN`, `ERR`, `CRIT`, `UNKN`, `N/A`). Hodnoty dodají budoucí kolektory; dnes žádné nejsou. Ve skutečném režimu se nevykonaná kontrola nikdy neukáže jako `OK`: sledovaná služba bez výsledku nebo s prošlým výsledkem je `UNKNOWN` konzistentně na stránce SLUŽBY (`UNKN`), v symbolu `?` na stránce NEXUS i ve STATUS. `UNKNOWN` není potvrzená závada; potvrzené WARNING/ERROR mají přednost (trojúhelník, pořadí ve STATUS). Nenasazená AnimeDB je `N/A`: není alarm ani neznámý stav. Položka NEXUS netvrdí `OK`, dokud nebude mít jednoznačně definovaný healthcheck s kolektorem. Fiktivní stavy simulátoru nesou značku `SIM`. Konkrétní závady dál ukazuje samostatný STATUS se stávajícím ovládáním.
 
 ## Systémový kolektor (potvrzeno pro v0.2)
 
@@ -48,6 +49,16 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 - Plánování v monotónním čase, čas měření v UTC. Plánované termíny postupně neujíždějí; při zpoždění se nespouští několik doháněcích měření najednou.
 - Selhání měření nesmí vést k falešnému stavu OK. Žádné aktivní čekání vytěžující procesor. Čisté ukončení pomocí Ctrl+C.
 - Zatím jen terminál: bez OLED hardware, služby, webu a SQLite.
+
+## Číselné hodnoty a první alarmové prahy (potvrzeno pro v0.4)
+
+- Měřená veličina nese číselnou hodnotu a jednotku (`measurement`), ne jen text. Alarmy se nikdy nevyhodnocují parsováním textu `summary`. Formát textu pro OLED a terminál zůstává.
+- Chyba měření: hodnota nedostupná a stav `UNKNOWN`. Zachovány UTC čas, monotónní expirace a příznak `simulated`; po expiraci hodnota zmizí.
+- Prahy zatím jen pro teplotu CPU (°C) a obsazení kořenového disku `/` (%). Pro každou veličinu: zapnutí/vypnutí, práh WARNING, práh ERROR (vyšší než WARNING), hystereze pro návrat do nižšího stavu, počet měření pro potvrzení vzniku (výchozí 3) a odeznění (výchozí 2).
+- Výchozí konfigurace žádné prahy nezapíná a kód nemá výchozí prahové hodnoty. Bez zapnutého pravidla zůstává platné měření `INFO`. Neplatné kombinace konfigurace se odmítnou.
+- Hodnota rovná prahu je nad prahem. Krátké jednorázové výkyvy alarm nevytvářejí ani neruší. `UNKNOWN` závadu nevyřeší; `N/A` se nemění. Simulovaná data se nesmějí prezentovat jako skutečný alarm Nexusu.
+- Závažné stavy zatím nemají zvláštní rychlou cestu ani automatickou akci. Žádné automatické vypínání serveru ani regulace ventilátorů.
+- Konkrétní hodnoty prahů pro Nexus zatím nejsou schválené.
 
 ## Tlačítko a kritické funkce
 

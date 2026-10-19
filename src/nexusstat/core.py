@@ -1,5 +1,6 @@
 """Stavový model diagnostických výsledků a výběr aktivních problémů."""
 
+import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
@@ -26,6 +27,43 @@ PROBLEM_STATES = {State.CRITICAL, State.ERROR, State.WARNING, State.UNKNOWN}
 ALERT_STATES = {State.WARNING, State.ERROR, State.CRITICAL}
 
 
+def is_finite_number(value):
+    """True pro konečné int/float. Ne bool, NaN, nekonečno ani int mimo rozsah float.
+
+    NaN se s ničím neporovná jako větší ani menší (prah ani expirace by nikdy
+    nezabraly) a nekonečno by nevypršelo nikdy. Obří celé číslo by při
+    převodu na float vyvolalo OverflowError místo srozumitelné chyby.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+@dataclass(frozen=True)
+class Measurement:
+    """Naměřená číselná hodnota s jednotkou (např. 55.4 a "°C").
+
+    Alarmy se vyhodnocují výhradně z ní, nikdy parsováním textu `summary`,
+    který slouží jen k zobrazení a jeho formát se může měnit.
+    """
+
+    value: float
+    unit: str
+
+    def __post_init__(self):
+        if not is_finite_number(self.value):
+            raise ValueError(f"hodnota měření musí být konečné číslo, ne {self.value!r}")
+        if not isinstance(self.unit, str) or not self.unit:
+            raise ValueError("jednotka měření musí být neprázdný text")
+
+
+# Stavy bez platné hodnoty: měření selhalo, data jsou prošlá, nebo se nesleduje.
+STATES_WITHOUT_VALUE = {State.UNKNOWN, State.NA}
+
+
 @dataclass(frozen=True)
 class CheckResult:
     """Výsledek jedné kontroly.
@@ -37,6 +75,8 @@ class CheckResult:
       času, např. po synchronizaci NTP po startu.
     U stavu N/A se platnost nepoužívá (viz effective()).
     `simulated` odlišuje vymyšlená data simulace od skutečného měření.
+    `measurement` je číselná hodnota pro vyhodnocení prahů; None = hodnota
+    nedostupná. UNKNOWN a N/A ji mít nesmějí.
     """
 
     id: str
@@ -45,6 +85,7 @@ class CheckResult:
     observed_utc: datetime
     expires_monotonic: float
     simulated: bool = field(kw_only=True)
+    measurement: Measurement | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         # Řetězec "OK" místo State.OK by tiše obešel řazení i vypršení.
@@ -58,8 +99,16 @@ class CheckResult:
             raise ValueError("observed_utc musí být datetime s časovou zónou UTC")
         if isinstance(self.expires_monotonic, bool) or not isinstance(self.expires_monotonic, (int, float)):
             raise TypeError("expires_monotonic musí být číslo v sekundách monotónních hodin")
+        # Výsledek s NaN nebo nekonečnou platností by nikdy nevypršel na UNKNOWN.
+        if not is_finite_number(self.expires_monotonic):
+            raise ValueError("expires_monotonic musí být konečné číslo")
         if not isinstance(self.simulated, bool):
             raise TypeError("simulated musí být True nebo False")
+        if self.measurement is not None and not isinstance(self.measurement, Measurement):
+            raise TypeError("measurement musí být Measurement nebo None")
+        # Neznámý stav s číslem by mohl dál vypadat jako platně naměřená hodnota.
+        if self.measurement is not None and self.state in STATES_WITHOUT_VALUE:
+            raise ValueError(f"stav {self.state.value} nesmí mít naměřenou hodnotu")
 
 
 def effective(result, now):
@@ -68,7 +117,8 @@ def effective(result, now):
     Vypršelý výsledek se mění na UNKNOWN pro jakýkoli původní stav: staré OK
     nesmí vypadat jako aktuální OK a staré ERROR nesmí vypadat jako potvrzená
     trvající závada. Mění se i popis, protože původní text (např. "SMART bez
-    chyb") by vedle UNKNOWN dál tvrdil něco, co už neplatí.
+    chyb") by vedle UNKNOWN dál tvrdil něco, co už neplatí. Ze stejného důvodu
+    zmizí i číselná hodnota.
 
     N/A nevyprší: je to rozhodnutí v konfiguraci, ne měření. Přechod z N/A na
     aktivní sledování musí přijít jako nový výsledek, ne jako timeout.
@@ -76,7 +126,7 @@ def effective(result, now):
     if result.state is State.NA:
         return result
     if now >= result.expires_monotonic:
-        return replace(result, state=State.UNKNOWN, summary=f"{result.id}: zastaralá data")
+        return replace(result, state=State.UNKNOWN, summary=f"{result.id}: zastaralá data", measurement=None)
     return result
 
 

@@ -1,5 +1,32 @@
 # Changelog NexusSTAT
 
+## 2026-10-19 – OLED: čtvrtá stránka SLUŽBY (lokálně, navazuje na rozpracovanou v0.4)
+
+- Kolotoč OLED: NEXUS → SYSTEM → DISK → SLUŽBY (interně `SERVICES`) a znovu NEXUS. Interval stránky (výchozí 10 s), okno 300 s, nečinnost STATUS 30 s i ovládání STATUS beze změny.
+- Nový `src/nexusstat/services.py`: katalog služeb (NEXUS, ANIMEDB, NAS, BACKUP) s id pro budoucí kolektory a známá skutečnost „AnimeDB není nasazena“ (`N/A`). Žádný sběr dat Dockeru, NAS, Resticu ani AnimeDB.
+- `oled.py`: `service_rows()` a společné texty stavů `STATE_TEXT`. Služba bez výsledku nebo s prošlým výsledkem je `UNKN`, nikdy `OK`; `N/A` zůstává `N/A`.
+- Sjednocení UNKNOWN (kontrola před commitem): služba bez kolektoru byla `UNKN` jen na stránce SLUŽBY, zatímco stránka NEXUS neměla `?` a STATUS hlásil `NO ACTIVE ISSUES`. Nově `services.complete_service_results()` doplní sledované služby bez výsledku jako `UNKNOWN` („<název>: bez dat“) a nenasazenou AnimeDB jako `N/A`; všechny OLED výstupy tak vycházejí ze stejných výsledků. Původní `deployment_facts()` nahrazeno. Evaluator alarmů beze změny.
+- `fit_text` zkracuje podle skutečně vykreslených znaků (`textbbox`): dříve mohl inkoust přesáhnout pravý okraj o 1 px (např. „chybí disk.smart: v“). `render.py`: stránka SLUŽBY (název vlevo, stav vpravo, značka `SIM` u fiktivních dat); STATUS používá tytéž texty stavů.
+- Simulátor: fiktivní služby NEXUS, ANIMEDB, NAS `OK`, BACKUP `WARN`. Fiktivní problémy, které by jim odporovaly (NAS CRITICAL, záloha ERROR, AnimeDB N/A), nahrazeny jinými fiktivními položkami; scénář projde čtyři stránky a dál ukazuje dvě stránky STATUS. `--live`: služby `UNKN`, AnimeDB `N/A`.
+- Testy: pořadí a střídání čtyř stránek, návrat na NEXUS, timeouty, stisk na stránce SLUŽBY, simulované, neznámé, prošlé a `N/A` stavy služeb, rozvržení 128 × 64 pro všechny kombinace názvů a stavů, scénář simulátoru. Dva dosavadní testy s pevným třístránkovým cyklem upraveny na čtyři stránky (časování se nezměnilo). Test rozvržení odhalil, že stav zarovnaný vpravo podle šířky pro posun zasahoval o zlomek pixelu za okraj; zarovnání je nově podle skutečného inkoustu.
+- Ověření: celá sada s Pillow i bez Pillow; snímky scénáře a `--live` uložené do `/tmp` a vizuálně zkontrolované. Bez hardware, nasazení, commitu a pushe.
+
+## 2026-10-19 – v0.4: číselná měření a první alarmové prahy (lokálně)
+
+- Datový model: nový `Measurement(value, unit)` a volitelné `CheckResult.measurement`. `UNKNOWN` a `N/A` hodnotu mít nesmějí, expirace ji smaže. UTC čas, monotónní platnost a `simulated` beze změny.
+- `system_monitor.py`: každá kontrola vrací nezaokrouhlené číslo s jednotkou (`%`, `°C`) a stejný text jako dřív. Chyba měření = `measurement` `None` a `UNKNOWN`.
+- Nový `alarms.py` (`AlarmEvaluator`): prahy WARNING/ERROR pro teplotu CPU a obsazení `/`, hodnota rovná prahu je nad prahem, hystereze pro návrat, vznik po 3 a odeznění po 2 po sobě jdoucích měřeních (konfigurovatelné). `UNKNOWN` nebo mezera v datech přeruší řadu, závadu ale nevyřeší; `N/A` beze změny; simulovaná a skutečná data mají oddělenou paměť. Vyhodnocuje se jen číselná hodnota, nikdy text. Žádné automatické akce.
+- Konfigurace: `[alarms.cpu_temp]` a `[alarms.disk_root]` (`enabled`, `warning`, `error`, `hysteresis`, `confirm_count`, `clear_count`). Výchozí stav vypnuto a bez prahových hodnot; zapnutí vyžaduje všechny tři prahy. Validace pořadí prahů, hystereze, rozsahů veličin a dosažitelnosti odeznění.
+- `run.py`: vyhodnocení prahů po každém měření i po selhání; úvodní řádek popisuje prahy, hodnota v závadě má ve výpisu `[WARNING]`/`[ERROR]`. `core.py` beze změny chování mimo nové pole; `oled.py`, `render.py` a `simulate.py` beze změny.
+- Testy: nový `tests/test_alarms.py` (hranice prahů, hystereze, opakovaná měření, výkyvy, UNKNOWN, N/A, expirace, mezera v datech, simulovaná data, OLED a vykreslení, integrace se skutečným kolektorem nad vzorovými soubory); rozšířené `test_core.py`, `test_config.py`, `test_system_monitor.py` a `test_run.py`.
+- Ověření: celá sada s Pillow i bez Pillow; kontrolní mutace evaluatoru (ostrá/neostrá hranice, bez hystereze, UNKNOWN jako vyřešení, bez přerušení řady, okamžité potvrzení či odeznění, sdílená paměť simulace, chybějící hodnota jako INFO, prošlá hodnota) testy odhalí; ruční běh na notebooku s výchozí konfigurací (bez alarmů) a se zjevně ilustračním prahem (WARNING po třetím měření).
+- Revize před commitem (opraveno, s regresními testy, které proti předchozí verzi selžou):
+  - Opakované vyhodnocení téhož vzorku zvyšovalo počítadlo potvrzení (stejný vzorek 3× = WARNING) a opakované staré `UNKNOWN` přerušilo novější řadu. Nově je identita vzorku (`id`, `simulated`, `expires_monotonic`) a stejný nebo starší vzorek se nezapočítá.
+  - Hranice hystereze u desetinných prahů byla posunutá binární aritmetikou (65.2 − 1.1 = 64.10000000000001), takže hodnota přesně na hranici závadu ukončila; validace zase přijala hysterezi rovnou odstupu prahů (70.1/75.2/5.1). Hranice se nově zaokrouhlují na 6 desetinných míst.
+  - Obří celé číslo v TOML prahu shodilo `nexusstat.run` tracebackem (`OverflowError`, kód 1); nově `ConfigError` a kód 2. `CheckResult` odmítá NaN/nekonečnou platnost (jinak by nikdy nevypršel), `SystemMonitor` odmítá NaN/nekonečnou platnost a `Measurement(10**400)` dává `ValueError`. Společná kontrola `core.is_finite_number()`.
+  - Neopodstatněné (ověřeno testy, beze změny kódu): NaN/nekonečno/bool v prazích a hysterezi se odmítaly; `UNKNOWN` během rozpracovaného potvrzování řadu přeruší; potvrzený alarm přes `UNKNOWN` trvá; vypnuté pravidlo nikdy nevytvoří WARNING/ERROR; přechod ERROR → WARNING a celé hranice fungovaly; simulovaná data zůstávají označená.
+- Hodnoty prahů pro Nexus nejsou schválené ani nastavené. Ověřeno jen na notebooku. Bez nasazení, commitu a pushe.
+
 ## 2026-10-19 – v0.3: pravidelný běh diagnostiky (lokálně)
 
 - Nový `src/nexusstat/run.py`: jedna hlavní smyčka `run_loop()`, která každých `interval_seconds` změří CPU, teplotu CPU, RAM a obsazenost `/` a vypíše jeden řádek do terminálu. Spuštění `PYTHONPATH=src python3 -m nexusstat.run [--config SOUBOR]`, ukončení Ctrl+C.

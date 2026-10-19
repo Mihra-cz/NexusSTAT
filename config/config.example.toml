@@ -11,6 +11,29 @@ status_idle_seconds = 30  # celé sekundy 1–3600
 [collector]
 interval_seconds = 10  # celé sekundy 1–3600; platnost výsledků = 3 × interval (nenastavuje se zvlášť)
 
+# Alarmové prahy. Výchozí stav: vyhodnocování vypnuto, platné měření zůstává INFO.
+# Prahy NEMAJÍ výchozí hodnoty a konkrétní čísla zatím nejsou schválená.
+# Při enabled = true jsou povinné všechny tři: warning < error,
+# 0 ≤ hysteresis < error − warning a warning − hysteresis nad dolní mezí rozsahu.
+# Hodnota rovná prahu je nad prahem. Závada vzniká po confirm_count po sobě
+# jdoucích měřeních nad prahem a odezní po clear_count měřeních pod
+# (práh − hysteresis). UNKNOWN závadu nevyřeší. Žádná automatická akce.
+[alarms.cpu_temp]   # °C, prahy v rozsahu (0, 125]
+enabled = false
+confirm_count = 3   # celé číslo 1–60
+clear_count = 2     # celé číslo 1–60
+# warning =
+# error =
+# hysteresis =
+
+[alarms.disk_root]  # % obsazení /, prahy v rozsahu (0, 100]
+enabled = false
+confirm_count = 3
+clear_count = 2
+# warning =
+# error =
+# hysteresis =
+
 # --- Budoucí možnosti: zatím NEIMPLEMENTOVÁNO a nenačítá se ---
 # Nápis na první stránce je pevně NEXUS, hodiny jsou vždy 24h.
 # Symboly na stránce NEXUS (trojúhelník / "?") nelze vypnout.
@@ -20,7 +43,7 @@ interval_seconds = 10  # celé sekundy 1–3600; platnost výsledků = 3 × inte
 # home_title = "NEXUS"
 # clock_24h = true
 #
-# [alarms]
+# [alarms]  # trojúhelník na stránce NEXUS zatím nejde vypnout
 # show_warning_triangle = true
 #
 # [web]  # v první fázi není žádný web
