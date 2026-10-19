@@ -1,0 +1,54 @@
+# Repozitář je veřejný: jen lokální prostředí, generované soubory a tajemství
+
+# Python cache a virtuální prostředí
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Snímky simulátoru OLED (README je ukládá do /tmp, tohle chrání před omylem
+# v projektu). Jen jejich vzory jmen z simulate.py, aby šly verzovat
+# dokumentační obrázky, ikony i grafika OLED; snímek do dokumentace přejmenuj.
+[0-9][0-9]*_t[0-9][0-9][0-9]*_[A-Z]*.png
+live_[A-Z]*.png
+
+# Lokální konfigurace: verzují se jen ne-tajné šablony *.example.toml
+config/*.toml
+!config/*.example.toml
+CLAUDE.local.md
+.claude/settings.local.json
+docs/_local/
+
+# Tajemství a klíče
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# Soukromý standard a registr Nexusu obsahují údaje o domácí síti;
+# ani omylem zkopírovaná kopie nesmí do veřejného repozitáře
+PROJECT-STANDARD.md
+PROJECTS.md
+NEXUS-RECOVERY.md
+
+# Databáze (včetně SQLite journal/WAL) a logy
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.log
+
+# Editor a záložní soubory
+*~
+*.swp
+.vscode/
+.idea/

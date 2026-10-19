@@ -1,0 +1,87 @@
+# Projektový manifest. Cesty jsou PLÁNOVANÉ, ne potvrzení existence.
+schema_version = 1
+
+[project]
+id = "nexusstat"
+name = "NexusSTAT"
+description = "Lokální diagnostika Nexusu a plánovaná náhrada aplikačních funkcí Pironman 5"
+created = "2026-10-19"
+last_reviewed = "2026-10-19"
+owner = "Mihra-cz" # veřejná identita (GitHub)
+license = "MIT" # viz LICENSE
+status = "development" # lokální vývoj na notebooku; nasazení viz platform.deployment
+
+[platform]
+hostname = "nexus"
+architecture = "arm64"
+os_family = "Debian 13"
+deployment = "not-deployed"
+
+[paths]
+project = "/srv/nexus/projects/nexusstat"
+stack = "/srv/nexus/stacks/nexusstat"
+appdata = "/srv/nexus/appdata/nexusstat"
+external_data = [] # monitoring NAS se bude navrhovat odděleně
+
+[services]
+systemd = []
+docker = []
+ports = [] # 8765 zatím NENÍ přidělený/otevřený
+healthcheck = "not-configured"
+
+[security]
+internet_exposure = false
+cloud_required = false
+nas_write_access = false
+secrets_location = "not-configured"
+
+[backup]
+job = "existing-host-restic-job" # skutečný název jednotky je v soukromé dokumentaci Nexusu
+project_files_included = "unverified"
+runtime_data_policy = "review-before-deployment"
+live_database_excluded = "not-applicable"
+consistent_database_snapshot = "not-applicable"
+restore_tested = false
+last_restore_test = "not-tested"
+
+[integrations]
+pironman5 = "replacement-planned; existing-service-must-remain-running"
+oled = "planned; offline-simulator-only (local tests); hardware-not-integrated"
+rgb = "planned; not-integrated"
+animedb = "future; not-deployed"
+
+[runtime]
+# Skutečný stav lokálního kódu. Cílový způsob provozu na Nexusu je v [planned].
+language = "python"
+python_min = "3.11" # tomllib
+python_verified = "3.12.3 (developer notebook)"
+dependencies_required = [] # pouze standardní knihovna
+dependencies_optional = ["Pillow"] # jen obrazová simulace OLED; ověřeno 10.2.0
+
+[development]
+# Lokální vývoj na notebooku. Nic z toho neběží na Nexusu (viz platform.deployment).
+location = "developer-notebook-only"
+last_verified = "2026-10-19"
+implemented_locally = ["core-state-model", "oled-state-machine", "oled-image-simulator", "system-collector-readonly"]
+system_collector_sources = ["/proc/stat", "/proc/meminfo", "/sys/class/thermal", "statvfs(/)"]
+verified_on = "x86_64 Linux Mint (unit tests + read-only run)"
+raspberry_pi_tested = false
+hardware_display_tested = false
+alarm_thresholds = "not-defined"
+version_control = "git" # lokální repozitář od 2026-10-19, větev main; commity a push jen po schválení
+repository = "https://github.com/Mihra-cz/NexusSTAT" # veřejný; bez interního standardu a údajů o síti
+local_backup = "unverified"
+
+[planned]
+execution = "native-python; subject-to-review"
+lan_port = 8765
+public_dashboard = "read-only status/errors only; separate interface; not deployed"
+hardware_switch = "requires separate approval and physical fan verification"
+
+[documentation]
+readme = "README.md"
+architecture = "docs/ARCHITECTURE.md"
+operations = "docs/OPERATIONS.md"
+changelog = "docs/CHANGELOG.md"
+requirements = "docs/REQUIREMENTS.md"
+security = "docs/SECURITY.md"
