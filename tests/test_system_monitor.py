@@ -14,14 +14,13 @@ from pathlib import Path
 
 from nexusstat.core import ALERT_STATES, State, active_problems, overall_state
 from nexusstat.oled import UNKNOWN_SYMBOL, OledController, home_symbol, page_lines
-from nexusstat.config import OledConfig
+from nexusstat.config import CollectorConfig, OledConfig
 from nexusstat.simulate import sample_results
 from nexusstat.system_monitor import (
     CPU_TEMP_ID,
     CPU_USAGE_ID,
     DISK_ROOT_ID,
     MEMORY_ID,
-    RESULT_VALIDITY_SECONDS,
     CpuSample,
     SystemMonitor,
     cpu_usage_percent,
@@ -40,6 +39,9 @@ except ImportError:  # Pillow není nainstalované
 
 OBSERVED = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
 WALL_TIME = datetime(2026, 10, 19, 14, 0)
+
+# Platnost z výchozí konfigurace [collector] (3 × 10 s). Kolektor vlastní nemá.
+VALIDITY_SECONDS = CollectorConfig().validity_seconds
 
 # Vzorové /proc/stat: user nice system idle iowait irq softirq steal guest guest_nice.
 # První vzorek: celkem 1000, nečinnost (idle + iowait) 850.
@@ -87,7 +89,7 @@ class FixtureCase(unittest.TestCase):
         return self.statvfs_result
 
     def monitor(self):
-        return SystemMonitor(proc_dir=self.proc, thermal_dir=self.thermal, statvfs=self.fake_statvfs)
+        return SystemMonitor(VALIDITY_SECONDS, proc_dir=self.proc, thermal_dir=self.thermal, statvfs=self.fake_statvfs)
 
     def by_id(self, results):
         return {result.id: result for result in results}
@@ -249,8 +251,21 @@ class CollectTest(FixtureCase):
 
     def test_validity_and_time_bases(self):
         for result in self.monitor().collect(1234.5, OBSERVED):
-            self.assertEqual(result.expires_monotonic, 1234.5 + RESULT_VALIDITY_SECONDS)
+            self.assertEqual(result.expires_monotonic, 1234.5 + VALIDITY_SECONDS)
             self.assertEqual(result.observed_utc, OBSERVED)
+
+    def test_validity_comes_from_collector_config(self):
+        # Žádná pevná platnost: interval 7 s dává platnost 21 s.
+        validity = CollectorConfig(interval_seconds=7).validity_seconds
+        monitor = SystemMonitor(validity, proc_dir=self.proc, thermal_dir=self.thermal, statvfs=self.fake_statvfs)
+        for result in monitor.collect(100, OBSERVED):
+            self.assertEqual(result.expires_monotonic, 121)
+
+    def test_invalid_validity_is_rejected(self):
+        for validity in (0, -30, True, "30", None):
+            with self.subTest(validity=validity):
+                with self.assertRaises(ValueError):
+                    SystemMonitor(validity, proc_dir=self.proc)
 
     def test_disk_checks_only_root(self):
         self.monitor().collect(10, OBSERVED)
@@ -326,7 +341,7 @@ class PartialFailureTest(FixtureCase):
     def test_everything_broken_still_returns_all(self):
         empty = Path(self.tmp.name) / "prazdne"
         self.statvfs_result = OSError("simulovaná chyba")
-        monitor = SystemMonitor(proc_dir=empty, thermal_dir=empty, statvfs=self.fake_statvfs)
+        monitor = SystemMonitor(VALIDITY_SECONDS, proc_dir=empty, thermal_dir=empty, statvfs=self.fake_statvfs)
         results = monitor.collect(10, OBSERVED)
         self.assertEqual(len(results), 4)
         self.assertEqual({result.state for result in results}, {State.UNKNOWN})
@@ -334,18 +349,20 @@ class PartialFailureTest(FixtureCase):
 
 class SimulatedFlagTest(FixtureCase):
     def test_real_sources_are_not_simulated(self):
-        self.assertFalse(SystemMonitor().simulated)
+        self.assertFalse(SystemMonitor(VALIDITY_SECONDS).simulated)
 
     def test_real_paths_in_any_form_are_not_simulated(self):
         # Regrese: Path("/proc") se porovnával s řetězcem "/proc" a skutečná
         # data by se na displeji chybně označila jako SIM.
-        self.assertFalse(SystemMonitor(proc_dir=Path("/proc")).simulated)
-        self.assertFalse(SystemMonitor(proc_dir="/proc/", thermal_dir=Path("/sys/class/thermal")).simulated)
+        self.assertFalse(SystemMonitor(VALIDITY_SECONDS, proc_dir=Path("/proc")).simulated)
+        self.assertFalse(
+            SystemMonitor(VALIDITY_SECONDS, proc_dir="/proc/", thermal_dir=Path("/sys/class/thermal")).simulated
+        )
 
     def test_any_replaced_source_is_simulated(self):
         self.assertTrue(self.monitor().simulated)
-        self.assertTrue(SystemMonitor(statvfs=self.fake_statvfs).simulated)
-        self.assertTrue(SystemMonitor(proc_dir=self.proc).simulated)
+        self.assertTrue(SystemMonitor(VALIDITY_SECONDS, statvfs=self.fake_statvfs).simulated)
+        self.assertTrue(SystemMonitor(VALIDITY_SECONDS, proc_dir=self.proc).simulated)
         self.assertTrue(all(result.simulated for result in self.monitor().collect(0, OBSERVED)))
 
     def test_simulator_sample_data_is_simulated(self):
@@ -354,7 +371,7 @@ class SimulatedFlagTest(FixtureCase):
     @unittest.skipUnless(os.path.exists("/proc/stat"), "není Linux s /proc")
     def test_real_system_smoke(self):
         # Jediný test nad skutečným systémem: kontroluje jen strukturu, ne hodnoty.
-        monitor = SystemMonitor()
+        monitor = SystemMonitor(VALIDITY_SECONDS)
         monitor.collect(0, OBSERVED)
         results = monitor.collect(1, OBSERVED)
         self.assertEqual([r.id for r in results], [CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID, DISK_ROOT_ID])
@@ -392,7 +409,8 @@ class CoreAndOledIntegrationTest(FixtureCase):
 
     def test_expired_results_become_na_text_and_unknown(self):
         results = self.collect_twice(now=100)
-        expired_at = 100 + RESULT_VALIDITY_SECONDS
+        expired_at = 100 + VALIDITY_SECONDS
+        self.assertEqual(page_lines("DISK", results, expired_at - 0.001), ["Disk / 21 % z 191 GiB"])
         self.assertEqual(page_lines("DISK", results, expired_at), ["Disk / N/A"])
         self.assertEqual(overall_state(results, expired_at), State.UNKNOWN)
         self.assertEqual(len(active_problems(results, expired_at)), 4)

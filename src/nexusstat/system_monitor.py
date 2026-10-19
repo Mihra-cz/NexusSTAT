@@ -16,6 +16,7 @@ from collections import namedtuple
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .config import CollectorConfig
 from .core import CheckResult, State
 
 CPU_USAGE_ID = "system.cpu_usage"
@@ -30,11 +31,6 @@ LABELS = {
     MEMORY_ID: "RAM",
     DISK_ROOT_ID: "Disk /",
 }
-
-# Doba platnosti výsledku od měření. Dočasná hodnota: později se odvodí z intervalu
-# pravidelného spouštění kolektoru. Když kolektor přestane běžet, hodnoty po 30 s
-# zestárnou na UNKNOWN místo tichého zamrznutí.
-RESULT_VALIDITY_SECONDS = 30
 
 # Typy teplotních zón, které měří CPU, v pořadí přednosti. Číslo zóny se mezi
 # stroji liší (na notebooku může být thermal_zone0 i Wi-Fi), proto rozhoduje typ.
@@ -172,7 +168,16 @@ class SystemMonitor:
     Pamatuje si jen předchozí vzorek CPU, protože vytížení vyžaduje dva vzorky.
     """
 
-    def __init__(self, proc_dir=DEFAULT_PROC_DIR, thermal_dir=DEFAULT_THERMAL_DIR, statvfs=os.statvfs):
+    def __init__(self, validity_seconds, proc_dir=DEFAULT_PROC_DIR, thermal_dir=DEFAULT_THERMAL_DIR,
+                 statvfs=os.statvfs):
+        # Platnost výsledků dodává volající z konfigurace (CollectorConfig, trojnásobek
+        # intervalu měření). Kolektor nemá vlastní výchozí hodnotu, aby se nemohla
+        # rozejít s intervalem spouštění. Když měření přestanou přicházet, hodnoty
+        # zestárnou na UNKNOWN místo tichého zamrznutí.
+        is_number = isinstance(validity_seconds, (int, float)) and not isinstance(validity_seconds, bool)
+        if not is_number or validity_seconds <= 0:
+            raise ValueError(f"validity_seconds musí být kladný počet sekund, ne {validity_seconds!r}")
+        self.validity_seconds = validity_seconds
         self.proc_dir = Path(proc_dir)
         self.thermal_dir = Path(thermal_dir)
         self.statvfs = statvfs
@@ -208,7 +213,7 @@ class SystemMonitor:
             # ArithmeticError: nesmyslně velké číslo projde int(), ale dělení na
             # float přeteče (OverflowError). Je to vadný údaj, ne pád celého měření.
             state, summary = State.UNKNOWN, f"{label}: neplatná data"
-        expires = now + RESULT_VALIDITY_SECONDS
+        expires = now + self.validity_seconds
         return CheckResult(check_id, state, summary, observed_utc, expires, simulated=self.simulated)
 
     def _cpu_usage(self):
@@ -240,7 +245,7 @@ class SystemMonitor:
 
 def main():
     """Dva vzorky skutečného systému s odstupem 1 s a výpis výsledků."""
-    monitor = SystemMonitor()
+    monitor = SystemMonitor(validity_seconds=CollectorConfig().validity_seconds)
     monitor.collect(time.monotonic(), datetime.now(timezone.utc))  # první vzorek CPU
     time.sleep(1)
     for result in monitor.collect(time.monotonic(), datetime.now(timezone.utc)):

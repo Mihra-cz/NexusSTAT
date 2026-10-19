@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import OledConfig, load_oled_config
+from .config import Config, load_config
 from .core import CheckResult, State, active_problems
 from .oled import CAROUSEL_PAGES, Mode, OledController
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
@@ -110,8 +110,11 @@ def run(output_dir, config):
 
 
 def run_live(output_dir, config):
-    """Snímek každé obrazovky ze skutečného měření. Čas je skutečný monotónní."""
-    monitor = SystemMonitor()
+    """Snímek každé obrazovky ze skutečného měření. Čas je skutečný monotónní.
+
+    `config` je celá konfigurace: [oled] pro automat, [collector] pro platnost výsledků.
+    """
+    monitor = SystemMonitor(validity_seconds=config.collector.validity_seconds)
     monitor.collect(time.monotonic(), datetime.now(timezone.utc))  # první vzorek CPU
     time.sleep(1)
     now = time.monotonic()
@@ -126,10 +129,10 @@ def run_live(output_dir, config):
     # Každou stránku kolotoče vykreslíme ve stejném okamžiku `now`, aby žádný
     # snímek neukazoval výsledky po vypršení platnosti.
     for page in CAROUSEL_PAGES:
-        controller = OledController(config, pages=(page,))
+        controller = OledController(config.oled, pages=(page,))
         controller.press(now, 0)
         save_png(render_screen(controller, now, results, wall_time), output_dir / f"live_{page}.png")
-    controller = OledController(config)
+    controller = OledController(config.oled)
     controller.press(now, 0)
     controller.press(now, len(active_problems(results, now)))  # druhý stisk otevře STATUS
     save_png(render_screen(controller, now, results, wall_time), output_dir / "live_STATUS.png")
@@ -138,14 +141,14 @@ def run_live(output_dir, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Offline simulace OLED NexusSTAT")
     parser.add_argument("output_dir", type=Path, help="složka pro PNG snímky")
-    parser.add_argument("--config", type=Path, help="TOML s sekcí [oled]")
+    parser.add_argument("--config", type=Path, help="TOML se sekcemi [oled] a [collector]")
     parser.add_argument("--live", action="store_true", help="skutečné read-only měření tohoto počítače")
     args = parser.parse_args(argv)
-    config = load_oled_config(args.config) if args.config else OledConfig()
+    config = load_config(args.config) if args.config else Config()
     if args.live:
         run_live(args.output_dir, config)
     else:
-        run(args.output_dir, config)
+        run(args.output_dir, config.oled)
 
 
 if __name__ == "__main__":

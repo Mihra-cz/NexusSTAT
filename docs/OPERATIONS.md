@@ -4,7 +4,7 @@
 
 Na Nexusu zatím neběží žádný kód, service ani port. Není co instalovat, spouštět či zastavovat. Příkazy v sekcích o Nexusu níže nejsou příkazem k nasazení.
 
-## Lokální vývoj (simulace a read-only kolektor)
+## Lokální vývoj (simulace, read-only kolektor a pravidelné měření)
 
 Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku, síti ani NAS. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`; nic nezapisuje a nespouští žádné příkazy.
 
@@ -13,9 +13,13 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 PYTHONPATH=src python3 -m nexusstat.simulate /tmp/nexusstat-sim
 PYTHONPATH=src python3 -m nexusstat.simulate /tmp/nexusstat-live --live
 PYTHONPATH=src python3 -m nexusstat.system_monitor
+PYTHONPATH=src python3 -m nexusstat.run
+PYTHONPATH=src python3 -m nexusstat.run --config config/config.example.toml
 ```
 
-Úspěšné testy dokládají logiku automatu, validaci, výpočty kolektoru nad vzorovými vstupy a vykreslení do obrázku. Nedokládají funkci displeje, tlačítka ani správnou volbu teplotního senzoru na Raspberry Pi 5; to vyžaduje samostatné schválené read-only ověření na cílovém stroji.
+`nexusstat.run` měří v popředí terminálu každých `[collector] interval_seconds` (výchozí 10 s) a vypisuje jeden řádek na měření. Ukončení Ctrl+C (kód 0); neplatná nebo chybějící konfigurace skončí kódem 2 bez měření. Neběží jako služba, nezapisuje soubory, neotevírá port a SIGTERM zvlášť neobsluhuje (proces skončí výchozím způsobem, nic se neukládá). Interval jde ověřit vlastní kopií konfigurace mimo Git, např. `config/config.toml` (ignorováno v `.gitignore`).
+
+Úspěšné testy dokládají logiku automatu, validaci, výpočty kolektoru nad vzorovými vstupy, plánování smyčky se simulovaným časem a vykreslení do obrázku. Nedokládají funkci displeje, tlačítka ani správnou volbu teplotního senzoru na Raspberry Pi 5; to vyžaduje samostatné schválené read-only ověření na cílovém stroji. Ruční běh `nexusstat.run` dokládá jen funkci na notebooku.
 
 ### Návratový postup lokálního vývoje
 

@@ -1,12 +1,15 @@
 # Ukázková konfigurace. Na Nexusu se zatím nic neaplikuje.
 # Aktivní jsou jen položky, které kód skutečně načítá a validuje
-# (src/nexusstat/config.py). Neznámý klíč v [oled] i jiná sekce je chyba.
+# (src/nexusstat/config.py). Neznámý klíč i jiná sekce je chyba.
 [oled]
 width = 128   # podporováno pouze 128
 height = 64   # podporováno pouze 64
 carousel_seconds = 300    # celé sekundy 1–3600
 page_seconds = 10         # celé sekundy 1–3600, nejvýše carousel_seconds
 status_idle_seconds = 30  # celé sekundy 1–3600
+
+[collector]
+interval_seconds = 10  # celé sekundy 1–3600; platnost výsledků = 3 × interval (nenastavuje se zvlášť)
 
 # --- Budoucí možnosti: zatím NEIMPLEMENTOVÁNO a nenačítá se ---
 # Nápis na první stránce je pevně NEXUS, hodiny jsou vždy 24h.

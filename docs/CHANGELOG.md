@@ -1,5 +1,17 @@
 # Changelog NexusSTAT
 
+## 2026-10-19 – v0.3: pravidelný běh diagnostiky (lokálně)
+
+- Nový `src/nexusstat/run.py`: jedna hlavní smyčka `run_loop()`, která každých `interval_seconds` změří CPU, teplotu CPU, RAM a obsazenost `/` a vypíše jeden řádek do terminálu. Spuštění `PYTHONPATH=src python3 -m nexusstat.run [--config SOUBOR]`, ukončení Ctrl+C.
+- Plánování v monotónním čase, čas měření v UTC. Termíny se počítají od plánovaného času, takže neujíždějí. Zpoždění o celý interval nebo víc spustí jediné měření a interval začne znovu; zmeškaná měření se nedohánějí. Mezi měřeními proces spí, bez aktivního čekání.
+- Výjimka kolektoru: všechny kontroly `UNKNOWN` („měření selhalo“), předchozí hodnoty se nepodrží, smyčka běží dál. Ctrl+C se za selhání nepovažuje.
+- Konfigurace: nová sekce `[collector]` s `interval_seconds = 10` (celé sekundy 1–3600, stejně přísná validace jako `[oled]`). `load_config()` vrací `Config(oled, collector)` a validuje vždy celý soubor; nahrazuje `load_oled_config()`. Platnost výsledků `validity_seconds` = 3 × interval.
+- `system_monitor.py`: odstraněna pevná platnost `RESULT_VALIDITY_SECONDS = 30`; `SystemMonitor(validity_seconds, ...)` ji dostává od volajícího. Simulátor (`--live`) a ukázka `system_monitor` používají platnost z konfigurace. Funkce simulátoru beze změny.
+- Testy: `tests/test_run.py` se simulovanými hodinami, `sleep` a kolektorem (plánování, drift, zpoždění a restart intervalu, expirace, výpadek kolektoru, Ctrl+C, výpis, kompatibilita s Core a OLED, `main` a konfigurace); rozšířené `test_config.py` a `test_system_monitor.py`. Žádný test skutečně nečeká.
+- `CLAUDE.md` bod 3 popisuje aktuální pracovní postup místo splněného prvního úkolu. `REQUIREMENTS.md`: platnost 3 × interval a sekce Pravidelné měření.
+- Ověření: celá sada `unittest` s Pillow i bez Pillow; ruční běh `nexusstat.run` na notebooku ukončený signálem SIGINT (kód 0, bez tracebacku, spotřeba CPU ~0,2 s za 7 s běhu); neplatná konfigurace kód 2; kontrolní mutace smyčky (drift, chybějící restart, podržení starých hodnot, aktivní čekání, Ctrl+C jako výpadek) testy odhalí. Simulátor ověřen bez generování PNG.
+- Ověřeno jen na notebooku (x86_64, Linux Mint), ne na Raspberry Pi 5. Bez nasazení, služby, commitu a pushe.
+
 ## 2026-10-19 – Git a příprava veřejného repozitáře
 
 - Lokálně `git init -b main` a `origin` = `https://github.com/Mihra-cz/NexusSTAT.git` (veřejný, v okamžiku propojení prázdný).

@@ -37,9 +37,17 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 - Platná naměřená hodnota bez stanoveného alarmového prahu má stav `INFO`.
 - STATUS bez aktivních závad zobrazuje `NO ACTIVE ISSUES`.
 - První vzorek CPU bez dostatku údajů pro výpočet má stav `UNKNOWN`.
-- Platnost výsledků 30 s je dočasná; později se naváže na interval pravidelného spouštění kolektoru.
+- Platnost výsledků je trojnásobek intervalu pravidelného měření (výchozí 3 × 10 s = 30 s), viz níže.
 - Rozsah teploty (0, 125] °C je prozatím jen kontrola věrohodnosti údaje, ne univerzální hardwarový limit ani alarmový práh.
 - Chyba jedné kontroly nesmí ovlivnit ostatní kontroly.
+
+## Pravidelné měření (potvrzeno pro v0.3)
+
+- Jedna přehledná smyčka pravidelně měří CPU, teplotu CPU, RAM a obsazenost `/`; výsledky stručně vypisuje do terminálu, bez vlastního logování.
+- Interval `[collector] interval_seconds`, výchozí 10 s. Platnost výsledků je trojnásobek intervalu a samostatně se nenastavuje.
+- Plánování v monotónním čase, čas měření v UTC. Plánované termíny postupně neujíždějí; při zpoždění se nespouští několik doháněcích měření najednou.
+- Selhání měření nesmí vést k falešnému stavu OK. Žádné aktivní čekání vytěžující procesor. Čisté ukončení pomocí Ctrl+C.
+- Zatím jen terminál: bez OLED hardware, služby, webu a SQLite.
 
 ## Tlačítko a kritické funkce
 

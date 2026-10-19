@@ -62,9 +62,11 @@ dependencies_optional = ["Pillow"] # jen obrazová simulace OLED; ověřeno 10.2
 # Lokální vývoj na notebooku. Nic z toho neběží na Nexusu (viz platform.deployment).
 location = "developer-notebook-only"
 last_verified = "2026-10-19"
-implemented_locally = ["core-state-model", "oled-state-machine", "oled-image-simulator", "system-collector-readonly"]
+implemented_locally = ["core-state-model", "oled-state-machine", "oled-image-simulator", "system-collector-readonly", "periodic-collection-loop-terminal"]
 system_collector_sources = ["/proc/stat", "/proc/meminfo", "/sys/class/thermal", "statvfs(/)"]
-verified_on = "x86_64 Linux Mint (unit tests + read-only run)"
+collector_interval_default_seconds = 10 # [collector] interval_seconds; platnost výsledků = 3 × interval
+periodic_loop = "foreground-terminal-only; not-a-service"
+verified_on = "x86_64 Linux Mint (unit tests + read-only run + periodic loop in terminal)"
 raspberry_pi_tested = false
 hardware_display_tested = false
 alarm_thresholds = "not-defined"
