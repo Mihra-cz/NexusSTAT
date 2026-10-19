@@ -16,10 +16,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import Config, load_config
-from .core import CheckResult, State, active_problems
+from .core import CheckResult, Measurement, State, active_problems
 from .oled import CAROUSEL_PAGES, Mode, OledController
 from .services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
-from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
+from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT, SystemMonitor
 
 # Snímky se ukládají zvětšené, aby byly 128 × 64 pixely na monitoru čitelné.
 PNG_SCALE = 4
@@ -29,30 +29,31 @@ def sample_results(observed_utc):
     """Fiktivní výsledky kontrol: od t=5 s 6 aktivních problémů, tj. 2 stránky STATUS.
 
     Všechny jsou označené simulated=True, takže displej ukazuje značku SIM.
-    Služby odpovídají ukázce stránky SLUŽBY (NEXUS, ANIMEDB a NAS OK, BACKUP WARN);
-    ostatní fiktivní problémy jim proto neodporují.
+    Služby odpovídají ukázce stránky SERVICES (NEXUS, ANIMEDB a NAS OK, BACKUP WARN);
+    ostatní fiktivní problémy jim proto neodporují. Hodnoty mají číselnou
+    hodnotu jako skutečný kolektor, protože displej ukazuje ji, ne popis.
     """
     valid = 10_000  # monotónní sekundy, dost dlouho na celý scénář
 
-    def sim(check_id, state, summary, expires=valid):
-        return CheckResult(check_id, state, summary, observed_utc, expires, simulated=True)
+    def sim(check_id, state, summary, expires=valid, value=None):
+        return CheckResult(check_id, state, summary, observed_utc, expires, simulated=True, measurement=value)
 
     return [
         sim("system.load", State.OK, "Zátěž v normě"),
         sim("disk.root_readonly", State.CRITICAL, "Disk / jen pro čtení"),
         sim("system.time_sync", State.ERROR, "Čas nesynchronizován"),
-        sim("disk.nvme_temp", State.WARNING, "NVMe 71 °C"),
+        sim("disk.nvme_temp", State.WARNING, "NVMe 71 °C", value=Measurement(71, CELSIUS)),
         sim("docker.engine", State.UNKNOWN, "Docker: stav neznámý"),
         # N/A s krátkou platností: neexpiruje, zůstane N/A po celý scénář.
         sim("public.status", State.NA, "Veřejný status vypnut", expires=1),
         # Výsledek s prošlou platností: v čase scénáře se z OK stane UNKNOWN.
         sim("disk.smart", State.OK, "SMART bez chyb", expires=5),
         # Fiktivní hodnoty pro stránky SYSTEM a DISK (stejná id jako kolektor).
-        sim(CPU_USAGE_ID, State.INFO, "CPU 23 %"),
-        sim(CPU_TEMP_ID, State.INFO, "Teplota CPU 48 °C"),
-        sim(MEMORY_ID, State.INFO, "RAM 24 % z 7,9 GiB"),
-        sim(DISK_ROOT_ID, State.INFO, "Disk / 31 % z 117 GiB"),
-        # Fiktivní stavy služeb pro stránku SLUŽBY (skutečné kolektory zatím nejsou).
+        sim(CPU_USAGE_ID, State.INFO, "CPU 23 %", value=Measurement(23, PERCENT)),
+        sim(CPU_TEMP_ID, State.INFO, "Teplota CPU 48 °C", value=Measurement(48, CELSIUS)),
+        sim(MEMORY_ID, State.INFO, "RAM 24 % z 7,9 GiB", value=Measurement(24, PERCENT)),
+        sim(DISK_ROOT_ID, State.INFO, "Disk / 31 % z 117 GiB", value=Measurement(31, PERCENT)),
+        # Fiktivní stavy služeb pro stránku SERVICES (skutečné kolektory zatím nejsou).
         sim(NEXUS_SERVICES_ID, State.OK, "Služby Nexusu běží"),
         sim(ANIMEDB_ID, State.OK, "AnimeDB odpovídá"),
         sim(NAS_ID, State.OK, "NAS dostupný"),
@@ -66,7 +67,7 @@ SCENARIO = [
     (1, "press"),  # probuzení na NEXUS
     (11, "wait"),  # SYSTEM
     (21, "wait"),  # DISK
-    (31, "wait"),  # SERVICES (na displeji SLUŽBY)
+    (31, "wait"),  # SERVICES
     (41, "wait"),  # kolotoč dokola: znovu NEXUS
     (45, "press"),  # STATUS 1/2
     (50, "press"),  # STATUS 2/2

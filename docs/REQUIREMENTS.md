@@ -4,7 +4,36 @@
 
 ## Účel
 
-Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic, Docker, služby, později AnimeDB). Postupná náhrada nadbytečných aplikačních funkcí Pironman 5 bez ohrožení hardwarového chlazení. Žádná povinná cloudová závislost.
+Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic, Docker, služby, později AnimeDB). **Cílem je nahradit aplikační software Pironman 5 vlastním NexusSTAT**, ne ho trvale provozovat vedle Pironmanu; hardwarové ochranné funkce a chlazení přitom nesmí utrpět (viz Náhrada Pironmanu 5). Žádná povinná cloudová závislost.
+
+## Náhrada Pironmanu 5 (schválený cíl, zatím neimplementováno)
+
+- NexusSTAT postupně převezme aplikační funkce Pironman 5: systémový monitoring, obrazovky OLED, signalizaci RGB, obsluhu dostupných funkcí fyzického tlačítka, monitoring ventilátorů, historii naměřených hodnot a lokální webové rozhraní.
+- Dnes existuje jen lokální vývoj na notebooku (offline simulace OLED, read-only systémový kolektor). Na Nexusu nic neběží a Pironman dál plní všechny své funkce.
+- Hardwarové ochranné mechanismy Raspberry Pi (firmware, teplotní omezování výkonu, nouzové vypnutí při přehřátí) se neodstraňují ani neobcházejí.
+- Hlavní CPU ventilátor dál bezpečně řídí Linux (kernel/firmware); NexusSTAT ho jen čte.
+- Oba boční ventilátory Pironmanu musí mít před vypnutím původního softwaru bezpečně ověřené nezávislé řízení (fyzická kontrola, teplotní dohled, rollback).
+- Pironman se nevypne, dokud není ověřené předání všech potřebných funkcí. Převzetí probíhá po jednotlivých funkcích, ne najednou.
+- Návrat k původnímu softwaru musí zůstat možný: při přechodu se Pironman nejdřív jen zastaví a zakáže, neodinstaluje se, a jeho konfigurace se předem zálohuje.
+
+## Historie a databáze SQLite (schválený směr, zatím neimplementováno)
+
+- Hlavní databází NexusSTAT pro historii měření, alarmů a událostí bude **SQLite**. NexusSTAT nesmí vyžadovat InfluxDB Pironmanu ani na ní stavět.
+- Po úspěšném nahrazení Pironmanu nebude jeho ukládání historie potřeba. Vypnutí příslušné instance InfluxDB je cíl, ale až po ověření, že ji nepoužívá žádná jiná aplikace, a po schválení.
+- Druhy dat:
+  1. **Aktuální měření**: rychlé hodnoty pro OLED, alarmy a web, v paměti procesu s časem platnosti; základní interval měření 10 s. Nečtou se z databáze a výpadek databáze je neovlivní.
+  2. **Historie měření**: časové řady vytížení CPU, teploty CPU, RAM, stavu a případně otáček CPU ventilátoru, obsazenosti disků, síťového provozu RX/TX a dalších systémových měření.
+  3. **Historie alarmů**: vznik alarmu, změna závažnosti, odeznění, ztráta měření (`UNKNOWN`), budoucí potvrzení nebo ztišení uživatelem.
+  4. **Systémové události**: start a ukončení NexusSTAT, výpadek kolektoru, změna konfigurace, významné změny sledovaných služeb.
+- Alarmy a události se ukládají jako přechody; nezměněný stav se každých 10 s znovu neukládá. Chybějící měření se ukládá jako mezera, nikdy jako nula. Simulovaná data se do provozní historie nezapisují.
+- Retence, **výchozí návrh, ne implementovaný kontrakt**: 30 dní původní měření po 10 s, 1 rok minutové agregace, dlouhodobě hodinové nebo denní agregace; důležité alarmy a systémové události mají samostatnou retenční politiku. Před implementací ověřit očekávanou velikost databáze, počet ukládaných veličin, frekvenci zápisů a nároky na SSD Raspberry Pi 5 (orientační měření v `ARCHITECTURE.md`).
+- Jednoduchost: modul `sqlite3` ze standardní knihovny, bez ORM, databázového frameworku a externí databázové služby.
+- Umístění: lokální SSD, adresář `/srv/nexus/appdata/nexusstat/` podle standardu Nexus; název souboru se určí s návrhem schématu. SQLite se nikdy neprovozuje přímo na NAS/CIFS.
+- Zvážit režim WAL pro současné čtení (web) a zápis.
+- Zálohování: konzistentní kopie živé databáze přes SQLite Backup API, napojená na existující Restic, s ověřenou obnovou. **Samotné kopírování aktivního souboru SQLite (ani spolu se soubory `-wal` a `-shm`) nemusí být konzistentní záloha.**
+- Retenční pravidla a omezení růstu databáze; ošetření chyb zápisu a nedostatku místa.
+- Chyba ukládání historie není chyba monitoringu: aktuální měření, alarmy, OLED a web běží dál a výpadek historie se hlásí jako vlastní stav, ne jako závada měřené veličiny.
+- Dokumentace SQLite: [WAL](https://www.sqlite.org/wal.html), [Backup API](https://www.sqlite.org/backup.html).
 
 ## Stavové kategorie
 
@@ -20,7 +49,7 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 ## OLED 128 × 64 (schválený směr UX)
 
 1. Displej nejprve spí. První **krátký stisk** zobrazí první stránku s nápisem `NEXUS`, hodinami (24h) a datem.
-2. Režim **CAROUSEL** automaticky mění stránky v pořadí **NEXUS → SYSTEM → DISK → SLUŽBY** a pak znovu NEXUS, každých **10 s**; celkově je aktivní **300 s** a následně OLED usne. Výchozí hodnoty jsou konfigurovatelné, později změnitelné přes LAN web.
+2. Režim **CAROUSEL** automaticky mění stránky v pořadí **NEXUS → SYSTEM → DISK → SERVICES** a pak znovu NEXUS, každých **10 s**; celkově je aktivní **300 s** a následně OLED usne. Výchozí hodnoty jsou konfigurovatelné, později změnitelné přes LAN web.
 3. Každý další krátký stisk během kolotoče otevře **STATUS**, což je přehled konkrétních závad pod sebou.
 4. **STATUS bez závad nebo s jednou stránkou:** další krátký stisk vrací do CAROUSEL.
 5. **STATUS s více stránkami:** další stisky listují po stránkách; ze **závěrečné stránky** další krátký stisk vrací do CAROUSEL (bez cyklení uvnitř STATUS).
@@ -30,8 +59,27 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 9. OLED v běžném stavu není nuceně rozsvěcen pouze kvůli upozornění. Ovládání a uspání musí zůstat funkční i při chybách.
 10. Vše nejprve testovat jako monochromatický bitmapový simulátor 128 × 64 bez hardware.
 11. STATUS bez sledovaných dat zobrazí `NO MONITOR DATA`, bez aktivních problémů při platných datech `NO ACTIVE ISSUES`. Obrazovky se simulovanými daty nesou značku `SIM`.
-12. Stránky SYSTEM a DISK ukazují hodnoty ze systémového kolektoru. Nedostupná hodnota se zobrazí jako text `N/A`, její diagnostický stav je `UNKNOWN`. Bez zapnutých prahů (`[alarms]`, výchozí vypnuto) se z hodnot neodvozuje WARNING ani ERROR.
-13. Stránka **SLUŽBY** (interně `SERVICES`) má řádky NEXUS, ANIMEDB, NAS a BACKUP: název vlevo, stav vpravo (`OK`, `INFO`, `WARN`, `ERR`, `CRIT`, `UNKN`, `N/A`). Hodnoty dodají budoucí kolektory; dnes žádné nejsou. Ve skutečném režimu se nevykonaná kontrola nikdy neukáže jako `OK`: sledovaná služba bez výsledku nebo s prošlým výsledkem je `UNKNOWN` konzistentně na stránce SLUŽBY (`UNKN`), v symbolu `?` na stránce NEXUS i ve STATUS. `UNKNOWN` není potvrzená závada; potvrzené WARNING/ERROR mají přednost (trojúhelník, pořadí ve STATUS). Nenasazená AnimeDB je `N/A`: není alarm ani neznámý stav. Položka NEXUS netvrdí `OK`, dokud nebude mít jednoznačně definovaný healthcheck s kolektorem. Fiktivní stavy simulátoru nesou značku `SIM`. Konkrétní závady dál ukazuje samostatný STATUS se stávajícím ovládáním.
+12. Stránky SYSTEM a DISK ukazují hodnoty ze systémového kolektoru: anglický název vlevo, hodnota s jednotkou vpravo (`CPU 23%`, `CPU TEMP 48°C`, `RAM 24%`, `ROOT 42%`). Chybějící, prošlá nebo neměřitelná hodnota se zobrazí jako `UNKN` (diagnostický stav `UNKNOWN`), nikdy jako stará hodnota ani jako `N/A`, které je vyhrazené záměrně vypnuté nebo nenasazené integraci (změna v0.5, dříve text `N/A`). Bez zapnutých prahů (`[alarms]`, výchozí vypnuto) se z hodnot neodvozuje WARNING ani ERROR.
+13. Stránka **SERVICES** má řádky NEXUS, ANIMEDB, NAS a BACKUP: název vlevo, stav vpravo (`OK`, `INFO`, `WARN`, `ERR`, `CRIT`, `UNKN`, `N/A`). Hodnoty dodají budoucí kolektory; dnes žádné nejsou. Ve skutečném režimu se nevykonaná kontrola nikdy neukáže jako `OK`: sledovaná služba bez výsledku nebo s prošlým výsledkem je `UNKNOWN` konzistentně na stránce SERVICES (`UNKN`), v symbolu `?` na stránce NEXUS i ve STATUS. `UNKNOWN` není potvrzená závada; potvrzené WARNING/ERROR mají přednost (trojúhelník, pořadí ve STATUS). Nenasazená AnimeDB je `N/A`: není alarm ani neznámý stav. Položka NEXUS netvrdí `OK`, dokud nebude mít jednoznačně definovaný healthcheck s kolektorem. Fiktivní stavy simulátoru nesou značku `SIM`. Konkrétní závady dál ukazuje samostatný STATUS se stávajícím ovládáním.
+14. Typografie (v0.5): jednotné ostré bitmapové písmo přiložené v projektu (nezávislé na písmech systému, s doloženou licencí), 1 bit na pixel bez vyhlazování. Stránka NEXUS má nápis, hodiny a datum vodorovně na středu podle skutečně vykreslených pixelů (tolerance 1 px), hodiny jsou dominantní; symbol vpravo nahoře ani značka `SIM` vystředění neovlivní a nepřekrývají se s textem.
+15. Jazyk OLED (v0.5): všechny texty na displeji (i v jeho simulovaném obrazu) jsou anglicky, velkými písmeny ASCII bez diakritiky; ze symbolů jen `%`, `°C`, `/`, `:` a `…` u zkrácení. Nadpisy NEXUS, SYSTEM, DISK, SERVICES, STATUS; názvy CPU, CPU TEMP, RAM, ROOT, NEXUS, ANIMEDB, NAS, BACKUP; stavy OK, INFO, WARN, ERR, CRIT, UNKN, N/A. Texty sestavuje samostatná prezentační vrstva výhradně z `id`, stavu a `measurement`, nikdy z textu `summary`; diagnostika, prahy ani id se kvůli zobrazení nemění. Česky zůstávají `summary`, terminál, dokumentace a ovládání okna simulátoru.
+16. STATUS (v0.5): stav vlevo (CRIT/ERR/WARN/UNKN), za mezerou krátký popis nejvýš na 15 znaků bez výpustky, např. `ERR  CPU TEMP 88°C`, `CRIT NAS OFFLINE`, `UNKN NAS NO DATA`. Potvrzený alarm ukazuje skutečně naměřenou hodnotu. `NO DATA` = platná hodnota chybí (nezměřeno, selhání, bez kolektoru), `STALE` = výsledek prošel. Hláška závady bez hodnoty jen u kontrol s jednoznačným významem id (`NAS OFFLINE` = prokázaná nedostupnost, `BACKUP OVERDUE` = stará záloha); jinak jen název. Když se celý popis nevejde, zůstane název kontroly; výpustka až u názvu delšího než řádek. Neznámé id: obecný název `CHECK` a deterministický dohledatelný kód (první 4 znaky SHA-256 id, např. `CHECK 0D51`), samotné id se nezobrazuje; závažnost zůstává ve sloupci stavu.
+
+### Budoucí kolotoč OLED (schválený návrh, zatím neimplementováno)
+
+Body 1–16 popisují implementovanou v0.5 se čtyřmi stránkami NEXUS, SYSTEM, DISK, SERVICES. Cílové uspořádání:
+
+1. **NEXUS** beze změny (varianta B).
+2. **SYSTEM**: CPU, CPU TEMP, RAM, CPU FAN; čtyři řádky čitelné na 128 × 64.
+3. **STORAGE**: rozšíření dnešní stránky DISK.
+4. **NETWORK**: nová stránka.
+5. **SERVICES**: NEXUS, ANIMEDB, NAS, BACKUP beze změny.
+
+- STATUS zůstává samostatný režim přístupný tlačítkem; řazení, stránkování a odlišení WARNING, ERROR, CRITICAL a UNKNOWN se nemění. Časování (10 s na stránku, okno 300 s) a pravidla v0.5 (anglicky, žádné falešné OK, `UNKN` vs `N/A`) platí i pro nové stránky.
+- **CPU FAN** (jen read-only monitoring, žádné řízení): nejméně stav `ON`/`OFF`/`UNKN`, pokud ho lze spolehlivě získat; přednost mají skutečně měřené otáčky (RPM), pokud je hardware poskytuje. Odlišit požadavek řídicího systému od prokázaného fyzického otáčení. `OFF` při nízké teplotě sám o sobě není závada.
+- **STORAGE**: možné položky lokální systémový disk/root, NVMe/SSD, další lokální souborové systémy a relevantní NAS mounty. Rozlišuje se obsazenost souborového systému, volné místo, dostupnost mountu, skutečná dostupnost NAS a velikost konkrétní složky; velikost složky není obsazenost souborového systému. Žádné časté rekurzivní procházení NAS: zjišťování velikosti adresářů má vlastní bezpečný interval a timeout. Otevřené: pokud se nebude sledovat více úložišť, ROOT se přesune pod SYSTEM a stránka STORAGE odpadne.
+- **NETWORK**: vybrané rozhraní, stav linky, aktuální RX a TX, lokální IP adresa, případně adresa webového rozhraní NexusSTAT. RX/TX z rozdílu čítačů v čase; přenosová rychlost v B/s se nezaměňuje s procentním vytížením linky. Počítá se s více rozhraními včetně Dockeru a VPN, virtuální rozhraní se ale automaticky nezahrnují do hlavního zobrazení. Adresa/port webu se ukáže jen tehdy, když web skutečně běží a lze určit použitelnou přístupovou adresu; plánovaný port 8765 se nikdy nevydává za běžící web. IP adresy ani jiné interní údaje z této obrazovky nesmí automaticky proniknout do budoucího veřejného statusu.
+- **SERVICES**: žádné falešné OK; nenapojená služba `UNKNOWN`, záměrně nenasazená integrace `N/A`. Rozšíření katalogu služeb až podle skutečných potřeb.
 
 ## Systémový kolektor (potvrzeno pro v0.2)
 
@@ -60,6 +108,15 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 - Závažné stavy zatím nemají zvláštní rychlou cestu ani automatickou akci. Žádné automatické vypínání serveru ani regulace ventilátorů.
 - Konkrétní hodnoty prahů pro Nexus zatím nejsou schválené.
 
+## Živý simulátor OLED (potvrzeno pro v0.5)
+
+- Okno tkinter na notebooku; obraz výhradně z existujícího `render_screen()`, skutečná bitmapa 128 × 64 zvětšená celočíselně bez vyhlazení, obnova přes `after()` bez aktivního čekání, ve SLEEP černý displej, bezpečné zavření bez procesů na pozadí.
+- Ovládání mimo plochu OLED: tlačítko „Stisk“ a klávesy mezerník/Enter, přepínač scénáře, režim SLEEP/CAROUSEL/STATUS, zrychlení 1×/5×/10× jen v simulaci. Logika je skutečný `OledController`.
+- Jedna společná simulovaná časová základna pro controller, platnost výsledků i vykreslení.
+- Scénáře s fiktivními daty (`simulated=True`, značka `SIM`): vše v pořádku, WARNING, ERROR a CRITICAL, UNKNOWN/zastaralá/chybějící data, více problémů (≥ 2 stránky STATUS), nenapojené služby. Změna scénáře nesmí míchat alarmy ani časy.
+- Volitelný LIVE režim: read-only měření notebooku přes `SystemMonitor` a `AlarmEvaluator`, bez `SIM`, ve skutečném čase, jasně označený jako notebook, ne Nexus; nenapojené služby `UNKNOWN`, AnimeDB `N/A`.
+- Testy bez grafického displeje; stávající testy bez tkinter i Pillow.
+
 ## Tlačítko a kritické funkce
 
 - Fyzický `pwr_button` je událost Linux input zařízení, nikoliv libovolný GPIO pin. Číslo zařízení `/dev/input/eventN` se může lišit a není trvalý kontrakt.
@@ -72,6 +129,7 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 - Hlavní PWM ventilátor CPU ponechat stávající linuxové regulaci.
 - Oba boční ventilátory nyní ovládá Pironman přes GPIO6 v režimu Always On (`gpio_fan_mode=0`); GPIO6 bylo při read-only kontrole `HIGH`. Kernelový gpio-hog je **návrh**, není nasazen ani fyzicky otestován.
 - Nezastavovat Pironman, dokud není schválené a ověřené předání řízení ventilátorů a tlačítka.
+- Monitoring ventilátorů (plán): CPU FAN read-only podle budoucí stránky SYSTEM. U bočních ventilátorů se nejdřív ověří, zda vůbec poskytují otáčky; bez tachometru lze jejich stav nanejvýš odvodit z řídicího signálu, a i jeho čtení (GPIO) vyžaduje samostatné schválení.
 
 ## Web / přístup
 
@@ -79,6 +137,7 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 - Funkce LAN: přehledné stavové karty, filtrování událostí, potvrzení/ztišení alarmů, konfigurace (včetně délky kolotoče 300 s, intervalu 10 s, nečinnosti STATUS 30 s).
 - Na veřejném webu `mh42.cz` pouze sanitizovaný read-only celkový stav a případně stručný výpis závad. **Nikdy** celé logy, interní IP, administraci ani API pro zápis.
 - Oddělit veřejnou projekci dat od administračního procesu už v návrhu; žádný automatický port forwarding nebo cloud.
+- Budoucí lokální web zobrazí historii ze SQLite jen pro čtení; veřejný status z ní dostane jen výslovně povolené souhrnné údaje (allowlist), nikdy IP adresy, rozhraní ani cesty.
 
 ## Jednoduchost a způsob vývoje
 

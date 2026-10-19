@@ -13,7 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from nexusstat.core import ALERT_STATES, Measurement, State, active_problems, overall_state
-from nexusstat.oled import UNKNOWN_SYMBOL, OledController, home_symbol, page_lines
+from nexusstat.oled import UNKNOWN_SYMBOL, OledController, home_symbol
+from nexusstat.oled_text import page_rows
 from nexusstat.config import CollectorConfig, OledConfig
 from nexusstat.simulate import sample_results
 from nexusstat.system_monitor import (
@@ -406,8 +407,9 @@ class SimulatedFlagTest(FixtureCase):
 class CoreAndOledIntegrationTest(FixtureCase):
     def test_value_pages(self):
         results = self.collect_twice(now=100)
-        self.assertEqual(page_lines("SYSTEM", results, 100), ["CPU 20 %", "Teplota CPU 55 °C", "RAM 25 % z 7,6 GiB"])
-        self.assertEqual(page_lines("DISK", results, 100), ["Disk / 21 % z 191 GiB"])
+        # Displej ukazuje číselnou hodnotu zaokrouhlenou stejně jako summary, anglicky.
+        self.assertEqual(page_rows("SYSTEM", results, 100), [("CPU", "20%"), ("CPU TEMP", "55°C"), ("RAM", "25%")])
+        self.assertEqual(page_rows("DISK", results, 100), [("ROOT", "21%")])
 
     def test_valid_values_give_no_symbol_and_no_problems(self):
         results = self.collect_twice(now=100)
@@ -415,10 +417,11 @@ class CoreAndOledIntegrationTest(FixtureCase):
         self.assertIsNone(home_symbol(results, 100))
         self.assertEqual(active_problems(results, 100), [])
 
-    def test_unavailable_value_is_text_na_but_state_unknown(self):
+    def test_unavailable_value_is_unkn_not_na(self):
         write_files(self.thermal, {"thermal_zone1/type": "acpitz\n"})
         results = self.collect_twice(now=100)
-        self.assertIn("Teplota CPU N/A", page_lines("SYSTEM", results, 100))
+        # UNKN, ne N/A: senzor sledujeme, jen jeho hodnotu neznáme.
+        self.assertIn(("CPU TEMP", "UNKN"), page_rows("SYSTEM", results, 100))
         problems = active_problems(results, 100)
         # Diagnostický stav je UNKNOWN, ne State.NA (záměrně nesledovaná integrace).
         self.assertEqual([(p.id, p.state) for p in problems], [(CPU_TEMP_ID, State.UNKNOWN)])
@@ -428,18 +431,18 @@ class CoreAndOledIntegrationTest(FixtureCase):
     def test_first_sample_shows_question_mark(self):
         results = self.monitor().collect(0, OBSERVED)
         self.assertEqual(home_symbol(results, 0), UNKNOWN_SYMBOL)
-        self.assertEqual(page_lines("SYSTEM", results, 0)[0], "CPU N/A")
+        self.assertEqual(page_rows("SYSTEM", results, 0)[0], ("CPU", "UNKN"))
 
-    def test_expired_results_become_na_text_and_unknown(self):
+    def test_expired_results_become_unkn_and_unknown(self):
         results = self.collect_twice(now=100)
         expired_at = 100 + VALIDITY_SECONDS
-        self.assertEqual(page_lines("DISK", results, expired_at - 0.001), ["Disk / 21 % z 191 GiB"])
-        self.assertEqual(page_lines("DISK", results, expired_at), ["Disk / N/A"])
+        self.assertEqual(page_rows("DISK", results, expired_at - 0.001), [("ROOT", "21%")])
+        self.assertEqual(page_rows("DISK", results, expired_at), [("ROOT", "UNKN")])
         self.assertEqual(overall_state(results, expired_at), State.UNKNOWN)
         self.assertEqual(len(active_problems(results, expired_at)), 4)
 
-    def test_missing_results_show_na(self):
-        self.assertEqual(page_lines("SYSTEM", [], 0), ["CPU N/A", "Teplota CPU N/A", "RAM N/A"])
+    def test_missing_results_show_unkn(self):
+        self.assertEqual(page_rows("SYSTEM", [], 0), [("CPU", "UNKN"), ("CPU TEMP", "UNKN"), ("RAM", "UNKN")])
 
     def test_collector_problems_drive_status_paging(self):
         results = self.monitor().collect(0, OBSERVED)  # jediný problém: první vzorek CPU

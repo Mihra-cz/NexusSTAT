@@ -19,10 +19,10 @@ from nexusstat.oled import (
     Mode,
     OledController,
     home_symbol,
-    service_rows,
     split_status_pages,
     status_page_count,
 )
+from nexusstat.oled_text import service_rows
 from nexusstat.services import (
     ANIMEDB_ID,
     BACKUP_ID,
@@ -275,7 +275,7 @@ class ServiceRowsTest(unittest.TestCase):
                          [("NEXUS", "OK"), ("ANIMEDB", "OK"), ("NAS", "OK"), ("BACKUP", "WARN")])
 
     def test_missing_service_rows_are_unknown_never_ok(self):
-        # Pojistka i bez doplnění: chybějící služba se na SLUŽBY nikdy neukáže jako OK.
+        # Pojistka i bez doplnění: chybějící služba se na SERVICES nikdy neukáže jako OK.
         self.assertEqual(service_rows([], 10), [(label, "UNKN") for label in SERVICE_LABELS.values()])
 
 
@@ -290,7 +290,7 @@ def problem_states(results, now=10):
 
 
 class ServiceConsistencyTest(unittest.TestCase):
-    """SLUŽBY, symbol na stránce NEXUS a STATUS vycházejí ze stejných výsledků."""
+    """SERVICES, symbol na stránce NEXUS a STATUS vycházejí ze stejných výsledků."""
 
     def test_completion_adds_unknown_and_na(self):
         added = complete_service_results([], OBSERVED, 30)

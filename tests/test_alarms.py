@@ -12,7 +12,8 @@ from pathlib import Path
 from nexusstat.alarms import AlarmEvaluator, measured_level
 from nexusstat.config import AlarmRule, AlarmsConfig, OledConfig
 from nexusstat.core import CheckResult, Measurement, State, active_problems, effective, overall_state
-from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, Mode, OledController, home_symbol, page_lines
+from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, Mode, OledController, home_symbol
+from nexusstat.oled_text import page_rows, status_texts
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
 
 try:
@@ -398,12 +399,14 @@ class OledCompatibilityTest(unittest.TestCase):
 
     def test_pages_show_values_and_status_orders_problems(self):
         results = self.evaluated()
-        # Text hodnot na stránkách zůstává stejný jako bez prahů.
-        self.assertEqual(page_lines("SYSTEM", results, 25), ["CPU N/A", "Teplota CPU 72 °C", "RAM N/A"])
-        self.assertEqual(page_lines("DISK", results, 25), ["Disk / 96 % z 117 GiB"])
+        # Hodnoty na stránkách jsou stejné jako bez prahů: skutečně naměřené číslo.
+        self.assertEqual(page_rows("SYSTEM", results, 25), [("CPU", "UNKN"), ("CPU TEMP", "72°C"), ("RAM", "UNKN")])
+        self.assertEqual(page_rows("DISK", results, 25), [("ROOT", "96%")])
         self.assertEqual(home_symbol(results, 25), ALERT_SYMBOL)
         problems = active_problems(results, 25)
         self.assertEqual([(problem.id, problem.state) for problem in problems], [(DISK_ROOT_ID, E), (CPU_TEMP_ID, W)])
+        # STATUS: potvrzený alarm ukáže naměřenou hodnotu (stav je ve sloupci vlevo).
+        self.assertEqual([status_texts(problem, 25)[0] for problem in problems], ["ROOT 96%", "CPU TEMP 72°C"])
 
     def test_status_paging_with_evaluated_problems(self):
         results = self.evaluated()

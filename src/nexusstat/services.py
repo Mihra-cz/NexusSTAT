@@ -1,4 +1,4 @@
-"""Katalog služeb pro stránku SLUŽBY (interně SERVICES).
+"""Katalog služeb pro stránku SERVICES.
 
 Zatím jen definice: id výsledků, které v budoucnu dodají kolektory (služby
 Nexusu, AnimeDB, NAS, zálohy), a krátké názvy pro displej. Žádný sběr dat:
@@ -9,10 +9,10 @@ from .core import CheckResult, State
 
 NEXUS_SERVICES_ID = "service.nexus"  # souhrn služeb hostitele Nexus
 ANIMEDB_ID = "service.animedb"
-NAS_ID = "service.nas"
-BACKUP_ID = "service.backup"  # zálohy (Restic)
+NAS_ID = "service.nas"  # dostupnost NAS; jiné kontroly NAS dostanou vlastní id
+BACKUP_ID = "service.backup"  # stáří poslední zálohy (Restic)
 
-# Řádky stránky SLUŽBY v tomto pořadí; názvy se vejdou vlevo na 128 px.
+# Řádky stránky SERVICES v tomto pořadí; krátké anglické názvy i pro STATUS.
 SERVICE_LABELS = {
     NEXUS_SERVICES_ID: "NEXUS",
     ANIMEDB_ID: "ANIMEDB",
@@ -31,7 +31,7 @@ def complete_service_results(results, observed_utc, expires_monotonic):
     """Doplní služby z katalogu, pro které nepřišel žádný výsledek.
 
     Sledovaná služba bez výsledku je UNKNOWN ("bez dat"), nenasazená N/A.
-    Stránka SLUŽBY, symbol na stránce NEXUS i STATUS pak vycházejí ze stejných
+    Stránka SERVICES, symbol na stránce NEXUS i STATUS pak vycházejí ze stejných
     výsledků, takže stav služby nemůže být na jedné obrazovce neznámý a na
     jiné chybět. Nevykonaná kontrola nikdy nevypadá jako OK; ani NEXUS
     nemá OK, dokud nebude mít jednoznačně definovaný healthcheck s kolektorem.

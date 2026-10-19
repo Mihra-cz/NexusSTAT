@@ -1,15 +1,13 @@
 """Stavový automat OLED: SLEEP → CAROUSEL ⇄ STATUS.
 
-Neobsahuje kreslení ani přístup k hardwaru. Čas dostává jako parametr `now`
-(v provozu `time.monotonic()`), takže testy mohou čas libovolně posouvat
-a nemusí skutečně čekat.
+Neobsahuje kreslení, texty displeje (ty jsou v oled_text) ani přístup
+k hardwaru. Čas dostává jako parametr `now` (v provozu `time.monotonic()`),
+takže testy mohou čas libovolně posouvat a nemusí skutečně čekat.
 """
 
 from enum import Enum
 
-from .core import ALERT_STATES, State, effective, overall_state
-from .services import SERVICE_LABELS
-from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS, MEMORY_ID
+from .core import ALERT_STATES, State, overall_state
 
 
 class Mode(Enum):
@@ -19,60 +17,8 @@ class Mode(Enum):
 
 
 # Stránky kolotoče. První musí být NEXUS, protože na ni vede každý návrat.
-# SERVICES se na displeji jmenuje SLUŽBY.
+# Názvy jsou zároveň nadpisy na displeji; texty stránek sestavuje oled_text.
 CAROUSEL_PAGES = ("NEXUS", "SYSTEM", "DISK", "SERVICES")
-
-# Které výsledky (podle id) ukazují stránky s hodnotami, řádek po řádku.
-PAGE_CHECKS = {
-    "SYSTEM": (CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID),
-    "DISK": (DISK_ROOT_ID,),
-}
-
-# Text nedostupné hodnoty na displeji. Jde jen o text: diagnostický stav
-# takového výsledku zůstává UNKNOWN a nesouvisí se stavem State.NA.
-VALUE_NOT_AVAILABLE = "N/A"
-
-# Krátký text stavu pro STATUS a stránku SLUŽBY (128 px na šířku).
-STATE_TEXT = {
-    State.OK: "OK",
-    State.INFO: "INFO",
-    State.WARNING: "WARN",
-    State.ERROR: "ERR",
-    State.CRITICAL: "CRIT",
-    State.UNKNOWN: "UNKN",
-    State.NA: "N/A",
-}
-
-
-def page_lines(page, results, now):
-    """Řádky stránky s hodnotami: platná hodnota, jinak "<popisek> N/A"."""
-    current = {result.id: effective(result, now) for result in results}
-    lines = []
-    for check_id in PAGE_CHECKS.get(page, ()):
-        result = current.get(check_id)
-        # Chybějící, prošlý nebo neměřitelný výsledek nemá platnou hodnotu,
-        # proto se ukáže jen popisek s N/A, nikoli starý text nebo chybová hláška.
-        if result is None or result.state in (State.UNKNOWN, State.NA):
-            lines.append(f"{LABELS[check_id]} {VALUE_NOT_AVAILABLE}")
-        else:
-            lines.append(result.summary)
-    return lines
-
-def service_rows(results, now):
-    """Řádky stránky SLUŽBY: (název, text stavu) v pořadí katalogu služeb.
-
-    Výsledky mají projít services.complete_service_results(), aby sledovaná
-    služba bez dat byla UNKNOWN stejně v SLUŽBY, v symbolu NEXUS i ve STATUS.
-    Prošlý výsledek je UNKN; N/A (nenasazená AnimeDB) zůstává N/A. Kdyby
-    doplnění chybělo, chybějící služba se tu i tak ukáže jako UNKN, nikdy OK.
-    """
-    current = {result.id: effective(result, now) for result in results}
-    rows = []
-    for service_id, label in SERVICE_LABELS.items():
-        result = current.get(service_id)
-        state = result.state if result is not None else State.UNKNOWN
-        rows.append((label, STATE_TEXT[state]))
-    return rows
 
 # Počet řádků s problémy na jedné stránce STATUS (128 × 64 px).
 STATUS_LINES_PER_PAGE = 4

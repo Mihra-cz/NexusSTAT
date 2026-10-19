@@ -11,7 +11,8 @@ from unittest import mock
 from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmRule, AlarmsConfig, CollectorConfig, OledConfig
 from nexusstat.core import CheckResult, Measurement, State, active_problems, effective, overall_state
-from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol, page_lines
+from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol
+from nexusstat.oled_text import page_rows
 from nexusstat.run import failed_results, format_line, main, run_loop
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS, MEMORY_ID
 
@@ -25,6 +26,13 @@ VALUES = {
     CPU_TEMP_ID: "Teplota CPU 48 °C",
     MEMORY_ID: "RAM 24 % z 7,9 GiB",
     DISK_ROOT_ID: "Disk / 31 % z 117 GiB",
+}
+# Číselné hodnoty k VALUES, jako je dodává skutečný kolektor.
+MEASUREMENTS = {
+    CPU_USAGE_ID: Measurement(5, "%"),
+    CPU_TEMP_ID: Measurement(48, "°C"),
+    MEMORY_ID: Measurement(24, "%"),
+    DISK_ROOT_ID: Measurement(31, "%"),
 }
 
 
@@ -83,7 +91,8 @@ class FakeCollector:
         if number in self.errors:
             raise self.errors[number]
         results = [
-            CheckResult(check_id, State.INFO, summary, observed_utc, now + CONFIG.validity_seconds, simulated=True)
+            CheckResult(check_id, State.INFO, summary, observed_utc, now + CONFIG.validity_seconds, simulated=True,
+                        measurement=MEASUREMENTS[check_id])
             for check_id, summary in VALUES.items()
         ]
         if self.temperatures:
@@ -239,7 +248,7 @@ class ExpiryTest(unittest.TestCase):
         # Během zaseknutí by displej ukazoval jen to, co víme: od 30 s UNKNOWN.
         self.assertIs(overall_state(first, START + 29.9), State.INFO)
         self.assertIs(overall_state(first, START + 30), State.UNKNOWN)
-        self.assertEqual(page_lines("SYSTEM", first, START + 40), ["CPU N/A", "Teplota CPU N/A", "RAM N/A"])
+        self.assertEqual(page_rows("SYSTEM", first, START + 40), [("CPU", "UNKN"), ("CPU TEMP", "UNKN"), ("RAM", "UNKN")])
 
 
 class CollectorFailureTest(unittest.TestCase):
@@ -267,7 +276,7 @@ class CollectorFailureTest(unittest.TestCase):
         self.assertEqual(results[0].summary, "CPU: měření selhalo")
         self.assertIs(overall_state(results, now), State.UNKNOWN)
         self.assertEqual(home_symbol(results, now), UNKNOWN_SYMBOL)
-        self.assertEqual(page_lines("DISK", results, now), ["Disk / N/A"])
+        self.assertEqual(page_rows("DISK", results, now), [("ROOT", "UNKN")])
         self.assertEqual(len(active_problems(results, now)), 4)
         for result in results:
             self.assertEqual(result.observed_utc, START_UTC + timedelta(seconds=20))
@@ -402,12 +411,12 @@ class OledCompatibilityTest(unittest.TestCase):
         controller.press(START + 21, problem_count=len(active_problems(results, START + 21)))
         controller.update(START + 31)
         self.assertEqual(controller.current_page(START + 31), "SYSTEM")
-        self.assertEqual(page_lines("SYSTEM", results, START + 31), [VALUES[CPU_USAGE_ID], VALUES[CPU_TEMP_ID], VALUES[MEMORY_ID]])
+        self.assertEqual(page_rows("SYSTEM", results, START + 31), [("CPU", "5%"), ("CPU TEMP", "48°C"), ("RAM", "24%")])
         self.assertIsNone(home_symbol(results, START + 31))
 
         # Další měření nepřišlo: po třech intervalech hodnoty zmizí a STATUS ukáže UNKNOWN.
         expired = START + 50
-        self.assertEqual(page_lines("DISK", results, expired), ["Disk / N/A"])
+        self.assertEqual(page_rows("DISK", results, expired), [("ROOT", "UNKN")])
         self.assertEqual(home_symbol(results, expired), UNKNOWN_SYMBOL)
         problems = active_problems(results, expired)
         self.assertEqual({problem.state for problem in problems}, {State.UNKNOWN})

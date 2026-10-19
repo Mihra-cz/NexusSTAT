@@ -2,20 +2,28 @@
 
 ## Zásada
 
-Diagnostika běží odděleně od hardwarových ochranných funkcí. Selhání NAS nebo webu nesmí zastavit kontrolu systému; selhání diagnostiky nesmí ovlivnit chlazení.
+Diagnostika běží odděleně od hardwarových ochranných funkcí. Selhání NAS nebo webu nesmí zastavit kontrolu systému; selhání diagnostiky nesmí ovlivnit chlazení. Selhání ukládání historie (SQLite) nesmí zastavit monitoring, alarmy ani OLED.
 
-## Plánované komponenty
+Cílem je nahradit aplikační software Pironman 5, ne ho trvale doplňovat (viz Náhrada Pironmanu 5). Implementováno je zatím jen to, co popisuje sekce Implementováno lokálně; vše ostatní v tomto dokumentu je návrh.
+
+## Plánované komponenty (cílový stav, návrh)
 
 ```text
-read-only collectors  ->  Core / stavový automat  ->  aktuální stav (lokální JSON)
-       |                         |                         |
-  system / backup          historie událostí             +-> OLED renderer
-  NAS / SSD / Docker         (SQLite, ne grafy)           +-> RGB renderer
-                                                           +-> LAN web (autentizovaný)
-                                                           +-> PUBLIC snapshot (whitelist)
+read-only kolektory          Core                            výstupy
+  system, CPU FAN,      ->   aktuální měření v paměti   ->   OLED renderer
+  network, storage,          (platnost 3 × interval)         RGB renderer
+  NAS, backup, služby        alarmy (AlarmEvaluator)         LAN web (autentizovaný, čte i historii)
+                                   |                         PUBLIC snapshot (allowlist, bez IP)
+                                   v
+                             zapisovač historie   ->   SQLite na lokálním SSD
+                             (dávky, oddělené          (měření, agregace, alarmy, události)
+                              selhání)                       |
+                                                             v
+                                                  kopie přes Backup API -> existující Restic
 
-Linux kernel/firmware -> hlavní CPU ventilátor
+Linux kernel/firmware -> hlavní CPU ventilátor (NexusSTAT jen čte jeho stav)
 Linux GPIO controller  -> boční ventilátory, až po samostatně ověřeném přechodu
+InfluxDB Pironmanu     -> NexusSTAT ji nepoužívá; vypnutí až po ověření dalších uživatelů
 ```
 
 ## Výchozí stav cílové platformy (zobecněno)
@@ -32,9 +40,65 @@ Podrobnosti skutečné instalace (názvy služeb, cesty mountů, výsledky inven
 
 - Každá kontrola: `id`, `state`, `summary`, `observed_utc`, `expires_monotonic`, `simulated` a volitelně `measurement` (číselná hodnota + jednotka); později `source` a volitelně omezená diagnostická metadata.
 - `summary` je jen text k zobrazení. Rozhodování (prahy, alarmy) používá výhradně `measurement`.
-- Agregovaný výsledek musí odlišovat `UNKNOWN` od `OK`; do historie se zaznamenávají přechody, ne kopie každého měření.
+- Agregovaný výsledek musí odlišovat `UNKNOWN` od `OK`. Historie alarmů a událostí zaznamenává přechody, ne kopie každého měření; historie měření ukládá vzorky časových řad s retencí (viz Historie a SQLite).
 - Dvě časové základny, nikdy se neporovnávají mezi sebou: monotónní čas (`time.monotonic()`) pro intervaly, timeouty a platnost v běžícím procesu; skutečný UTC čas (`observed_utc`) pro budoucí perzistentní historii a časové značky událostí. Monotónní čas nepřežije restart, proto se nesmí ukládat do historie. Při budoucím exportu do JSON je nutné platnost převést (např. na zbývající sekundy nebo UTC čas vypršení v okamžiku exportu).
 - Aktuální JSON publikovat lokálně atomicky, pouze s odpovídajícími oprávněními a časem platnosti.
+
+## Náhrada Pironmanu 5 (cílová architektura, návrh)
+
+NexusSTAT má převzít aplikační funkce Pironmanu po jednotlivých funkcích. Pironman zůstává v provozu, dokud není převzetí každé potřebné funkce ověřené na Nexusu.
+
+| Funkce Pironmanu | Cíl v NexusSTAT | Stav dnes | Podmínka převzetí |
+| --- | --- | --- | --- |
+| Systémový monitoring | `system_monitor`, smyčka měření, alarmy | read-only kolektor a smyčka na notebooku | ověření na RPi 5 (M7) |
+| OLED (`OLEDAddon`) | `oled`, `oled_text`, `render` + ovladač SSD1306 (Adafruit) | jen simulace | HW test displeje; Pironman ho v té době nesmí ovládat |
+| RGB (`WS2812Addon`) | budoucí renderer RGB (Adafruit NeoPixel SPI) | nic | HW test, jen chybové sekvence |
+| Tlačítko | obsluha události Linux input | nic | ověření `systemd-logind` a `evdev` grabu |
+| Ventilátory (`FanAddon`) | hlavní CPU ventilátor: Linux řídí, NexusSTAT čte; boční: nezávislé řízení (návrh gpio-hog) + monitoring | nic | fyzicky ověřené nezávislé řízení bočních ventilátorů s rollbackem |
+| Historie (InfluxDB) | SQLite na lokálním SSD | nic | M2–M3, ověřená záloha a obnova |
+| Webový dashboard | lokální LAN web NexusSTAT | nic | autentizace, schválení firewallu (M6) |
+
+- Návrat: Pironman se při převzetí jen zastaví a zakáže, neodinstaluje; jeho konfigurace i dotčené systémové soubory se předem zálohují a postup návratu se vyzkouší.
+- InfluxDB: NexusSTAT ji nečte ani nezapisuje. Před vypnutím se read-only ověří, kdo ji používá (klienti, dashboardy, skripty); vypnutí jen po schválení a se zálohou dat.
+
+## Historie a SQLite (návrh, zatím neimplementováno)
+
+- Jediný zapisovač historie v procesu NexusSTAT dostává vzorky ze smyčky měření a výsledky `AlarmEvaluator`u. Zápis běží v dávkách (např. jednou za 60 s, otevřené) a jeho selhání smyčku ani výstupy nezastaví: omezená fronta v paměti, při jejím zaplnění se zahodí nejstarší vzorky a zaznamená se mezera; výpadek zápisu je vlastní stav, ne závada měřené veličiny.
+- Čas v databázi je UTC (`observed_utc`); monotónní čas se nikdy neukládá. `UNKNOWN` = mezera, ne nula. Simulovaná data do provozní databáze nepatří.
+- Historie měření: surové vzorky po 10 s, z nich periodicky agregace (průměr, minimum, maximum, počet vzorků, aby byly vidět mezery). Historie alarmů a události: jen přechody (vznik, změna závažnosti, odeznění, ztráta dat, budoucí potvrzení či ztišení; start, ukončení, výpadek kolektoru, změna konfigurace).
+- Retence: mazání po malých dávkách. Smazaná data soubor nezmenší, SQLite uvolněné stránky znovu použije; `VACUUM` jen výjimečně, protože potřebuje volné místo zhruba velikosti databáze. Před zápisem se hlídá volné místo; `SQLITE_FULL` nebo chyba I/O zastaví jen zápis historie.
+- Režim WAL umožní čtení webem během zápisu. Záloha jen přes Backup API do samostatného souboru, který zahrne existující Restic (podrobnosti v `OPERATIONS.md`).
+- Schéma (tabulky, klíče, verze schématu) se teprve navrhne v milníku M2.
+
+### Orientační měření velikosti a zápisů
+
+Jednorázový pokus na notebooku (SQLite 3.45.1, x86_64, stránka 4096 B, WAL, `synchronous=NORMAL`) se syntetickými daty pro 10 veličin. Bez indexů pro web, bez tabulek alarmů a událostí, bez zápisů checkpointu a režie souborového systému. Není to ověření na Raspberry Pi 5, jen podklad pro rozhodnutí v M2.
+
+| Data (10 veličin) | Velikost |
+| --- | --- |
+| surová měření po 10 s, 30 dní | 25 MB (široká tabulka: čas + sloupec na veličinu) až 55 MB (úzká: veličina, čas, hodnota) |
+| minutové agregace (průměr, min, max, počet), 1 rok | asi 220 MB |
+| pětiminutové agregace, 1 rok | asi 43 MB |
+| hodinové agregace, 1 rok | asi 4 MB |
+
+| Zápis do WAL | každých 10 s | dávka po 60 s |
+| --- | --- | --- |
+| široká tabulka (klíč čas) | 36 MB/den | 7 MB/den |
+| úzká tabulka, klíč (čas, veličina) | 59 MB/den | 20 MB/den |
+| úzká tabulka, klíč (veličina, čas) | 418 MB/den | 104 MB/den |
+
+Závěry pro návrh: roční minutové agregace jsou největší část databáze (4–9× víc než 30 dní surových dat). Klíč, podle kterého nová data přibývají na konec tabulky, a dávkování snižují zápisy až 60×. I nejhorší varianta (asi 150 GB/rok jen ve WAL, checkpoint zhruba zdvojnásobí) je malá proti výdrži běžných NVMe udávané ve stovkách TBW; skutečný disk Nexusu a jeho dosavadní zápisy se ověří read-only (SMART) před nasazením.
+
+## Budoucí stránky OLED (návrh, zatím neimplementováno)
+
+Požadavky jsou v `REQUIREMENTS.md` (Budoucí kolotoč OLED). Technické poznámky pro M4–M5:
+
+- Kolotoč NEXUS → SYSTEM → STORAGE → NETWORK → SERVICES; časování se počítá z počtu stránek, takže pátá stránka okno 300 s neprodlouží. Dnešní kód a testy (čtyři stránky) se mění až v M5.
+- Rozvržení: čtyři řádky jako dnes SERVICES (12 px), název 6x13 vlevo, hodnota 8x13B vpravo (nejvýš asi 9 tučných znaků); na řádek se vejde 21 znaků 6x13. Pravidlo v0.5 „velká písmena ASCII“ by pro jednotky typu `kB/s` nebo `Mb/s` potřebovalo výslovnou výjimku (otevřené).
+- **CPU FAN** na RPi 5 (ověřit read-only na Nexusu): požadavek řízení je stupeň chlazení kernelu (`/sys/class/thermal/cooling_device*` typu `pwm-fan`, `cur_state`/`max_state`), skutečné otáčky z hwmon (`fan*_input`), pokud je tachometr zapojen a ovladač je vystavuje. Zobrazení `RPM`, jinak `ON`/`OFF`, jinak `UNKN`. Závada až při potvrzeném rozporu (požadavek > 0, otáčky 0), prahy budou samostatné rozhodnutí. Žádný zápis do `/sys`.
+- **STORAGE**: `statvfs` na síťovém mountu se může zaseknout, proto každá kontrola úložiště poběží s timeoutem mimo hlavní smyčku (dnešní smyčka je jednovláknová a bez timeoutu). Dostupnost mountu z `/proc/self/mountinfo`; skutečná dostupnost NAS je samostatná kontrola s timeoutem; velikost složek má vlastní dlouhý interval a timeout a na NAS se často nespouští.
+- **NETWORK**: RX/TX z `/sys/class/net/<rozhraní>/statistics/{rx,tx}_bytes` jako rozdíl za monotónní čas (první vzorek a reset čítače `UNKNOWN`, stejně jako CPU); stav linky z `operstate`; procentní vytížení jen při známé rychlosti linky (`speed`, u Wi-Fi často neznámá). Hlavní rozhraní z konfigurace nebo výchozí trasy (`/proc/net/route`); virtuální rozhraní (Docker `docker0`, `br-*`, `veth*`, VPN) se do hlavního zobrazení automaticky nezahrnují. IPv4 (až 15 znaků) se vejde jen písmem 6x13, IPv6 se na řádek nevejde. Adresa webu jen po úspěšné kontrole běžícího webu, nikdy podle plánovaného portu.
+- Veřejný status dostane jen allowlist souhrnných stavů; údaje stránky NETWORK do něj nepatří.
 
 ## Implementováno lokálně (fáze 1: simulace, read-only kolektor, pravidelné měření a první prahy)
 
@@ -56,6 +120,7 @@ CheckResult  ->  core.active_problems / core.overall_state
 stisk / update(now)     ->  oled.OledController (SLEEP / CAROUSEL / STATUS)
                                    |
                             render.render_screen  ->  1bit obrázek 128 × 64 (Pillow)
+                            (texty: oled_text, anglicky podle id a hodnoty)
 ```
 
 - `core.py`: `CheckResult` má `id`, `state`, `summary`, `observed_utc` (UTC `datetime`), `expires_monotonic` (sekundy monotónních hodin) a povinný příznak `simulated`. Typy se kontrolují při vytvoření, takže záměnu časových základen odhalí hned. Pole `source` zatím chybí: existuje jediný kolektor a jeho výsledky jednoznačně určuje `id`. Výsledek s `now >= expires_monotonic` se vyhodnotí jako `UNKNOWN` s popisem „<id>: zastaralá data“, ať byl původně jakýkoli. Výjimkou je `N/A`, které nevyprší. `Measurement(value, unit)` je konečné číslo (ne bool, NaN ani nekonečno) s neprázdnou jednotkou; `UNKNOWN` a `N/A` hodnotu mít nesmějí a expirace ji smaže, takže prošlé číslo nemůže dál vypadat platně. Problémy jsou `CRITICAL`, `ERROR`, `WARNING` a `UNKNOWN`; `OK`, `INFO` a `N/A` problémem nejsou. Stejná závažnost se řadí podle `id`. `overall_state()` vrací nejzávažnější stav; bez dat nebo jen s `N/A` vrací `UNKNOWN`.
@@ -88,10 +153,25 @@ stisk / update(now)     ->  oled.OledController (SLEEP / CAROUSEL / STATUS)
   - Identita vzorku: (`id`, `simulated`, `expires_monotonic`). Platnost = monotónní čas měření + pevná platnost z `[collector]`, takže každé měření jedné veličiny má v běžícím procesu jinou, rostoucí hodnotu. Vzorek, který není novější než poslední vyhodnocený (i `UNKNOWN`), se nezapočítá znovu a dostane aktuální potvrzený stav: opakované vyhodnocení, např. při obnově displeje, je idempotentní a starší vzorek nic nezmění. `now` v `evaluate()` je čas vzniku výsledků a slouží jen k poznání mezery v datech.
   - Zaokrouhlení pro zobrazení: o stavu rozhoduje nezaokrouhlená `measurement.value`. OLED i terminál ukazují text `summary` zaokrouhlený na celé °C/% (Python `:.0f`, polovina k sudé: 69,5 → 70, 70,5 → 70, 64,5 → 64). Zobrazená hodnota se od vyhodnocené liší nejvýš o 0,5 jednotky. Text „70 °C“ proto při prahu 70 může znamenat `INFO` (69,5–69,99) i hodnotu nad prahem (70–70,5) a „65 °C“ při hranici odeznění 65 může být pod ní (nad 64,5 až 64,99). Rozhodující je zobrazený stav (`[WARNING]`, STATUS, trojúhelník), ne zaokrouhlené číslo.
   - Změna pravidel = nový evaluator: potvrzené i rozpracované stavy začnou znovu.
-- `oled.py`: čistá stavová logika bez kreslení. Kolotoč má čtyři stránky `NEXUS`, `SYSTEM`, `DISK`, `SERVICES` (na displeji SLUŽBY); časování (10 s na stránku, okno 300 s, nečinnost STATUS 30 s) se počítá z počtu stránek, takže čtvrtá stránka okno neprodlužuje a po ní následuje znovu NEXUS. `service_rows()` sestaví řádky SLUŽBY z výsledků podle id z `services.py`: text stavu `OK/INFO/WARN/ERR/CRIT/UNKN/N/A`; prošlý výsledek je `UNKN`, nikdy `OK`. OLED výstupy dostávají výsledky doplněné `services.complete_service_results()`, takže sledovaná služba bez dat je `UNKNOWN` stejně na SLUŽBY, v symbolu `?` na NEXUS i ve STATUS (společné vyhodnocení přes `effective()`); potvrzené WARNING/ERROR mají přednost. Kdyby doplnění chybělo, `service_rows()` chybějící službu i tak ukáže jako `UNKN`. Čas dostává jako parametr `now` (v provozu `time.monotonic()`, v testech libovolná čísla). Stránka kolotoče se počítá z času od začátku okna, takže automatické přepínání okno neprodlužuje. Při návratu ze STATUS po nečinnosti začíná nové okno okamžikem vypršení, nikoli až pozdním voláním `update()`. Stisk nejdřív uplatní časové limity, takže stisk po uplynutí okna displej probudí a neotevře STATUS. `home_symbol()` určuje symbol stránky NEXUS: trojúhelník (`WARNING/ERROR/CRITICAL`) má přednost před `?` (`UNKNOWN`, žádná data nebo jen `N/A`). `page_lines()` sestaví řádky stránek SYSTEM a DISK z výsledků podle id; chybějící, prošlá nebo neměřitelná hodnota se ukáže jako text „<popisek> N/A“, diagnostický stav přitom zůstává `UNKNOWN` (nejde o `State.NA`).
-- `render.py`: jen kreslí podle stavu automatu. STATUS má 4 řádky na stránku. SLUŽBY: nadpis 12 px tučně, čára na y = 15, 4 řádky písmem 11 px od y = 14 po 12 px (inkoust 17–62 px), název vlevo, stav zarovnaný vpravo podle skutečného inkoustu (sloupec 127 zůstává volný); rozvržení ověřuje test pro všechny kombinace názvů a stavů. Zkracování textu (`fit_text`) i zarovnání vpravo měří skutečně vykreslené znaky (`textbbox`), ne šířku pro posun, která bývá o zlomek pixelu menší. Bez sledovaných dat (žádné výsledky nebo jen `N/A`) zobrazí `NO MONITOR DATA`, při platných datech bez závad `NO ACTIVE ISSUES` (ne „vše OK“, protože hodnoty `INFO` nejsou vyhodnocené prahy). Obrazovky se simulovanými výsledky nesou značku `SIM`; skutečná měření ji nemají.
-- `services.py`: katalog služeb pro stránku SLUŽBY (id `service.nexus`, `service.animedb`, `service.nas`, `service.backup` a krátké názvy). Nesbírá žádná data. `complete_service_results()` doplní služby z katalogu, pro které nepřišel výsledek: nenasazená AnimeDB `N/A` („AnimeDB není nasazena“), ostatní `UNKNOWN` („<název>: bez dat“), vše `simulated=False` a bez číselné hodnoty; výsledky, které přišly (i simulované), nemění. Rozdíl: `UNKNOWN` = sledované, ale aktuální stav neznáme (problém ve STATUS, symbol `?`); `N/A` = záměrně vypnuté nebo nenasazené (žádný alarm, nevyprší). NEXUS zatím nemá definovaný healthcheck, proto je `UNKNOWN`, nikdy `OK`. Terminálová smyčka `run.py` služby zatím nevypisuje (jen systémová měření a prahy). Budoucí kolektory (služby Nexusu, AnimeDB, NAS, Restic) budou vracet výsledky se stejnými id.
-- `simulate.py`: fiktivní data scénáře odpovídají ukázce SLUŽBY (NEXUS, ANIMEDB, NAS `OK`, BACKUP `WARN`); dřívější fiktivní problémy NAS (CRITICAL), zálohy (ERROR) a N/A AnimeDB byly nahrazeny jinými fiktivními položkami, aby si obrazovky neodporovaly. Scénář projde všechny čtyři stránky, vrátí se na NEXUS a dál ukazuje dvě stránky STATUS. `--live` doplní k měření služby přes `complete_service_results()`.
+- `oled.py`: čistá stavová logika bez kreslení. Kolotoč má čtyři stránky `NEXUS`, `SYSTEM`, `DISK`, `SERVICES` (názvy jsou zároveň nadpisy na displeji); časování (10 s na stránku, okno 300 s, nečinnost STATUS 30 s) se počítá z počtu stránek, takže čtvrtá stránka okno neprodlužuje a po ní následuje znovu NEXUS. Texty stránek tu nejsou (od v0.5 v `oled_text.py`). OLED výstupy dostávají výsledky doplněné `services.complete_service_results()`, takže sledovaná služba bez dat je `UNKNOWN` stejně na SERVICES, v symbolu `?` na NEXUS i ve STATUS (společné vyhodnocení přes `effective()`); potvrzené WARNING/ERROR mají přednost. Čas dostává jako parametr `now` (v provozu `time.monotonic()`, v testech libovolná čísla). Stránka kolotoče se počítá z času od začátku okna, takže automatické přepínání okno neprodlužuje. Při návratu ze STATUS po nečinnosti začíná nové okno okamžikem vypršení, nikoli až pozdním voláním `update()`. Stisk nejdřív uplatní časové limity, takže stisk po uplynutí okna displej probudí a neotevře STATUS. `home_symbol()` určuje symbol stránky NEXUS: trojúhelník (`WARNING/ERROR/CRITICAL`) má přednost před `?` (`UNKNOWN`, žádná data nebo jen `N/A`).
+- `oled_text.py` (v0.5): prezentační vrstva, krátké anglické texty displeje. Vstupem je jen `id`, stav a `measurement`; text `summary` (česky, pro terminál) se nečte, takže jeho jazyk ani formát displej neovlivní. Výsledky jen čte, diagnostiku, prahy ani id nemění. Není to lokalizační framework: dva slovníky a pár funkcí.
+  - `CHECK_NAMES`: id → název (`system.cpu_usage` CPU, `system.cpu_temp` CPU TEMP, `system.memory` RAM, `disk.root` ROOT, služby z `services.SERVICE_LABELS`, plánované kontroly ze simulace, např. `system.time_sync` TIME SYNC, `disk.root_readonly` ROOT MODE). Názvy jsou různé, aby dva řádky STATUS nevypadaly stejně. Neznámé id: `CHECK` a kód `check_code()` = první 4 znaky SHA-256 id velkými písmeny (např. `docker.container_restarts` → `CHECK 0D51`). Kód je stejný v každém běhu i na každém stroji (ne `hash()`), takže jde dohledat: `PYTHONPATH=src python3 -c "from nexusstat.oled_text import check_code; print(check_code('<id>'))"`. Samotné id se na displej nepřepisuje (může být česky nebo dlouhé). Při shodě kódů dvou neznámých id (1 : 65 536) se id přidá do `CHECK_NAMES`.
+  - `FAULT_TEXT`: hláška potvrzené závady bez číselné hodnoty, jen u id s jednoznačným významem: `service.nas` = dostupnost (`NAS OFFLINE`), `service.backup` = stáří poslední zálohy (`BACKUP OVERDUE`), `TIME UNSYNCED`, `ROOT READ-ONLY`. Jiný druh závady (např. zaplnění NAS) má dostat vlastní id, ne jiný text. Ostatní závady bez hodnoty ukážou jen název; závažnost je ve sloupci stavu.
+  - `measurement_text()`: hodnota zaokrouhlená `:.0f` stejně jako `summary` kolektoru, bez mezery před jednotkou (`48°C`, `24%`); z jednotky jen ASCII a `°`.
+  - `page_rows()` (SYSTEM, DISK): `(název, hodnota)`; bez platné hodnoty text stavu, tedy chybějící, prošlá nebo neměřitelná hodnota `UNKN`, nikdy staré číslo ani `N/A`. `service_rows()` (SERVICES, přesunuto z `oled.py` beze změny logiky): `(název, OK/INFO/WARN/ERR/CRIT/UNKN/N/A)`, prošlý výsledek `UNKN`, chybějící služba `UNKN`.
+  - `status_texts()` (STATUS): popisy od nejúplnějšího po samotný název. Hodnota (`CPU TEMP 88°C`), u `UNKNOWN` `NO DATA` nebo `STALE` (prošlá data se poznají z `expires_monotonic`, který `effective()` nemění, ne z textu), u závady bez hodnoty `FAULT_TEXT` nebo jen název. `STALE` se nepoužívá pro starou zálohu (ta je `BACKUP OVERDUE`), aby se nepletla neznámá data se závadou.
+- `render.py`: jen kreslí podle stavu automatu. Písmo je přiložené bitmapové X11 „Fixed“ (`src/nexusstat/fonts`, volné dílo, původ a SHA-256 v `fonts/README.md`): `8x13B` pro nápis NEXUS, nadpisy stránek, hodiny (2×), hodnoty a stavy CRIT/WARN/OK…, `6x13` pro názvy, popisy ve STATUS, datum a značku `SIM`. Znaky jsou navržené pixel po pixelu, takže na 1 bitu zůstávají ostré. Displej od v0.5 používá jen ASCII velkými písmeny, `°` a `…`; všechny tyto znaky v obou písmech existují a navzájem se liší (test). Užší tučná 6x13B a 7x13B nejsou použitá, protože v nich splývá „M“ a „W“ s „H“. Písmo se načte z přiloženého `.pcf.gz` do paměti (FreeType by gzip při každém skoku rozbaloval znovu a Pillow by při chybějícím souboru potichu dohledal stejné jméno v systému); chybějící soubor je chyba, ne náhradní vzhled. Všechny rozměry vycházejí ze skutečně vykreslených pixelů (`ink_box`: text se vykreslí a změří, metriky písma obsahují i prázdné řádky buňky), souřadnice jsou celá čísla.
+  - NEXUS: nápis, hodiny `HH:MM` (8x13B zvětšené 2× metodou NEAREST, 20 px) a datum jsou každý vodorovně vystředěné na celou šířku displeje (`(128 − šířka) // 2`, rozdíl okrajů nejvýš 1 px); symbol vpravo nahoře ani `SIM` vystředění neovlivní. Svisle pásma inkoustu 2–11, 21–40 a 50–59 px s mezerami 9 px. `SIM` je vpravo v řádku data, nejdelší datum (12 znaků) končí nejméně 4 sloupce před ní.
+  - Záhlaví SYSTEM, DISK, SERVICES a STATUS: nadpis 8x13B vlevo, `SIM` vpravo (u STATUS vlevo od čítače s 6 volnými sloupci), čára na y = 13. SYSTEM a DISK: až 3 řádky po 15 px, název 6x13 vlevo, hodnota 8x13B vpravo (hodnoty pod sebou zarovnané jako stavy na SERVICES; hodnota nejvýš 72 px, název se zkrátí až před ní s 4 volnými sloupci). SERVICES: 4 řádky po 12 px, název vlevo, stav tučně vpravo. STATUS: 4 řádky po 12 px, stav 8x13B, popis 6x13 od x = 36, nejvýš 15 znaků; renderer (`first_fitting`) vybere první popis z `status_texts()`, který se vejde celý, a výpustku „…“ (bez mezery před ní) použije až u příliš dlouhého názvu. Text zarovnaný vpravo končí ve sloupci 126.
+  - Bez sledovaných dat (žádné výsledky nebo jen `N/A`) STATUS zobrazí `NO MONITOR DATA`, při platných datech bez závad `NO ACTIVE ISSUES` (ne „vše OK“, protože hodnoty `INFO` nejsou vyhodnocené prahy); zpráva je vystředěná. Obrazovky se simulovanými výsledky nesou značku `SIM`; skutečná měření ji nemají.
+- `services.py`: katalog služeb pro stránku SERVICES (id `service.nexus`, `service.animedb`, `service.nas`, `service.backup` a krátké názvy). Nesbírá žádná data. `complete_service_results()` doplní služby z katalogu, pro které nepřišel výsledek: nenasazená AnimeDB `N/A` („AnimeDB není nasazena“), ostatní `UNKNOWN` („<název>: bez dat“), vše `simulated=False` a bez číselné hodnoty; výsledky, které přišly (i simulované), nemění. Rozdíl: `UNKNOWN` = sledované, ale aktuální stav neznáme (problém ve STATUS, symbol `?`); `N/A` = záměrně vypnuté nebo nenasazené (žádný alarm, nevyprší). NEXUS zatím nemá definovaný healthcheck, proto je `UNKNOWN`, nikdy `OK`. Terminálová smyčka `run.py` služby zatím nevypisuje (jen systémová měření a prahy). Budoucí kolektory (služby Nexusu, AnimeDB, NAS, Restic) budou vracet výsledky se stejnými id.
+- `simulate.py`: fiktivní data scénáře odpovídají ukázce SERVICES (NEXUS, ANIMEDB, NAS `OK`, BACKUP `WARN`); systémové hodnoty a teplota NVMe mají `measurement` jako skutečný kolektor; dřívější fiktivní problémy NAS (CRITICAL), zálohy (ERROR) a N/A AnimeDB byly nahrazeny jinými fiktivními položkami, aby si obrazovky neodporovaly. Scénář projde všechny čtyři stránky, vrátí se na NEXUS a dál ukazuje dvě stránky STATUS. `--live` doplní k měření služby přes `complete_service_results()`.
+- `preview.py` (v0.5): živý simulátor OLED v okně tkinter, jen pro notebook. Obraz je výhradně `render_screen()` (žádná druhá grafická implementace), zvětšený celočíselně metodou NEAREST a předaný do `tkinter.PhotoImage` jako PNG (bez `PIL.ImageTk`).
+  - `PreviewSession` je stavová logika bez tkinter: scénář, výsledky, `OledController` a čas. `SessionClock` je jediná časová základna pro controller, platnost výsledků i vykreslení; zrychlení 1×/5×/10× se při změně přepočítá bez skoku. Hodiny na stránce NEXUS i UTC čas fiktivních výsledků se z ní odvozují.
+  - Fiktivní systémové hodnoty mají `measurement` jako skutečný kolektor, protože displej ukazuje číslo, ne popis. Popisek režimu v okně používá názvy stránek z displeje (SERVICES).
+  - Fiktivní scénáře se obnovují v intervalu kolektoru jako skutečná měření (`simulated=True`, platnost 3 × interval), takže při dlouhém běhu nevyprší; položky `stale_after` jsou změřené jen při startu scénáře a ukazují expiraci. Všechny výsledky projdou `complete_service_results()`.
+  - LIVE: `SystemMonitor` + `AlarmEvaluator` v intervalu `[collector]`, rychlost vynucená 1×, čas měření ze skutečného UTC; selhání kolektoru = `UNKNOWN` jako v `run.py`.
+  - Okno: obnova přes `after()` po 100 ms, nový obrázek jen při změně, klávesy mezerník/Enter, ovládací prvky bez fokusu (mezerník nestiskne nic dalšího), zavření zruší naplánovanou obnovu; Ctrl+C zavře okno stejně. tkinter se importuje až při otevření okna, takže testy běží bez X serveru; zapojení okna ověřuje test s falešným modulem tkinter.
 - `config.py`: sekce `[oled]` a `[collector]` z TOML (`tomllib`) přes `load_config()`; validuje se vždy celý soubor, i sekce, kterou volající nepotřebuje. Časy jsou celé sekundy 1–3600, `page_seconds ≤ carousel_seconds`, neznámé klíče, jiné sekce a jiný rozměr než 128 × 64 jsou chyba. `[collector] interval_seconds` (výchozí 10 s); platnost výsledků `validity_seconds` = 3 × interval se samostatně nenastavuje, aby nemohla být kratší než interval. `[alarms.cpu_temp]` a `[alarms.disk_root]` (`AlarmRule`): `enabled` (výchozí `false`), `warning`, `error`, `hysteresis` bez výchozích hodnot (při zapnutí povinné, zadávají se všechny tři najednou), `confirm_count` 3 a `clear_count` 2 (celá čísla 1–60). Validace: konečná čísla, `warning < error`, `0 ≤ hysteresis < error − warning`, prahy v rozsahu teploty (0, 125] °C a disku (0, 100] %, `warning − hysteresis` nad dolní mezí (jinak by závada nikdy neodezněla). Neimplementované volby (`home_title`, `clock_24h`, `[alarms] show_warning_triangle`, `[web]`, `[storage]`) jsou v ukázkové konfiguraci jen jako komentář a při zadání vyvolají chybu.
 - Hodiny a datum na stránce NEXUS používají místní čas předaný zvlášť (`wall_time`); monotónní čas slouží jen časovačům a platnosti.
 
@@ -126,10 +206,25 @@ Prahy jsou data (`AlarmsConfig`/`AlarmRule`), ne kód. Budoucí LAN web jen při
 - Fáze 2: laboratorní čtecí testy/ověření pinů, obnovy, časovačů a oprávnění.
 - Fáze 3: konkrétní testovací plán pro chlazení s rollbackem a fyzickým dohledem.
 - Fáze 4: po souhlasu adaptovat OLED, RGB a tlačítko, prověřit všechny interakce.
-- Fáze 5: až po doloženém funkčním nahrazení zvážit ukončení původní služby a InfluxDB.
+- Fáze 5: až po doloženém funkčním nahrazení zvážit ukončení původní služby a InfluxDB (u InfluxDB nejdřív read-only ověřit, zda ji nepoužívá jiná aplikace).
+- Fáze 2–5 odpovídají milníku M7 níže; žádná z nich zatím není schválená.
 
 ## Zálohování
 
 - Projektové zdrojáky budou v plánovaném `/srv/nexus/projects/nexusstat` a jejich pokrytí Resticem musí být reálně ověřené.
-- Umístění provozní SQLite, staging zálohy a vyloučení živé DB jsou otevřené. Před ostrým provozem navrhnout SQLite Online Backup API, kontrolu integrity, test obnovy a zdokumentovat vše v manifestu.
+- Provozní SQLite (neimplementováno): lokální SSD v `/srv/nexus/appdata/nexusstat/`, nikdy NAS/CIFS. Konzistentní kopie přes SQLite Backup API do samostatného souboru, který zahrne existující Restic; živá databáze se do zálohy nebere přímo. Kontrola integrity kopie, test obnovy a zápis do manifestu až s implementací (postup v `OPERATIONS.md`).
 - Nová aplikace NESMÍ sama měnit nebo spouštět Restic job bez schválení.
+
+## Plán milníků (návrh k posouzení)
+
+Pořadí a obsah jsou návrh správci. Milníky nejsou hotové a čísla verzí se jim přidělí až při schválení, nenavazují automaticky na v0.5.
+
+| Milník | Obsah | Výstup | Mimo rozsah |
+| --- | --- | --- | --- |
+| M1 Uzavření v0.5 | posouzení anglického OLED a otevřených rozhodnutí v0.5, commit a push po schválení | uzavřená v0.5 v repozitáři | nové funkce |
+| M2 Návrh SQLite | schéma (měření, agregace, alarmy, události, verze schématu), retence a agregace, odhad velikosti a zápisů pro skutečné veličiny, dávkování, WAL, záloha přes Backup API, napojení na Restic, test obnovy, chování při chybě a plném disku | schválený návrh v dokumentaci | kód |
+| M3 Lokální SQLite | zapisovač historie (`sqlite3`), zápis měření, přechodů alarmů a událostí, retence a agregace, izolace selhání; testy nad dočasnou databází se simulovaným časem, zkouška zálohy a obnovy na notebooku | kód a testy na notebooku | Nexus, Restic, produkční data |
+| M4 Kolektory CPU FAN a NETWORK | read-only čtení nad vzorovými soubory a LIVE na notebooku; read-only ověření zdrojů ventilátoru na RPi 5 jen po schválení | kolektory s testy | řízení ventilátorů |
+| M5 STORAGE a OLED | rozhodnutí STORAGE vs. ROOT pod SYSTEM, kontroly úložišť s timeoutem, pětistránkový kolotoč, SYSTEM se 4 řádky, stránka NETWORK, simulátor a vizuální kontrola | nové stránky v simulátoru | hardware displeje |
+| M6 Web s historií | lokální web čte historii, autentizace; port až po schválení firewallu; veřejný status odděleně | web na notebooku | veřejné nasazení |
+| M7 RPi 5 a náhrada Pironmanu | testovací nasazení podle standardu Nexus, souběh s Pironmanem, převzetí funkcí po jedné (OLED, RGB, tlačítko), boční ventilátory až po ověřeném nezávislém řízení s fyzickým dohledem, rollback; InfluxDB až po ověření dalších uživatelů | ověřená náhrada | vše bez schválení |

@@ -39,15 +39,17 @@ secrets_location = "not-configured"
 job = "existing-host-restic-job" # skutečný název jednotky je v soukromé dokumentaci Nexusu
 project_files_included = "unverified"
 runtime_data_policy = "review-before-deployment"
-live_database_excluded = "not-applicable"
-consistent_database_snapshot = "not-applicable"
+live_database_excluded = "not-applicable" # SQLite zatím neexistuje; plán: Restic nezálohuje živou DB přímo
+consistent_database_snapshot = "not-applicable" # plán: kopie přes SQLite Backup API (viz planned.history_database)
 restore_tested = false
 last_restore_test = "not-tested"
 
 [integrations]
 pironman5 = "replacement-planned; existing-service-must-remain-running"
 oled = "planned; offline-simulator-only (local tests, 4 carousel pages); hardware-not-integrated"
-service_collectors = "not-implemented" # stránka SLUŽBY jen zobrazuje; Docker, NAS, Restic, AnimeDB se nečtou
+oled_language = "english-ascii" # texty displeje z id, stavu a measurement (oled_text.py), ne ze summary; terminál a dokumentace česky
+oled_font = "bundled X11 misc-fixed 8x13B + 6x13 (public domain, src/nexusstat/fonts)"
+service_collectors = "not-implemented" # stránka SERVICES jen zobrazuje; Docker, NAS, Restic, AnimeDB se nečtou
 rgb = "planned; not-integrated"
 animedb = "future; not-deployed"
 
@@ -57,13 +59,14 @@ language = "python"
 python_min = "3.11" # tomllib
 python_verified = "3.12.3 (developer notebook)"
 dependencies_required = [] # pouze standardní knihovna
-dependencies_optional = ["Pillow"] # jen obrazová simulace OLED; ověřeno 10.2.0
+dependencies_optional = ["Pillow", "tkinter"] # Pillow: obraz OLED (ověřeno 10.2.0); tkinter (python3-tk 3.12.3, Tk 8.6.14): okno živého simulátoru, na notebooku nainstalováno 2026-10-19
 
 [development]
 # Lokální vývoj na notebooku. Nic z toho neběží na Nexusu (viz platform.deployment).
 location = "developer-notebook-only"
 last_verified = "2026-10-19"
-implemented_locally = ["core-state-model", "oled-state-machine", "oled-image-simulator", "system-collector-readonly", "periodic-collection-loop-terminal", "numeric-measurements", "threshold-evaluator", "oled-services-page-display-only"]
+implemented_locally = ["core-state-model", "oled-state-machine", "oled-image-simulator", "system-collector-readonly", "periodic-collection-loop-terminal", "numeric-measurements", "threshold-evaluator", "oled-services-page-display-only", "oled-live-preview-tkinter", "oled-english-text-layer"]
+preview_window_tested = true # skutečné okno na notebooku (X11, Tk 8.6.14); jen vývojový nástroj, ne hardware displeje
 system_collector_sources = ["/proc/stat", "/proc/meminfo", "/sys/class/thermal", "statvfs(/)"]
 collector_interval_default_seconds = 10 # [collector] interval_seconds; platnost výsledků = 3 × interval
 periodic_loop = "foreground-terminal-only; not-a-service"
@@ -81,6 +84,12 @@ execution = "native-python; subject-to-review"
 lan_port = 8765
 public_dashboard = "read-only status/errors only; separate interface; not deployed"
 hardware_switch = "requires separate approval and physical fan verification"
+pironman_replacement = "target: replace Pironman 5 application software function by function; not started" # Pironman jen zastavit a zakázat, neodinstalovat (rollback)
+history_database = "sqlite on local SSD under paths.appdata (file name TBD); WAL considered; Backup API copy for existing Restic; not-implemented"
+history_retention = "proposal: raw 10 s 30 days, 1 min aggregates 1 year, hourly/daily long-term; alarms and events separate"
+influxdb = "not-required by nexusstat; shutdown only after verifying no other users and approval"
+oled_carousel = ["NEXUS", "SYSTEM", "STORAGE", "NETWORK", "SERVICES"] # plán; implementováno NEXUS, SYSTEM, DISK, SERVICES (v0.5)
+milestones = "proposal M1-M7, see docs/ARCHITECTURE.md; none started beyond v0.5"
 
 [documentation]
 readme = "README.md"
