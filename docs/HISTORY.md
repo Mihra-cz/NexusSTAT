@@ -189,7 +189,7 @@ CREATE TABLE event (
 CREATE INDEX event_ts ON event (ts);
 ```
 
-Při vytvoření souboru zapíše kód (ne DDL) do `meta` řádky `role`, `host_id` (prvních 16 znaků SHA-256 z `/etc/machine-id`, ne samotné id) a `created_utc`, do `schema_migration` verzi 1 a do `aggregation_state` začátek aktuální hodiny pro obě úrovně. Celé vytvoření je jedna transakce.
+Implementace (M3.1a): `nexusstat.history.SCHEMA_SQL` je doslovná kopie tohoto bloku; shodu hlídá `tests/test_history.py` a aplikace dokumentaci nečte. Při vytvoření souboru zapíše kód (ne DDL) do `meta` řádky `role`, `host_id` (prvních 16 znaků SHA-256 z `/etc/machine-id`, ne samotné id) a `created_utc`, do `schema_migration` verzi 1 a do `aggregation_state` začátek aktuální hodiny pro obě úrovně. Celé vytvoření je jedna transakce v dočasném souboru vedle cíle (`synchronous=FULL`). Zveřejní se jen samostatně použitelný soubor: po zavření spojení nesmí zůstat `-wal` ani `-shm` a soubor sám musí projít ověřením a `integrity_check` (otevření `immutable=1`). Pak `fsync` souboru, zveřejnění pevným odkazem (`os.link`, který existující soubor nikdy nepřepíše) a `fsync` adresáře, aby nové jméno přežilo výpadek napájení. Soubor vznikne s právy 0600. Pád uprostřed vytváření nezveřejní nic a nechá jen dočasný soubor `.<jméno>.*.creating` (případně s `-journal`); ten se automaticky nemaže, protože může patřit souběžnému vytváření, a správce ho smí smazat, když žádné vytváření neběží. Pád mezi zveřejněním a úklidem nechá druhé jméno téhož souboru; `open_writer` ho po získání zámku smaže, jen pokud je prokazatelně tentýž inode bez vlastních pomocných souborů, jinak otevření odmítne.
 
 ### 3.3 Indexy
 
@@ -439,7 +439,7 @@ PRAGMA secure_delete = FAST;          -- sestavení Ubuntu má výchozí ON: ret
 
 - Checkpoint: automatický po 1000 stránkách (asi 4 MB WAL, výchozí `wal_autocheckpoint`), režim PASSIVE ve vlákně zapisovače. Čtenáři (web) drží jen krátké transakce: dlouhá čtecí transakce brání checkpointu a WAL roste (změřeno v 10.6).
 - `auto_vacuum` zůstává vypnuté: smazané stránky jdou do seznamu volných a SQLite je znovu použije. Po roce provozu soubor přestane růst (10.6). `VACUUM` jen výjimečně a ručně (potřebuje volné místo zhruba velikosti databáze).
-- `PRAGMA optimize` při zavření spojení zapisovače (doporučení SQLite), `PRAGMA quick_check` při startu ve vlákně zapisovače, plná `integrity_check` na denním snímku (9.2), ne na živé databázi.
+- `PRAGMA optimize` při zavření spojení zapisovače (doporučení SQLite), `PRAGMA quick_check` při startu ve vlákně zapisovače, plná `integrity_check` a `foreign_key_check` na denním snímku (9.2) a při testu obnovy, ne na živé databázi; nové porušení cizích klíčů brání při zápisu `foreign_keys = ON`. Identitu souboru ověří zapisovač nejdřív na spojení jen pro čtení, takže odmítnuté otevření hlavní soubor nikdy nezmění (ani checkpointem při zavření).
 
 ### 5.8 Riziko WAL-reset a jediný zapisovač
 
@@ -466,7 +466,7 @@ Oprava se považuje za doloženou jen podle jedné z podmínek, nikdy jen proto,
 **Návrh vylučuje podmínky chyby nezávisle na verzi:**
 
 1. Na živou databázi zapisuje a checkpoint provádí jediné spojení, spojení vlákna zapisovače. Automatický checkpoint běží uvnitř jeho commitu, takže se s vlastním zápisem nikdy nepřekryje; jiný checkpoint nevolá nikdo.
-2. Všechna ostatní spojení jsou jen pro čtení: `file:…?mode=ro`, od Pythonu 3.12 navíc `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`. Nevolají `wal_checkpoint`, `optimize`, `VACUUM` ani zápis. Kontroly `history.storage` a `history.snapshot` SQLite vůbec nepoužívají.
+2. Všechna ostatní spojení jsou jen pro čtení: `file:…?mode=ro`, `PRAGMA query_only` a od Pythonu 3.12 navíc `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`. Nevolají `wal_checkpoint`, `optimize`, `VACUUM` ani zápis. Kontroly `history.storage` a `history.snapshot` SQLite vůbec nepoužívají. Takové spojení smí vedle databáze ve WAL vytvořit prázdné `-wal` a `-shm`, proto se cizí soubor odmítá podle hlavičky dřív, než ho SQLite otevře (M3.1a).
 3. Druhému procesu NexusSTAT brání `flock` na `history.lock`; zapisovač po chybě nejdřív zavře staré spojení, pak otevře nové (nikdy dvě zapisující spojení najednou).
 4. Snímek čte přes Backup API spojením zapisovače; kontroly snímku a testy obnovy pracují s kopiemi, ne se živým souborem. Restic čte jen soubory ve `snapshot/` a se živou databází se nespojuje.
 5. Budoucí web (M6) čte jen podle bodu 2. Potvrzení nebo ztišení alarmu do databáze nezapisuje sám, předá ho procesu NexusSTAT, který ho zapíše frontou zapisovače.
@@ -930,12 +930,13 @@ Vše jen na notebooku, nad dočasnými databázemi v testech; žádná cesta Nex
 
 | Krok | Obsah | Soubory | Testy (výběr) |
 | --- | --- | --- | --- |
-| M3.1 Schéma a zápis | nový modul `history.py`: vytvoření a otevření souboru (kontrola `application_id`, `user_version`, role, otisku stroje, existence adresáře), katalog řad, pravidla přijetí (4.1) včetně rozlišení duplicity, kolize a konfliktu, kvalita času (4.3), dávka s `batch-guard`, změny stavu a provozních údajů podle R4 (7.1), jediné spojení pro zápis a checkpoint a čtecí spojení jen `mode=ro` (5.8), horní mez, uzavření nečistých běhů, odmítnutí simulovaných dat, záznam ztrát (5.4) | `src/nexusstat/history.py`, `tests/test_history.py` | scénáře 4.5 a 7.1; nula vs. `UNKNOWN` vs. mezera vs. `N/A`; neznámá jednotka; simulovaná data; cizí nebo novější soubor; chybějící adresář; druhý zapisovač odmítnut (`flock`); čtecí spojení nezapíše ani neprovede checkpoint |
+| M3.1a Základ databáze (**implementováno lokálně 2026-10-20**) | `history.py`: vytvoření nové databáze `test`/`development` na výslovné cestě (bez vytváření adresáře, bez přepsání souboru a jeho `-wal`/`-shm`/`-journal`, stavba v dočasném souboru a zveřejnění `os.link`), otevření pro zápis (kontrola hlavičky bez SQLite, zámek `flock` na `<jméno>.lock`, `mode=rw`, ověření `application_id`, `user_version`, otisku schématu, role a stroje, nastavení spojení podle 5.7, `quick_check`), otevření jen pro čtení (`mode=ro`, `query_only`, `NO_CKPT_ON_CLOSE`), kontrola verze SQLite ≥ 3.38 | `src/nexusstat/history.py`, `tests/test_history.py` | 51 testů: shoda `SCHEMA_SQL` a nastavení s dokumentací, pády v odděleném procesu (uprostřed inicializace, po zveřejnění, nečisté ukončení zapisovače s daty ve WAL, novější schéma jen ve WAL), pořadí `fsync`, samostatná použitelnost souboru, schéma vytvořené souboru = schéma z DDL dokumentace, cizí, prázdný, novější, starší a upravený soubor, role, stroj, chybějící adresář, přepis, zbylé `-wal`, nepovedené vytvoření, druhý zapisovač v témže i jiném procesu, čtenář bez zápisu a checkpointu, poškozená kopie; 14 kontrolních mutací odhaleno |
+| M3.1b Zápis | katalog řad, pravidla přijetí (4.1) včetně rozlišení duplicity, kolize a konfliktu, kvalita času (4.3), dávka s `batch-guard`, změny stavu a provozních údajů podle R4 (7.1), horní mez, uzavření nečistých běhů, odmítnutí simulovaných dat, záznam ztrát (5.4) | `history.py`, `tests/test_history.py` | scénáře 4.5 a 7.1; nula vs. `UNKNOWN` vs. mezera vs. `N/A`; neznámá jednotka; simulovaná data |
 | M3.2 Agregace a retence | uzavření okna (6.1), agregace s `progress-*` bez přepisu, pozdní vzorky, retence po dávkách s hranicí podle hotové agregace a limitem dne za běh | `history.py`, `tests/test_history.py` | shoda s přímým výpočtem; pád před commitem; odmítnuté opakování; konflikt agregace; okno jen s `UNKNOWN`; mezera; retence nesmaže neagregovaná data; hranice přesně na sekundě |
 | M3.3 Vlákno a napojení | fronty a dávka (5.2), chyby zápisu (5.3), stav `history.storage`, nová sekce `[history]` (výchozí `enabled = false`, cesta bez výchozí hodnoty), volání ze smyčky `run.py`, obsluha SIGTERM s dopsáním front a limitem 10 s, strukturovaný údaj o selhání kolektoru v `run.Collectors` | `history.py`, `config.py`, `run.py`, `oled_text.py` (názvy `HISTORY`, `HIST SNAPSHOT`), `config/config.example.toml`, testy | plný disk (`max_page_count`), jen pro čtení, poškozený soubor, zámek, nejistý commit, zaplněné fronty a `history.gap`, přetečení před synchronizací bez času UTC, `history.unknown_gap` po restartu, měření a alarmy běží beze změny i při chybách historie, čisté ukončení bez ztráty |
 | M3.4 Snímek a obnova | snímek (9.2) jen při synchronizovaném čase, se záznamem a stavem `history.snapshot` z paměti (9.3), zkouška obnovy na notebooku (9.5), rozpoznání obnoveného snímku (9.6), read-only výpis stavu (`python3 -m nexusstat.history info <soubor>`) a převzetí souboru na náhradním stroji (`adopt`) | `history.py`, testy, `OPERATIONS.md` | snímek během zápisu je konzistentní a bez `-wal`; poškozený snímek se nezveřejní; stáří snímku; obnovený soubor projde kontrolami a čtecími dotazy |
 
-- Kroky M3.1 a M3.2 nemění chování aplikace (nový modul bez napojení). M3.3 mění `run.py` a `config.py`, proto až po samostatném schválení; se `[history] enabled = false` zůstává chování dnešní v0.6.
+- Kroky M3.1 a M3.2 nemění chování aplikace (nový modul bez napojení). M3.1a je hotový jen lokálně na notebooku: aplikace zatím nic nezapisuje, `run.py` modul nepoužívá a produkční role se nevytváří ani neotevírá. M3.3 mění `run.py` a `config.py`, proto až po samostatném schválení; se `[history] enabled = false` zůstává chování dnešní v0.6.
 - Ruční zkouška na notebooku jen s cestou mimo repozitář v lokálním `config/config.toml` (ignorováno Gitem), např. v `~/.local/state/`; DB soubory chrání i `.gitignore` (`*.sqlite3`, `*.db`).
 - Test veřejných souborů (`PublicDataTest`) od review prochází i `tools/`.
 - Mimo M3: Nexus, Restic, systemd, produkční data, web (M6), nasazení (M7).
@@ -977,7 +978,7 @@ Hodnoty R1–R3 jsou od 2026-10-20 schválené pro lokální vývoj M3; R4 plat�
 
 ### 12.3 Podmínka zahájení M3 (ověřitelná)
 
-M3 smí začít, když platí vše:
+M3 smí začít, když platí vše (splněno 2026-10-20 pro M3.1a: M2 schváleno a commitnuto, SQLite 3.45.1 se stavem WAL-reset UNKNOWN, `selfcheck` prošel, jen dočasné databáze testů):
 
 1. M2 je schválené: každé z R1–R18 je schválené, nebo výslovně odložené (R11, R13 a R15 M3 nepoužije), a dokumentace M2 je commitnutá.
 2. Na notebooku je zapsaná verze SQLite, kterou používá Python (`python3 -c "import sqlite3; print(sqlite3.sqlite_version)"`), a stav opravy WAL-reset podle 5.8; dnes 3.45.1, **UNKNOWN**.
