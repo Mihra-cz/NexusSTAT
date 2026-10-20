@@ -25,6 +25,12 @@ Alarmové prahy (`[alarms.cpu_temp]`, `[alarms.disk_root]`) jsou ve výchozím s
 
 Síťové rozhraní (v0.6): bez `[network] interface` se vybírá automaticky (fyzické s výchozí trasou IPv4 a nejnižší metrikou → fyzické s linkou UP → jakékoli fyzické, při shodě abecedně; Docker, VPN, loopback ani jiná virtuální rozhraní ne). Pro lokální zkoušku jiného rozhraní stačí `python3 -m nexusstat.network_monitor <rozhraní>` nebo vlastní `config/config.toml` mimo Git. Neexistující rozhraní je `UNKNOWN` („rozhraní nenalezeno“), neplatný název ukončí program kódem 2. První měření rychlosti RX/TX je vždy `UNKNOWN`. Výpis obsahuje lokální IPv4 notebooku: do dokumentace, issue ani veřejného repozitáře ji nekopíruj (příklady používají dokumentační rozsah 192.0.2.0/24).
 
+Benchmark návrhu SQLite (M2, `tools/sqlite_history_benchmark.py`) není součástí aplikace: syntetické databáze zapisuje jen do nového dočasného adresáře (`TMPDIR`, jinak `/tmp`, nebo `--dir`) a na konci ho smaže; plný běh potřebuje asi 1 GB volného místa a trvá řádově minuty, `--quick` kolem minuty. Nepoužívá síť, kód aplikace ani cesty Nexusu.
+
+```bash
+python3 tools/sqlite_history_benchmark.py --quick
+```
+
 Simulátor kreslí i stránku SERVICES: ve scénáři s fiktivními stavy a značkou `SIM`, v režimu `--live` bez kolektorů služeb: NEXUS, NAS a BACKUP jsou `UNKNOWN` na SERVICES (`UNKN`) i ve STATUS (`NAS NO DATA`) a stránka NEXUS ukazuje `?`; AnimeDB je `N/A`. Snímky ukládej mimo repozitář (např. do `/tmp`).
 
 ### Živý simulátor OLED (v0.5)
@@ -77,15 +83,17 @@ Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje d
 
 ## SQLite: provoz a zálohování (návrh, neimplementováno)
 
-SQLite zatím neexistuje; tento postup se ověří v M3 na notebooku a na Nexusu až v M7 se schválením.
+SQLite zatím neexistuje. Návrh M2 je v `HISTORY.md` (schválený 2026-10-20 kromě R11, R13, R15 (odloženo do M7); neimplementováno, nasazení neschváleno); postup se ověří v M3 na notebooku nad dočasnou databází a na Nexusu až v M7 se schválením. Nic z toho dnes na serveru neexistuje.
 
-- Umístění: lokální SSD v `/srv/nexus/appdata/nexusstat/` (název souboru určí návrh schématu v M2). SQLite nikdy přímo na NAS/CIFS: zamykání souborů přes síť není spolehlivé a výpadek NAS by zastavil zápis.
-- Režim WAL zvážit kvůli současnému čtení webem a zápisu. Vedle databáze pak existují soubory `-wal` a `-shm`, které k ní patří. Viz [WAL](https://www.sqlite.org/wal.html).
-- **Samotné kopírování aktivního souboru SQLite nemusí být konzistentní záloha**: během kopírování může probíhat zápis a poslední potvrzené změny mohou být jen ve `-wal`. Restic proto živou databázi přímo nezálohuje.
-- Konzistentní kopie přes SQLite Backup API ([Backup API](https://www.sqlite.org/backup.html), v Pythonu `sqlite3.Connection.backup`) do samostatného souboru na lokálním disku, na kopii `PRAGMA integrity_check`. Tento soubor zahrne existující Restic; živou databázi a její `-wal`/`-shm` z Resticu vyloučit. Kdy kopie vzniká (těsně před spuštěním Resticu, nebo ve vlastním intervalu), rozhodne M2.
-- Nepřidávat další samostatný timer zálohování bez potřeby; do existujícího zálohovacího skriptu nebo jednotky sahat jen po schválení a s rollbackem. Při nedostupném NAS musí záloha selhat bezpečně a živá databáze zůstat nedotčená.
-- Test obnovy: obnovit kopii z Resticu do dočasného adresáře, `PRAGMA integrity_check`, otevřít ji NexusSTAT v režimu jen pro čtení a porovnat počty záznamů a poslední časy. `restore_tested=false` do skutečného úspěšného testu.
-- Růst: retenční mazání po dávkách; hlídat velikost souboru a volné místo. Při chybě zápisu nebo plném disku se zastaví jen ukládání historie (vlastní stav a událost), monitoring, alarmy a OLED běží dál.
+- Umístění (návrh M2): živá databáze `/srv/nexus/appdata/nexusstat/history/history.sqlite3` s `-wal`, `-shm`, zámkem `history.lock` a rozpracovaným snímkem, konzistentní snímek `/srv/nexus/appdata/nexusstat/snapshot/history-snapshot.sqlite3` se záznamem `history-snapshot.json` (čas, SHA-256, počty řádků). Lokální SSD, nikdy NAS/CIFS: zamykání souborů přes síť není spolehlivé a výpadek NAS by zastavil zápis. Zapisovač adresář sám nevytváří.
+- Režim WAL (`synchronous=FULL`, dávka 60 s): čtení webem neblokuje zápis. Soubory `-wal` a `-shm` patří k databázi. Viz [WAL](https://www.sqlite.org/wal.html).
+- Jediný zapisovač (`HISTORY.md`, sekce 5.8): zapisuje a checkpoint dělá jen NexusSTAT. Za jeho běhu živou databázi nikdy neotvírat jiným nástrojem pro zápis (`sqlite3` jen s `-readonly`, raději snímek); převzetí souboru (`adopt`) a obnova jen se zastaveným NexusSTAT. Důvodem je mimo jiné chyba SQLite „WAL-reset“, jejíž oprava je na notebooku (`libsqlite3-0 3.45.1-1ubuntu2.8`) i v Debianu 13 (`3.46.1-7+deb13u1`) neprokázaná (UNKNOWN). Podmínky pro M3 a pro provoz: `HISTORY.md`, sekce 12.3 a 12.4.
+- **Samotné kopírování aktivního souboru SQLite nemusí být konzistentní záloha**: během kopírování může probíhat zápis a poslední potvrzené změny mohou být jen ve `-wal`. Restic proto živou databázi přímo nezálohuje: vyloučit celý `history/`, zahrnout `snapshot/`.
+- Konzistentní kopie přes SQLite Backup API ([Backup API](https://www.sqlite.org/backup.html), v Pythonu `sqlite3.Connection.backup`): jednou denně asi 30 minut před během existujícího Resticu ji vytvoří sám NexusSTAT do dočasného souboru v `history/` (mimo zálohu), převede na samostatný soubor bez WAL (`journal_mode=DELETE`), ověří `PRAGMA integrity_check` a atomicky přejmenuje do `snapshot/`, pak zapíše záznam (`HISTORY.md`, sekce 9.2). Neúspěšný snímek nic nepřepíše. Kontrola `history.snapshot` hlásí chybějící nebo starý snímek (`WARNING` nad 26 h, `ERROR` nad 50 h), protože Restic sám by úspěch hlásil i bez aktuální historie (9.3). Skript ani timer Resticu se nemění, jen jeho seznam cest (po schválení, se zálohou původní konfigurace).
+- Nepřidávat další samostatný timer zálohování. Při nedostupném NAS selže jen Restic; snímek ani živá databáze se nemění.
+- Test obnovy (`HISTORY.md`, sekce 9.5): obnovit `snapshot/` z Resticu do nového dočasného adresáře, porovnat SHA-256 se záznamem `history-snapshot.json`, `PRAGMA integrity_check` a `foreign_key_check`, otevřít jen pro čtení a porovnat `meta.snapshot_utc` a počty řádků se záznamem, spustit čtecí dotazy. `restore_tested=false` do skutečného úspěšného testu na Nexusu.
+- Obnova po havárii (`HISTORY.md`, sekce 9.6): zastavit NexusSTAT, celý `history/` přesunout stranou včetně `-wal` a `-shm` (nesmí zůstat vedle obnoveného souboru), zkopírovat ověřený snímek, nastavit vlastníka a práva, na náhradním stroji soubor výslovně převzít (otisk stroje), spustit. NexusSTAT obnovený snímek rozpozná a zapíše začátek ztraceného úseku.
+- Růst: retenční mazání po hodinových dávkách; hlídat velikost souboru a volné místo (návrh: zápis se zastaví pod 1 GiB nebo 5 % volného místa). Při chybě zápisu nebo plném disku se zastaví jen ukládání historie (vlastní stav `history.storage` a událost), monitoring, alarmy a OLED běží dál.
 
 ## Po každé budoucí změně
 

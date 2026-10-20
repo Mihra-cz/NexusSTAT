@@ -63,31 +63,28 @@ NexusSTAT má převzít aplikační funkce Pironmanu po jednotlivých funkcích.
 
 ## Historie a SQLite (návrh, zatím neimplementováno)
 
-- Jediný zapisovač historie v procesu NexusSTAT dostává vzorky ze smyčky měření a výsledky `AlarmEvaluator`u. Zápis běží v dávkách (např. jednou za 60 s, otevřené) a jeho selhání smyčku ani výstupy nezastaví: omezená fronta v paměti, při jejím zaplnění se zahodí nejstarší vzorky a zaznamená se mezera; výpadek zápisu je vlastní stav, ne závada měřené veličiny.
-- Čas v databázi je UTC (`observed_utc`); monotónní čas se nikdy neukládá. `UNKNOWN` = mezera, ne nula. Simulovaná data do provozní databáze nepatří.
-- Historie měření: surové vzorky po 10 s, z nich periodicky agregace (průměr, minimum, maximum, počet vzorků, aby byly vidět mezery). Historie alarmů a události: jen přechody (vznik, změna závažnosti, odeznění, ztráta dat, budoucí potvrzení či ztišení; start, ukončení, výpadek kolektoru, změna konfigurace).
-- Retence: mazání po malých dávkách. Smazaná data soubor nezmenší, SQLite uvolněné stránky znovu použije; `VACUUM` jen výjimečně, protože potřebuje volné místo zhruba velikosti databáze. Před zápisem se hlídá volné místo; `SQLITE_FULL` nebo chyba I/O zastaví jen zápis historie.
-- Režim WAL umožní čtení webem během zápisu. Záloha jen přes Backup API do samostatného souboru, který zahrne existující Restic (podrobnosti v `OPERATIONS.md`).
-- Schéma (tabulky, klíče, verze schématu) se teprve navrhne v milníku M2.
+Podrobný návrh M2 (tabulky a DDL, čas a identita, zápis, agregace, retence, odolnost, záloha a obnova, benchmark, plán M3, rozhodnutí ke schválení) je v `HISTORY.md`. Nic z toho není implementováno; body níže jsou shrnutí.
 
-### Orientační měření velikosti a zápisů
+- Jediný zapisovač historie ve vlastním vlákně procesu NexusSTAT dostává výsledky ze smyčky měření po `AlarmEvaluator`u. Zápis běží v dávkách (nejstarší nezapsané měření nejvýš 60 s, změny stavu a události do 10 s), každá dávka jednou transakcí s ochranou proti opakování (`run.last_batch`). Selhání zápisu smyčku ani výstupy nezastaví: omezené fronty v paměti (návrh 1 h měření a 2 000 změn), při jejich zaplnění se zahodí nejstarší položky a ztráta se zaznamená; výpadek zápisu je vlastní stav `history.storage`, ne závada měřené veličiny. Ztráta „nejvýš 60 s“ není garance, platí jen za podmínek v `HISTORY.md`, sekce 5.5. Zapisuje a checkpoint dělá jediné spojení zapisovače, všechna ostatní jsou jen pro čtení; tím návrh vylučuje podmínky chyby SQLite „WAL-reset“, jejíž oprava je v použitých verzích neprokázaná (`HISTORY.md`, sekce 5.8, gate 12.4).
+- Čas v databázi je UTC (`observed_utc`, celé Unixové sekundy); monotónní čas se nikdy neukládá. Skutečná nula = řádek s hodnotou 0, `UNKNOWN` = řádek s `NULL`, chybějící vzorek = žádný řádek (mezera), `N/A` = jen stav v tabulce změn. Simulovaná data do provozní databáze nepatří (odmítnutí v zapisovači, role a otisk stroje v souboru).
+- Historie měření: surové vzorky po 10 s, z nich průběžně 5min a hodinové agregace (počet vzorků, počet platných, minimum, maximum, součet pro průměr), aby byly vidět mezery. Historie alarmů a události: jen přechody (vznik, změna závažnosti, odeznění, ztráta dat, budoucí potvrzení či ztišení; start, ukončení, výpadek kolektoru, změna konfigurace, skok času, mezera v historii).
+- Retence: 30 dní surových vzorků je nejkratší doba uchování; vzorek se smaže, až když je starší a zároveň agregovaný, po hodinových dávkách s limitem jednoho dne dat za běh. Agregace nikdy nepřepisuje hotové okno. Smazaná data soubor nezmenší, SQLite uvolněné stránky znovu použije; `VACUUM` jen výjimečně, protože potřebuje volné místo zhruba velikosti databáze. Před zápisem se hlídá volné místo; `SQLITE_FULL` nebo chyba I/O zastaví jen zápis historie.
+- Režim WAL umožní čtení webem během zápisu. Záloha jen přes Backup API do samostatného souboru, který zahrne existující Restic (`HISTORY.md`, sekce 9, provoz v `OPERATIONS.md`).
+- Schéma v1: `meta`, `schema_migration`, `run`, `metric`, `sample`, `agg_5m`, `agg_1h`, `aggregation_state`, `check_change`, `event`; verze v `PRAGMA user_version`, identita souboru v `application_id`.
 
-Jednorázový pokus na notebooku (SQLite 3.45.1, x86_64, stránka 4096 B, WAL, `synchronous=NORMAL`) se syntetickými daty pro 10 veličin. Bez indexů pro web, bez tabulek alarmů a událostí, bez zápisů checkpointu a režie souborového systému. Není to ověření na Raspberry Pi 5, jen podklad pro rozhodnutí v M2.
+### Měření velikosti a zápisů (benchmark M2)
 
-| Data (10 veličin) | Velikost |
+Reprodukovatelný benchmark `tools/sqlite_history_benchmark.py` nad dočasnými syntetickými databázemi (notebook x86_64, SATA SSD, SQLite 3.45.1; ne Raspberry Pi 5), 20 řad po 10 s. Úplné výsledky a metodika jsou v `HISTORY.md`, sekce 10; nahrazují jednorázový orientační pokus z 2026-10-19 (10 veličin).
+
+| | Výsledek |
 | --- | --- |
-| surová měření po 10 s, 30 dní | 25 MB (široká tabulka: čas + sloupec na veličinu) až 55 MB (úzká: veličina, čas, hodnota) |
-| minutové agregace (průměr, min, max, počet), 1 rok | asi 220 MB |
-| pětiminutové agregace, 1 rok | asi 43 MB |
-| hodinové agregace, 1 rok | asi 4 MB |
+| surová data 30 dní | 102–105 MB WITHOUT ROWID, 202 MB s ROWID a indexem |
+| zápis surových dat, dávka 60 s | 35 MB/den s klíčem (`ts`, `metric_id`), 266 MB/den s klíčem (`metric_id`, `ts`) |
+| agregace za rok | 1 min 410 MB, 5 min 81 MB, hodinové 7 MB |
+| doporučená databáze celkem | asi 200 MB po roce, 270 MB po 10 letech; na disku se snímkem asi 0,6–0,8 GB |
+| po pravidelné retenci (týden cyklu zápis → agregace → retence → snímek) | velikost stálá 194–195 MB; logický zápis asi 310 MB/den, z toho denní snímek 195 MB |
 
-| Zápis do WAL | každých 10 s | dávka po 60 s |
-| --- | --- | --- |
-| široká tabulka (klíč čas) | 36 MB/den | 7 MB/den |
-| úzká tabulka, klíč (čas, veličina) | 59 MB/den | 20 MB/den |
-| úzká tabulka, klíč (veličina, čas) | 418 MB/den | 104 MB/den |
-
-Závěry pro návrh: roční minutové agregace jsou největší část databáze (4–9× víc než 30 dní surových dat). Klíč, podle kterého nová data přibývají na konec tabulky, a dávkování snižují zápisy až 60×. I nejhorší varianta (asi 150 GB/rok jen ve WAL, checkpoint zhruba zdvojnásobí) je malá proti výdrži běžných NVMe udávané ve stovkách TBW; skutečný disk Nexusu a jeho dosavadní zápisy se ověří read-only (SMART) před nasazením.
+Závěry: klíč začínající časem a dávkování po 60 s drží zápisy surových dat na desítkách MB denně; 5min agregace jsou pětkrát menší než minutové. I s denním snímkem je to asi 110 GB/rok, malé proti výdrži běžných NVMe ve stovkách TBW; skutečný disk Nexusu se ověří read-only (SMART) před nasazením.
 
 ## Budoucí stránky OLED (návrh, zatím neimplementováno)
 
@@ -225,7 +222,7 @@ Prahy jsou data (`AlarmsConfig`/`AlarmRule`), ne kód. Budoucí LAN web jen při
 ## Zálohování
 
 - Projektové zdrojáky budou v plánovaném `/srv/nexus/projects/nexusstat` a jejich pokrytí Resticem musí být reálně ověřené.
-- Provozní SQLite (neimplementováno): lokální SSD v `/srv/nexus/appdata/nexusstat/`, nikdy NAS/CIFS. Konzistentní kopie přes SQLite Backup API do samostatného souboru, který zahrne existující Restic; živá databáze se do zálohy nebere přímo. Kontrola integrity kopie, test obnovy a zápis do manifestu až s implementací (postup v `OPERATIONS.md`).
+- Provozní SQLite (neimplementováno, návrh M2): lokální SSD, živá databáze v `/srv/nexus/appdata/nexusstat/history/`, denní snímek přes SQLite Backup API v `/srv/nexus/appdata/nexusstat/snapshot/`, nikdy NAS/CIFS. Restic zahrne jen `snapshot/`, živou databázi s `-wal` a `-shm` vyloučí. Kontrola integrity snímku, test obnovy a zápis do manifestu až s implementací (`HISTORY.md`, sekce 9, postup v `OPERATIONS.md`).
 - Nová aplikace NESMÍ sama měnit nebo spouštět Restic job bez schválení.
 
 ## Plán milníků (návrh k posouzení)
@@ -235,8 +232,8 @@ Pořadí a obsah jsou návrh správci. Milníky nejsou hotové a čísla verzí 
 | Milník | Obsah | Výstup | Mimo rozsah |
 | --- | --- | --- | --- |
 | M1 Uzavření v0.5 | posouzení anglického OLED a otevřených rozhodnutí v0.5, commit a push po schválení | uzavřená v0.5 v repozitáři | nové funkce |
-| M2 Návrh SQLite | schéma (měření, agregace, alarmy, události, verze schématu), retence a agregace, odhad velikosti a zápisů pro skutečné veličiny, dávkování, WAL, záloha přes Backup API, napojení na Restic, test obnovy, chování při chybě a plném disku | schválený návrh v dokumentaci | kód |
-| M3 Lokální SQLite | zapisovač historie (`sqlite3`), zápis měření, přechodů alarmů a událostí, retence a agregace, izolace selhání; testy nad dočasnou databází se simulovaným časem, zkouška zálohy a obnovy na notebooku | kód a testy na notebooku | Nexus, Restic, produkční data |
+| M2 Návrh SQLite | schéma (měření, agregace, alarmy, události, verze schématu), retence a agregace, odhad velikosti a zápisů pro skutečné veličiny, dávkování, WAL, záloha přes Backup API, napojení na Restic, test obnovy, chování při chybě a plném disku. Návrh v `HISTORY.md` s benchmarkem (`tools/`), **schválený 2026-10-20 kromě R11, R13, R15 (odloženo do M7)** | schválený návrh v dokumentaci | kód aplikace |
+| M3 Lokální SQLite | zapisovač historie (`sqlite3`), zápis měření, přechodů alarmů a událostí, retence a agregace, izolace selhání; testy nad dočasnou databází se simulovaným časem, zkouška zálohy a obnovy na notebooku. Kroky M3.1–M3.4 v `HISTORY.md`, sekce 11 | kód a testy na notebooku | Nexus, Restic, produkční data |
 | M4 Kolektory CPU FAN a NETWORK | read-only čtení nad vzorovými soubory a LIVE na notebooku; read-only ověření zdrojů ventilátoru na RPi 5 jen po schválení. NETWORK hotovo lokálně ve v0.6, CPU FAN zbývá | kolektory s testy | řízení ventilátorů |
 | M5 STORAGE a OLED | rozhodnutí STORAGE vs. ROOT pod SYSTEM, kontroly úložišť s timeoutem, SYSTEM se 4 řádky, simulátor a vizuální kontrola. Pětistránkový kolotoč se stránkou NETWORK hotov lokálně ve v0.6 (zatím s DISK místo STORAGE) | nové stránky v simulátoru | hardware displeje |
 | M6 Web s historií | lokální web čte historii, autentizace; port až po schválení firewallu; veřejný status odděleně | web na notebooku | veřejné nasazení |

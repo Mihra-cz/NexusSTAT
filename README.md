@@ -5,15 +5,15 @@
 
 ## Co bude sledovat
 
-Systém a NVMe, ventilátory, síť, NAS, Restic, systemd služby, Docker; později AnimeDB (zatím není na Nexusu). Hlavní databází pro historii měření, alarmů a událostí bude **SQLite** na lokálním SSD; NexusSTAT nepotřebuje InfluxDB Pironmanu (návrh v `docs/REQUIREMENTS.md` a `docs/ARCHITECTURE.md`, zatím neimplementováno).
+Systém a NVMe, ventilátory, síť, NAS, Restic, systemd služby, Docker; později AnimeDB (zatím není na Nexusu). Hlavní databází pro historii měření, alarmů a událostí bude **SQLite** na lokálním SSD; NexusSTAT nepotřebuje InfluxDB Pironmanu (návrh M2 v `docs/HISTORY.md` schválený 2026-10-20 kromě R11, R13, R15 (odloženo do M7); zatím neimplementováno).
 
 Výstupy: 128 × 64 OLED, čtyři RGB WS2812, lokální LAN web s administrací (plánovaný port 8765), později přísně omezený veřejný status pro `mh42.cz`. Cloud nesmí být nutný.
 
 ## Směr projektu (návrh, nic z toho není hotové)
 
 - OLED cílově: NEXUS → SYSTEM (CPU, CPU TEMP, RAM, CPU FAN) → STORAGE → NETWORK → SERVICES, STATUS dál tlačítkem. Dnešní v0.6 má NEXUS, SYSTEM, DISK, NETWORK, SERVICES; STORAGE (místo DISK) a CPU FAN jsou další fáze.
-- Historie: aktuální měření v paměti po 10 s; v SQLite časové řady (návrh retence: 30 dní po 10 s, 1 rok minutové agregace, dlouhodobě hodinové či denní), přechody alarmů a systémové události. Záloha jen konzistentní kopií přes SQLite Backup API do existujícího Resticu.
-- Milníky k posouzení: M1 uzavření v0.5 → M2 návrh SQLite → M3 lokální SQLite s testy → M4 kolektory CPU FAN a NETWORK → M5 STORAGE a nové stránky OLED → M6 lokální web s historií → M7 testovací nasazení na RPi 5 a postupná náhrada Pironmanu. Podrobnosti v `docs/ARCHITECTURE.md` (Plán milníků).
+- Historie: aktuální měření v paměti po 10 s; v SQLite časové řady, změny stavů a textových údajů (alarmy, `UNKNOWN`, `N/A`, linka, IPv4) a systémové události. Návrh M2 (`docs/HISTORY.md`, schváleno 2026-10-20 kromě R11, R13, R15): nejméně 30 dní po 10 s, 1 rok 5min agregace (alternativa 1 min), hodinové 10 let; zápis v dávkách po 60 s ve vlastním vlákně, aby výpadek databáze nezastavil měření. Záloha jen konzistentním snímkem přes SQLite Backup API, který zahrne existující Restic.
+- Milníky k posouzení: M1 uzavření v0.5 → M2 návrh SQLite (`docs/HISTORY.md`, schválen 2026-10-20 kromě R11, R13, R15) → M3 lokální SQLite s testy → M4 kolektory CPU FAN a NETWORK → M5 STORAGE a nové stránky OLED → M6 lokální web s historií → M7 testovací nasazení na RPi 5 a postupná náhrada Pironmanu. Podrobnosti v `docs/ARCHITECTURE.md` (Plán milníků).
 
 ## Implementováno lokálně: simulace, kolektory, pravidelné měření a první prahy (v0.6)
 
@@ -77,7 +77,7 @@ Ilustrační řádek se zapnutým prahem teploty (vymyšlené prahy i hodnoty, n
 
 - Schválené hodnoty prahů (vyhodnocování je ve výchozím stavu vypnuté), prahy pro CPU a RAM, kolektory NAS, Resticu, Dockeru, AnimeDB a služeb (stránka SERVICES zatím jen zobrazuje, co by dodaly), hardware drivery (OLED, RGB, tlačítko; živý simulátor je jen okno na notebooku), web a SQLite. Nic nebylo testováno na Raspberry Pi ani na hardwaru displeje.
 - Velikost RAM a disku na OLED (`RAM 24% / 7.9G`): kolektor ji dává jen v českém textu `summary`, který displej nečte; zobrazení by vyžadovalo strukturovanou hodnotu kapacity v kolektoru (samostatný krok).
-- SQLite a jakákoli historie (žádná databáze, retence ani záloha neexistuje), kolektory CPU FAN a dalších úložišť, stránka STORAGE (místo DISK) a čtyřřádkový SYSTEM. Vše jen návrh. Síťový kolektor a stránka NETWORK jsou od v0.6 implementované, ale jen lokálně na notebooku (nenasazeno, neověřeno na Raspberry Pi).
+- SQLite a jakákoli historie (žádná databáze, retence ani záloha neexistuje; je jen návrh M2 v `docs/HISTORY.md` a benchmark nad dočasnými syntetickými daty), kolektory CPU FAN a dalších úložišť, stránka STORAGE (místo DISK) a čtyřřádkový SYSTEM. Vše jen návrh. Síťový kolektor a stránka NETWORK jsou od v0.6 implementované, ale jen lokálně na notebooku (nenasazeno, neověřeno na Raspberry Pi).
 - Síť: žádné alarmové prahy (linka `DOWN` zůstává `INFO`), jen jedno rozhraní a jen jeho primární IPv4 (bez IPv6), procentní vytížení linky se nepočítá; adresa webového rozhraní se ukáže až s běžícím webem.
 - Smyčka `nexusstat.run` jen vypisuje do terminálu: nekreslí OLED, nezapisuje JSON, historii ani logy a neběží jako služba. Je jednovláknová a kolektor nemá timeout, takže zaseknuté měření zastaví i výpis.
 - Neexistuje provozní služba či nasazení na `nexus`.
@@ -90,6 +90,8 @@ Ilustrační řádek se zapnutým prahem teploty (vymyšlené prahy i hodnoty, n
 - `manifest.toml`: plánovaný a ověřený stav projektu.
 - `docs/REQUIREMENTS.md`: schválené a otevřené požadavky.
 - `docs/ARCHITECTURE.md`: hranice procesu, hardware, síť a data.
+- `docs/HISTORY.md`: návrh SQLite historie (M2): schéma, zápis, retence, záloha a obnova, benchmark; neimplementováno.
+- `tools/sqlite_history_benchmark.py`: benchmark návrhu, jen dočasné syntetické databáze; není součástí aplikace.
 - `docs/OPERATIONS.md`: budoucí provozní postup a bezpečnostní brány.
 - `docs/CHANGELOG.md`: historie změn návrhu/implementace.
 - `CLAUDE.md`: konkrétní pracovní pravidla pro Claude Code.

@@ -603,7 +603,7 @@ class CoreAndOledIntegrationTest(FixtureCase):
 # speciální adresy, které nepatří žádnému stroji ani síti.
 DOCUMENTATION_NETWORKS = [ipaddress.ip_network(net) for net in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
 GENERIC_ADDRESSES = {"0.0.0.0", "127.0.0.1", "255.255.255.255"}
-PUBLIC_FILES = ["README.md", "manifest.toml", "config", "docs", "src", "tests"]
+PUBLIC_FILES = ["README.md", "manifest.toml", "config", "docs", "src", "tests", "tools"]
 
 
 def is_documentation(address):
