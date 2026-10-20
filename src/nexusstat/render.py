@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .config import DISPLAY_HEIGHT, DISPLAY_WIDTH
 from .core import active_problems, has_monitor_data
 from .oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, Mode, home_symbol, split_status_pages
-from .oled_text import STATE_TEXT, page_rows, service_rows, status_texts
+from .oled_text import STATE_TEXT, network_rows, page_rows, service_rows, status_texts
 
 FONT_DIR = Path(__file__).resolve().parent / "fonts"
 # Bitmapová písma mají jedinou velikost: buňku vysokou 13 px.
@@ -43,7 +43,7 @@ NEXUS_CLOCK_TOP = 21
 NEXUS_DATE_TOP = 50
 CLOCK_SCALE = 2
 
-# Záhlaví stránek SYSTEM, DISK, SERVICES a STATUS: nadpis nahoře, pod ním čára.
+# Záhlaví stránek SYSTEM, DISK, NETWORK, SERVICES a STATUS: nadpis nahoře, pod ním čára.
 HEADER_LINE_Y = 13
 
 # SYSTEM a DISK: až 3 řádky po 15 px (inkoust 17–58 px), název vlevo,
@@ -59,6 +59,12 @@ SERVICES_ROW_TOP = 14
 SERVICES_ROW_STEP = 12
 SERVICES_ROWS_PER_PAGE = 4
 STATUS_TEXT_X = 36  # popis za čtyřznakovým stavem (CRIT, WARN, ...) v 8x13B; vejde se 15 znaků 6x13
+
+# NETWORK: 4 řádky jako SERVICES, název 6x13 vlevo, hodnota vpravo. Linka a
+# RX/TX tučně jako hodnoty jinde; IPv4 obyčejným 6x13, protože 15 znaků
+# adresy tučně (120 px) by se vedle názvu nevešlo.
+NETWORK_ADDRESS_ROW = 3
+ADDRESS_MAX_WIDTH = 96  # 16 znaků 6x13; nejdelší IPv4 má 15
 
 # Oblast symbolu (trojúhelník nebo "?") v pravém horním rohu stránky NEXUS (x, y, velikost).
 SYMBOL_BOX = (112, 1, 15)
@@ -211,6 +217,19 @@ def draw_value_page(image, title, rows, simulated):
         draw.text((0, y), fit_text(label, font(TEXT_FONT), value_left - LABEL_GAP), font=font(TEXT_FONT), fill=1)
 
 
+def draw_network_page(image, rows, simulated):
+    """Stránka NETWORK: rozhraní a linka, RX, TX, IPv4; hodnoty pod sebou zarovnané vpravo."""
+    draw = draw_header(image, "NETWORK", simulated)
+    for index, (label, value) in enumerate(rows[:SERVICES_ROWS_PER_PAGE]):
+        y = SERVICES_ROW_TOP + index * SERVICES_ROW_STEP
+        if index == NETWORK_ADDRESS_ROW:
+            value_font, max_width = font(TEXT_FONT), ADDRESS_MAX_WIDTH
+        else:
+            value_font, max_width = font(TITLE_FONT), VALUE_MAX_WIDTH
+        value_left = draw_right(draw, fit_text(value, value_font, max_width), value_font, y)
+        draw.text((0, y), fit_text(label, font(TEXT_FONT), value_left - LABEL_GAP), font=font(TEXT_FONT), fill=1)
+
+
 def layout_service_rows(rows):
     """Pozice textů stránky SERVICES: [(label_xy, state_xy)], název vlevo, stav vpravo podle pixelů."""
     positions = []
@@ -273,6 +292,8 @@ def render_screen(controller, now, results, wall_time):
     page = controller.current_page(now)
     if page == "NEXUS":
         draw_nexus_page(image, wall_time, home_symbol(results, now), simulated)
+    elif page == "NETWORK":
+        draw_network_page(image, network_rows(results, now), simulated)
     elif page == "SERVICES":
         draw_services_page(image, service_rows(results, now), simulated)
     else:

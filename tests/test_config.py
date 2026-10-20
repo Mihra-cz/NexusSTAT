@@ -10,10 +10,12 @@ from nexusstat.config import (
     CollectorConfig,
     Config,
     ConfigError,
+    NetworkConfig,
     OledConfig,
     alarms_config_from_dict,
     collector_config_from_dict,
     load_config,
+    network_config_from_dict,
     oled_config_from_dict,
 )
 
@@ -32,10 +34,14 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(load_config(EXAMPLE_CONFIG).oled, OledConfig())
 
     def test_example_config_has_only_used_sections(self):
-        # Ostatní sekce (web, alarms, storage) jsou v ukázce jen jako komentář,
+        # Ostatní sekce (web, storage) jsou v ukázce jen jako komentář,
         # aby nevypadaly funkčně, dokud je kód nenačítá.
         with open(EXAMPLE_CONFIG, "rb") as file:
-            self.assertEqual(set(tomllib.load(file)), {"oled", "collector", "alarms"})
+            self.assertEqual(set(tomllib.load(file)), {"oled", "collector", "network", "alarms"})
+
+    def test_example_config_selects_interface_automatically(self):
+        # Ukázka nesmí natvrdo určit rozhraní: na Nexusu se může jmenovat jinak.
+        self.assertIsNone(load_config(EXAMPLE_CONFIG).network.interface)
 
     def test_example_config_has_no_active_thresholds(self):
         # Ukázka nesmí obsahovat neodsouhlasené prahy, ani vypnuté.
@@ -130,6 +136,40 @@ class CollectorConfigTest(unittest.TestCase):
     def test_collector_must_be_table(self):
         with self.assertRaises(ConfigError):
             collector_config_from_dict(10)
+
+
+class NetworkConfigTest(unittest.TestCase):
+    def test_default_is_automatic_selection(self):
+        self.assertIsNone(NetworkConfig().interface)
+        self.assertEqual(Config().network, NetworkConfig())
+        self.assertEqual(network_config_from_dict({}), NetworkConfig())
+
+    def test_explicit_interface(self):
+        # Fyzická i virtuální rozhraní: výslovná volba se použije přesně.
+        for name in ("eth0", "end0", "wlp2s0", "enp0s31f6", "br0", "eth0.10", "wlan_ap", "a" * 15):
+            with self.subTest(name=name):
+                self.assertEqual(network_config_from_dict({"interface": name}).interface, name)
+
+    def test_invalid_interface(self):
+        # Prázdný, dlouhý (jádro dovolí nejvýš 15 znaků), s cestou, mezerou,
+        # dvojtečkou, diakritikou nebo jiného typu: chyba, ne tichý automatický výběr.
+        # (TOML nemá null; automatický výběr = klíč vynechat.)
+        for value in ("", "a" * 16, ".", "..", "../eth0", "eth 0", "eth0:1", "ethé", True, 0, ["eth0"]):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError):
+                    network_config_from_dict({"interface": value})
+
+    def test_direct_construction_is_validated(self):
+        with self.assertRaises(ConfigError):
+            NetworkConfig(interface="eth/0")
+
+    def test_unknown_key_and_non_table(self):
+        for section in ({"interfaces": "eth0"}, {"interface": "eth0", "ipv6": True}):
+            with self.subTest(section=section):
+                with self.assertRaises(ConfigError):
+                    network_config_from_dict(section)
+        with self.assertRaises(ConfigError):
+            network_config_from_dict("eth0")
 
 
 # Ilustrační prahy jen pro testy validace; nejde o schválené hodnoty.
@@ -294,6 +334,15 @@ class LoadFileTest(unittest.TestCase):
         config = self.load_text("[oled]\npage_seconds = 6\n\n[collector]\ninterval_seconds = 5\n")
         self.assertEqual(config, Config(OledConfig(page_seconds=6), CollectorConfig(5)))
         self.assertEqual(config.collector.validity_seconds, 15)
+
+    def test_network_from_file(self):
+        config = self.load_text('[network]\ninterface = "end0"\n')
+        self.assertEqual(config.network, NetworkConfig("end0"))
+        self.assertEqual((config.oled, config.collector), (OledConfig(), CollectorConfig()))
+
+    def test_invalid_network_rejects_whole_file(self):
+        with self.assertRaises(ConfigError):
+            self.load_text('[collector]\ninterval_seconds = 5\n\n[network]\ninterface = "eth 0"\n')
 
     def test_collector_only_keeps_oled_defaults(self):
         config = self.load_text("[collector]\ninterval_seconds = 20\n")

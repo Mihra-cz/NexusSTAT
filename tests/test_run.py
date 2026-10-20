@@ -13,8 +13,10 @@ from nexusstat.config import AlarmRule, AlarmsConfig, CollectorConfig, OledConfi
 from nexusstat.core import CheckResult, Measurement, State, active_problems, effective, overall_state
 from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol
 from nexusstat.oled_text import page_rows
-from nexusstat.run import failed_results, format_line, main, run_loop
-from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS, MEMORY_ID
+from nexusstat.config import Config, NetworkConfig
+from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
+from nexusstat.run import Collectors, failed_results, format_line, live_monitor, main, run_loop
+from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS, MEMORY_ID, SystemMonitor
 
 # Monotónní čas nezačíná nulou, aby nic nezáviselo na náhodné shodě s 0.
 START = 5000.0
@@ -71,6 +73,7 @@ class FakeCollector:
     """Náhrada SystemMonitor s fiktivními výsledky; umí pomalé měření i výpadek."""
 
     simulated = True
+    labels = LABELS
 
     def __init__(self, clock, duration=0.25):
         self.clock = clock
@@ -305,10 +308,91 @@ class CollectorFailureTest(unittest.TestCase):
         self.assertIs(overall_state(results, START + 30), State.UNKNOWN)
 
     def test_failure_of_real_collector_is_not_marked_simulated(self):
-        real_collector = mock.Mock(simulated=False)
+        real_collector = mock.Mock(simulated=False, labels=LABELS)
         results = failed_results(real_collector, START, START_UTC, 30)
         self.assertFalse(any(result.simulated for result in results))
         self.assertNotIn("SIM", format_line(results, START, START_UTC, "měření selhalo"))
+
+
+class FakeNetwork:
+    """Náhrada NetworkMonitor: čtyři platné výsledky, nebo výjimka místo nich."""
+
+    simulated = True
+    labels = NETWORK_LABELS
+    validity_seconds = CONFIG.validity_seconds
+
+    def __init__(self, error=None):
+        self.error = error
+
+    def collect(self, now, observed_utc):
+        if self.error is not None:
+            raise self.error
+        return [CheckResult(check_id, State.INFO, f"{label} ok", observed_utc, now + self.validity_seconds,
+                            simulated=True) for check_id, label in NETWORK_LABELS.items()]
+
+
+class CollectorsTest(unittest.TestCase):
+    """Systém a síť se měří společně, ale selhání jednoho kolektoru nezasáhne druhý."""
+
+    def collectors(self, network_error=None):
+        clock = FakeClock(stop_at=START + 1000)
+        system = FakeCollector(clock)
+        system.validity_seconds = CONFIG.validity_seconds
+        return Collectors(system, FakeNetwork(network_error)), system
+
+    def test_results_of_all_collectors_in_order(self):
+        collectors, _ = self.collectors()
+        results = collectors.collect(START, START_UTC)
+        self.assertEqual([r.id for r in results], list(LABELS) + list(NETWORK_LABELS))
+        self.assertEqual(collectors.labels, {**LABELS, **NETWORK_LABELS})
+        self.assertEqual(collectors.validity_seconds, 30)
+
+    def test_failure_of_network_keeps_system_values(self):
+        collectors, _ = self.collectors(network_error=OSError("simulovaný výpadek"))
+        by_id = {r.id: r for r in collectors.collect(START, START_UTC)}
+        self.assertEqual({by_id[i].state for i in LABELS}, {State.INFO})  # systém změřen normálně
+        self.assertEqual({by_id[i].state for i in NETWORK_LABELS}, {State.UNKNOWN})
+        self.assertEqual(by_id["network.link"].summary, "Síť: měření selhalo (OSError)")
+        self.assertEqual({by_id[i].expires_monotonic for i in NETWORK_LABELS}, {START + 30})
+
+    def test_failure_of_system_keeps_network_values(self):
+        collectors, system = self.collectors()
+        system.errors = {1: RuntimeError("simulovaný výpadek")}
+        by_id = {r.id: r for r in collectors.collect(START, START_UTC)}
+        self.assertEqual({by_id[i].state for i in LABELS}, {State.UNKNOWN})
+        self.assertEqual({by_id[i].state for i in NETWORK_LABELS}, {State.INFO})
+
+    def test_loop_with_failing_network_still_reports_system(self):
+        clock = FakeClock(stop_at=START + 5)
+        system = FakeCollector(clock)
+        system.validity_seconds = CONFIG.validity_seconds
+        results, lines = run(clock, Collectors(system, FakeNetwork(ValueError("vadná data"))))
+        self.assertIn("CPU 5 %", lines[1])
+        self.assertIn("Síť RX: měření selhalo (ValueError)", lines[1])
+        self.assertIs(overall_state(results, START), State.UNKNOWN)  # síť chybí: ne INFO/OK
+
+    def test_ctrl_c_is_not_swallowed(self):
+        collectors, _ = self.collectors(network_error=KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            collectors.collect(START, START_UTC)
+
+    def test_invalid_combination(self):
+        with self.assertRaises(ValueError):
+            Collectors()
+        other = FakeNetwork()
+        other.validity_seconds = 15
+        with self.assertRaises(ValueError):
+            Collectors(FakeNetwork(), other)
+
+    def test_live_monitor_reads_system_and_configured_network(self):
+        monitor = live_monitor(Config(collector=CollectorConfig(interval_seconds=5), network=NetworkConfig("end0")))
+        system, network = monitor.monitors
+        self.assertIsInstance(system, SystemMonitor)
+        self.assertIsInstance(network, NetworkMonitor)
+        self.assertEqual(network.interface, "end0")
+        self.assertEqual((system.validity_seconds, network.validity_seconds, monitor.validity_seconds), (15, 15, 15))
+        self.assertFalse(monitor.simulated)  # skutečné zdroje, nic se při vytvoření nečte
+        self.assertIsNone(live_monitor(Config()).monitors[1].interface)  # výchozí: automatický výběr
 
 
 class TerminationTest(unittest.TestCase):
@@ -451,6 +535,14 @@ class MainTest(unittest.TestCase):
         self.assertEqual(config, CollectorConfig())
         self.assertEqual(monitor.validity_seconds, 30)
         self.assertFalse(any(rule.enabled for rule, _ in evaluator.rules.values()))
+        # Smyčka měří systém i síť, rozhraní se vybírá automaticky.
+        self.assertEqual(list(monitor.labels), list(LABELS) + list(NETWORK_LABELS))
+        self.assertIsNone(monitor.monitors[1].interface)
+
+    def test_network_interface_from_config(self):
+        run_loop_mock, _ = self.run_main(["--config", self.write_config('[network]\ninterface = "eth0"\n')])
+        monitor, _, _ = run_loop_mock.call_args.args
+        self.assertEqual(monitor.monitors[1].interface, "eth0")
 
     def test_alarm_rules_from_config(self):
         text = "[alarms.disk_root]\nenabled = true\nwarning = 85\nerror = 95\nhysteresis = 3\n"
@@ -464,6 +556,7 @@ class MainTest(unittest.TestCase):
             "neznámý klíč": "[collector]\nvalidity_seconds = 30\n",
             "neplatné OLED": "[oled]\npage_seconds = 0\n",
             "neznámá sekce": "[web]\nadmin_port = 8765\n",
+            "neplatné rozhraní": '[network]\ninterface = "../eth0"\n',
             # Regrese: obří celé číslo shodilo main() tracebackem (OverflowError, kód 1).
             "obří číslo": "[alarms.cpu_temp]\nwarning = 1" + "0" * 400 + "\nerror = 80\nhysteresis = 1\n",
         }

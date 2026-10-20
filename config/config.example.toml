@@ -11,6 +11,14 @@ status_idle_seconds = 30  # celé sekundy 1–3600
 [collector]
 interval_seconds = 10  # celé sekundy 1–3600; platnost výsledků = 3 × interval (nenastavuje se zvlášť)
 
+# Síťové rozhraní pro stránku NETWORK a výpis. Bez klíče interface se vybírá
+# automaticky: fyzické rozhraní s výchozí trasou IPv4 (nejnižší metrika), jinak
+# fyzické s linkou UP, jinak jakékoli fyzické; při shodě abecedně. Docker,
+# VPN, loopback a další virtuální rozhraní se automaticky nevybírají.
+# Zadaný název (1–15 znaků A–Z, a–z, 0–9, _ . -) se použije přesně, i virtuální.
+[network]
+# interface = "eth0"
+
 # Alarmové prahy. Výchozí stav: vyhodnocování vypnuto, platné měření zůstává INFO.
 # Prahy NEMAJÍ výchozí hodnoty a konkrétní čísla zatím nejsou schválená.
 # Při enabled = true jsou povinné všechny tři: warning < error,

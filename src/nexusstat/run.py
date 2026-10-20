@@ -4,9 +4,11 @@ Použití:
   PYTHONPATH=src python3 -m nexusstat.run [--config SOUBOR]
 
 Každých `interval_seconds` (sekce [collector], výchozí 10 s) změří vytížení CPU,
-teplotu CPU, RAM a obsazenost /, vyhodnotí zapnuté prahy ([alarms], výchozí
-vypnuto) a vypíše jeden řádek. Ukončení: Ctrl+C.
-Nic nezapisuje, neotevírá port a nepřistupuje k displeji, NAS ani jinému hardwaru.
+teplotu CPU, RAM, obsazenost / a síťové rozhraní ([network]: linka, RX/TX, IPv4),
+vyhodnotí zapnuté prahy ([alarms], výchozí vypnuto) a vypíše jeden řádek.
+Ukončení: Ctrl+C.
+Nic nezapisuje, neotevírá port, nic neposílá do sítě a nepřistupuje k displeji,
+NAS ani jinému hardwaru.
 Alarm se jen vypíše; žádná automatická akce (vypnutí, ventilátory) neexistuje.
 """
 
@@ -18,7 +20,8 @@ from pathlib import Path
 from .alarms import AlarmEvaluator
 from .config import Config, ConfigError, load_config
 from .core import ALERT_STATES, CheckResult, State, overall_state
-from .system_monitor import LABELS, SystemMonitor
+from .network_monitor import NetworkMonitor
+from .system_monitor import SystemMonitor
 
 
 def utc_now():
@@ -30,20 +33,61 @@ def print_now(line):
     print(line, flush=True)
 
 
-def failed_results(monitor, now, observed_utc, validity_seconds):
-    """Výsledky pro měření, které celé selhalo: všechny kontroly UNKNOWN.
+def failed_results(monitor, now, observed_utc, validity_seconds, reason="měření selhalo"):
+    """Výsledky pro měření, které celé selhalo: všechny kontroly kolektoru UNKNOWN.
 
-    Předchozí hodnoty se nepodrží, i když by ještě byly platné: víme, že
-    aktuální měření neproběhlo, a staré INFO/OK by vypadalo jako čerstvé.
-    Stejně se kolektor chová při selhání jedné kontroly.
+    Kontroly určuje `monitor.labels` (id → popisek). Předchozí hodnoty se
+    nepodrží, i když by ještě byly platné: víme, že aktuální měření
+    neproběhlo, a staré INFO/OK by vypadalo jako čerstvé. Stejně se kolektor
+    chová při selhání jedné kontroly.
     """
     return [
         CheckResult(
-            check_id, State.UNKNOWN, f"{label}: měření selhalo", observed_utc,
+            check_id, State.UNKNOWN, f"{label}: {reason}", observed_utc,
             now + validity_seconds, simulated=monitor.simulated,
         )
-        for check_id, label in LABELS.items()
+        for check_id, label in monitor.labels.items()
     ]
+
+
+class Collectors:
+    """Několik read-only kolektorů měřených společně, navenek jako jeden.
+
+    Výjimka jednoho kolektoru nahradí UNKNOWN jen jeho vlastní kontroly;
+    ostatní kolektory změří normálně. Chyba sítě tak nezneplatní měření CPU
+    (a naopak), stejně jako chyba jedné kontroly uvnitř kolektoru.
+    """
+
+    def __init__(self, *monitors):
+        if not monitors:
+            raise ValueError("Collectors potřebuje aspoň jeden kolektor")
+        validities = {monitor.validity_seconds for monitor in monitors}
+        if len(validities) != 1:
+            raise ValueError("kolektory musí mít stejnou platnost výsledků")
+        self.monitors = monitors
+        self.validity_seconds = validities.pop()
+        self.simulated = any(monitor.simulated for monitor in monitors)
+        self.labels = {check_id: label for monitor in monitors for check_id, label in monitor.labels.items()}
+
+    def collect(self, now, observed_utc):
+        results = []
+        for monitor in self.monitors:
+            try:
+                results += monitor.collect(now, observed_utc)
+            except Exception as error:
+                # Ctrl+C (KeyboardInterrupt) není Exception a projde až do smyčky.
+                results += failed_results(monitor, now, observed_utc, self.validity_seconds,
+                                          f"měření selhalo ({type(error).__name__})")
+        return results
+
+
+def live_monitor(config):
+    """Skutečné read-only kolektory tohoto počítače: systém a síť podle konfigurace."""
+    validity = config.collector.validity_seconds
+    return Collectors(
+        SystemMonitor(validity_seconds=validity),
+        NetworkMonitor(validity_seconds=validity, interface=config.network.interface),
+    )
 
 
 def result_text(result):
@@ -121,17 +165,15 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Pravidelné read-only měření systému NexusSTAT")
-    parser.add_argument("--config", type=Path, help="TOML se sekcemi [collector] a [oled]")
+    parser = argparse.ArgumentParser(description="Pravidelné read-only měření systému a sítě NexusSTAT")
+    parser.add_argument("--config", type=Path, help="TOML se sekcemi [collector], [network], [alarms] a [oled]")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config) if args.config else Config()
     except (ConfigError, OSError) as error:
         # Neplatná konfigurace = žádné měření, ne tiché použití výchozích hodnot.
         parser.error(str(error))
-    collector = config.collector
-    monitor = SystemMonitor(validity_seconds=collector.validity_seconds)
-    run_loop(monitor, collector, AlarmEvaluator(config.alarms))
+    run_loop(live_monitor(config), config.collector, AlarmEvaluator(config.alarms))
 
 
 if __name__ == "__main__":

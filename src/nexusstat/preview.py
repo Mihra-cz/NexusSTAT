@@ -4,7 +4,8 @@ Spuštění:
   PYTHONPATH=src python3 -m nexusstat.preview [--scenario NÁZEV] [--scale 4|6] [--config SOUBOR]
 
 Obraz kreslí výhradně render.render_screen(); simulátor jen řídí čas,
-tlačítko, scénáře a zvětšení. Nepřistupuje k hardwaru displeje, GPIO ani síti.
+tlačítko, scénáře a zvětšení. Nepřistupuje k hardwaru displeje ani GPIO
+a nic neposílá do sítě (LIVE síť jen čte jako network_monitor).
 Stavová logika (PreviewSession) nepotřebuje tkinter ani grafický displej,
 takže ji testy ověřují bez X serveru; tkinter se načte až při otevření okna.
 """
@@ -21,10 +22,23 @@ from pathlib import Path
 from .alarms import AlarmEvaluator
 from .config import Config, ConfigError, load_config
 from .core import CheckResult, Measurement, State, active_problems
+from .network_monitor import (
+    ADDRESS,
+    BYTES_PER_SECOND,
+    INTERFACE,
+    IPV4_ID,
+    LINK,
+    LINK_DOWN,
+    LINK_ID,
+    LINK_UP,
+    RX_RATE_ID,
+    TX_RATE_ID,
+    format_rate,
+)
 from .oled import Mode, OledController, status_page_count
-from .run import failed_results
+from .run import failed_results, live_monitor
 from .services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
-from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT, SystemMonitor
+from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
 
 # Zrychlení simulovaného času. LIVE běží vždy 1×, protože měří skutečný čas.
 SPEEDS = (1, 5, 10)
@@ -37,12 +51,18 @@ LIVE = "live"
 
 
 # --- Fiktivní scénáře -------------------------------------------------------
-# Každý scénář dostane funkci sim(id, stav, popis, hodnota=None, stale_after=None)
-# a vrátí seznam výsledků. Běžná položka je čerstvé měření v okamžiku obnovy
-# (obnovuje se po intervalu kolektoru jako skutečná data). `stale_after=N`
-# znamená: změřeno jen při spuštění scénáře a dál nepřichází, po N s tedy vyprší.
-# Systémové hodnoty mají číselnou hodnotu jako skutečný kolektor: displej
-# (oled_text) ukazuje ji, ne český popis.
+# Každý scénář dostane funkci sim(id, stav, popis, hodnota=None, stale_after=None,
+# details=None) a vrátí seznam výsledků. Běžná položka je čerstvé měření
+# v okamžiku obnovy (obnovuje se po intervalu kolektoru jako skutečná data).
+# `stale_after=N` znamená: změřeno jen při spuštění scénáře a dál nepřichází,
+# po N s tedy vyprší. Hodnoty mají číselnou hodnotu a údaje details jako
+# skutečné kolektory: displej (oled_text) ukazuje je, ne český popis.
+
+# Fiktivní rozhraní a adresa z dokumentačního rozsahu 192.0.2.0/24 (RFC 5737),
+# aby se simulace nikdy nepletla se skutečnou sítí.
+SIM_INTERFACE = "eth0"
+SIM_ADDRESS = "192.0.2.10"
+
 
 def pct(value):
     return Measurement(value, PERCENT)
@@ -52,7 +72,24 @@ def deg(value):
     return Measurement(value, CELSIUS)
 
 
-def scenario_ok(sim):
+def rate(bytes_per_second):
+    return Measurement(bytes_per_second, BYTES_PER_SECOND)
+
+
+def network(sim, rx, tx, link=LINK_UP, address=SIM_ADDRESS, stale_after=None):
+    """Čtyři fiktivní výsledky stránky NETWORK; address=None = rozhraní bez IPv4."""
+    on_interface = {INTERFACE: SIM_INTERFACE}
+    with_address = {ADDRESS: address} if address else {}
+    return [
+        sim(LINK_ID, State.INFO, f"Síť {SIM_INTERFACE} {link}", details={**on_interface, LINK: link}),
+        sim(RX_RATE_ID, State.INFO, f"Síť RX {format_rate(rx)}", rate(rx), stale_after, details=on_interface),
+        sim(TX_RATE_ID, State.INFO, f"Síť TX {format_rate(tx)}", rate(tx), stale_after, details=on_interface),
+        sim(IPV4_ID, State.INFO, f"IPv4 {address or 'bez adresy'}", stale_after=stale_after,
+            details={**on_interface, **with_address}),
+    ]
+
+
+def system_and_services(sim):
     return [
         sim(CPU_USAGE_ID, State.INFO, "CPU 12 %", pct(12)),
         sim(CPU_TEMP_ID, State.INFO, "Teplota CPU 46 °C", deg(46)),
@@ -63,6 +100,11 @@ def scenario_ok(sim):
         sim(BACKUP_ID, State.OK, "Záloha v pořádku"),
         sim(ANIMEDB_ID, State.NA, "AnimeDB není nasazena"),
     ]
+
+
+def scenario_ok(sim):
+    # Síť na konci, aby indexy systémových položek a služeb zůstaly stejné.
+    return system_and_services(sim) + network(sim, rx=1_234_000, tx=85_300)
 
 
 def scenario_warning(sim):
@@ -102,13 +144,45 @@ def scenario_many(sim):
         sim(NAS_ID, State.CRITICAL, "NAS nedostupný"),
         sim(BACKUP_ID, State.ERROR, "Záloha starší 3 dny"),
         sim(ANIMEDB_ID, State.NA, "AnimeDB není nasazena"),
-    ]
+    ] + network(sim, rx=4_820_000, tx=310_000)
 
 
 def scenario_unconnected(sim):
-    # Fiktivní systém, služby bez výsledku: doplnění je ukáže jako dnes ve
-    # skutečnosti (NEXUS, NAS, BACKUP UNKNOWN, AnimeDB N/A).
-    return scenario_ok(sim)[:4]
+    # Fiktivní systém a síť, služby bez výsledku: doplnění je ukáže jako dnes
+    # ve skutečnosti (NEXUS, NAS, BACKUP UNKNOWN, AnimeDB N/A).
+    return system_and_services(sim)[:4] + network(sim, rx=1_234_000, tx=85_300)
+
+
+# Síťové scénáře: systém a služby jako ve scénáři 1, mění se jen NETWORK.
+def scenario_net_down(sim):
+    # Linka DOWN: platné měření (INFO), adresa žádná, čítače stojí.
+    return system_and_services(sim) + network(sim, rx=0, tx=0, link=LINK_DOWN, address=None)
+
+
+def scenario_net_no_ipv4(sim):
+    # Linka UP, ale IPv4 chybí (např. nefunkční DHCP): NONE, ne UNKN.
+    return system_and_services(sim) + network(sim, rx=412, tx=0, address=None)
+
+
+def scenario_net_low(sim):
+    return system_and_services(sim) + network(sim, rx=312, tx=96)
+
+
+def scenario_net_high(sim):
+    return system_and_services(sim) + network(sim, rx=112_400_000, tx=48_700_000)
+
+
+def scenario_net_invalid(sim):
+    # RX neplatné (reset čítače, UNKNOWN), TX a IPv4 změřené jen při spuštění
+    # scénáře: po 20 s vyprší na UNKN (ve STATUS STALE). Linka platí dál.
+    on_interface = {INTERFACE: SIM_INTERFACE}
+    fresh = network(sim, rx=0, tx=85_300, stale_after=20)
+    return system_and_services(sim) + [
+        fresh[0],
+        sim(RX_RATE_ID, State.UNKNOWN, "Síť RX: reset čítače", details=on_interface),
+        fresh[2],
+        fresh[3],
+    ]
 
 
 # Pořadí odpovídá nabídce v okně.
@@ -119,6 +193,11 @@ SCENARIOS = {
     "unknown": ("4 UNKNOWN: stará a chybějící data", scenario_unknown),
     "many": ("5 Více problémů (2 stránky STATUS)", scenario_many),
     "unconnected": ("6 Nenapojené služby (dnešní stav)", scenario_unconnected),
+    "net_down": ("7 NETWORK: linka DOWN", scenario_net_down),
+    "net_no_ipv4": ("8 NETWORK: bez IPv4", scenario_net_no_ipv4),
+    "net_low": ("9 NETWORK: nízký provoz", scenario_net_low),
+    "net_high": ("10 NETWORK: vysoký provoz", scenario_net_high),
+    "net_invalid": ("11 NETWORK: neplatná a zastaralá data", scenario_net_invalid),
     LIVE: ("LIVE: měření tohoto notebooku", None),
 }
 
@@ -151,7 +230,7 @@ class PreviewSession:
     """Stav simulátoru bez grafického okna: scénář, data, controller a čas."""
 
     def __init__(self, config=None, scenario="ok", clock=None, utc_clock=None, wall_clock=datetime.now,
-                 monitor_factory=SystemMonitor):
+                 monitor_factory=live_monitor):
         self.config = config or Config()
         self.clock = clock or SessionClock()
         self.utc_clock = utc_clock or (lambda: datetime.now(timezone.utc))
@@ -183,7 +262,8 @@ class PreviewSession:
         if self.is_live:
             # Skutečné měření běží ve skutečném čase.
             self.clock.set_speed(1)
-            self.monitor = self.monitor_factory(validity_seconds=self.validity)
+            # Skutečné read-only kolektory podle konfigurace: systém a síť ([network]).
+            self.monitor = self.monitor_factory(self.config)
             self.evaluator = AlarmEvaluator(self.config.alarms)
         else:
             self.monitor = self.evaluator = None
@@ -208,10 +288,10 @@ class PreviewSession:
         return self._wall_start + timedelta(seconds=now - self._time_start)
 
     def _scenario_results(self, now):
-        def sim(check_id, state, summary, value=None, stale_after=None):
+        def sim(check_id, state, summary, value=None, stale_after=None, details=None):
             at, valid = (self.started_at, stale_after) if stale_after else (now, self.validity)
             return CheckResult(check_id, state, summary, self.utc_at(at), at + valid, simulated=True,
-                               measurement=value)
+                               measurement=value, details=details or {})
 
         return SCENARIOS[self.scenario][1](sim)
 
@@ -264,7 +344,7 @@ class PreviewSession:
 
     def source_text(self):
         if self.is_live:
-            return ("LIVE: skutečná read-only měření tohoto NOTEBOOKU, ne Nexusu. "
+            return ("LIVE: skutečná read-only měření (systém a síť) tohoto NOTEBOOKU, ne Nexusu. "
                     "Služby bez kolektoru UNKNOWN, AnimeDB N/A. Čas 1×.")
         return f"SIMULACE: fiktivní data (značka SIM), čas {self.clock.speed}×."
 

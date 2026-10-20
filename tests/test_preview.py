@@ -7,6 +7,7 @@ se ověřuje s falešným modulem tkinter, takže X server není potřeba.
 
 import base64
 import contextlib
+import inspect
 import io
 import signal
 import sys
@@ -15,13 +16,15 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from nexusstat.config import AlarmRule, AlarmsConfig, Config
+from nexusstat.config import AlarmRule, AlarmsConfig, Config, NetworkConfig
 from nexusstat.core import CheckResult, Measurement, State, active_problems
+from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
 from nexusstat.oled import UNKNOWN_SYMBOL, Mode, home_symbol
-from nexusstat.oled_text import page_rows, service_rows
+from nexusstat.oled_text import network_rows, page_rows, service_rows
 from nexusstat.preview import LIVE, SCENARIOS, SPEEDS, PreviewSession, SessionClock, main
+from nexusstat.run import Collectors, live_monitor
 from nexusstat.services import BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, SERVICE_LABELS
-from nexusstat.system_monitor import CPU_TEMP_ID, LABELS as SYSTEM_LABELS
+from nexusstat.system_monitor import CPU_TEMP_ID, LABELS as SYSTEM_LABELS, SystemMonitor
 
 try:
     from PIL import Image
@@ -48,14 +51,15 @@ class FakeRealClock:
 
 
 class FakeMonitor:
-    """Náhrada SystemMonitor pro LIVE: skutečná (ne simulovaná) data bez čtení /proc."""
+    """Náhrada skutečných kolektorů pro LIVE: skutečná (ne simulovaná) data bez čtení /proc."""
 
     simulated = False
+    labels = SYSTEM_LABELS
     temperature = 50.0
     fail = False
 
-    def __init__(self, validity_seconds):
-        self.validity_seconds = validity_seconds
+    def __init__(self, config):
+        self.validity_seconds = config.collector.validity_seconds
         self.calls = []
 
     def collect(self, now, observed_utc):
@@ -144,31 +148,47 @@ class WakeSleepTest(unittest.TestCase):
 
 
 class CarouselTest(unittest.TestCase):
-    def test_four_pages_every_10_seconds(self):
+    def test_five_pages_every_10_seconds(self):
         session, real = make_session()
         session.press()
         pages = []
-        for _ in range(5):
+        for _ in range(6):
             pages.append(mode_page(session)[1])
             real.advance(10)
-        self.assertEqual(pages, ["NEXUS", "SYSTEM", "DISK", "SERVICES", "NEXUS"])
+        self.assertEqual(pages, ["NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES", "NEXUS"])
 
     def test_pages_at_5x_speed(self):
         session, real = make_session()
         session.set_speed(5)
         session.press()
         pages = []
-        for _ in range(5):
+        for _ in range(6):
             pages.append(mode_page(session)[1])
             real.advance(2)  # 2 s skutečného času = 10 s simulovaného
-        self.assertEqual(pages, ["NEXUS", "SYSTEM", "DISK", "SERVICES", "NEXUS"])
+        self.assertEqual(pages, ["NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES", "NEXUS"])
 
-    def test_describe_names_services_page(self):
+    def test_describe_names_network_and_services_pages(self):
         session, real = make_session()
         session.press()
         real.advance(30)
         session.controller.update(session.clock.now())
-        self.assertTrue(session.describe().startswith("CAROUSEL – SERVICES"))  # stejně jako nadpis na displeji
+        self.assertTrue(session.describe().startswith("CAROUSEL – NETWORK"))  # stejně jako nadpis na displeji
+        real.advance(10)
+        session.controller.update(session.clock.now())
+        self.assertTrue(session.describe().startswith("CAROUSEL – SERVICES"))
+
+    def test_window_and_status_timeouts_unchanged_with_five_pages(self):
+        session, real = make_session("net_invalid")
+        session.press()
+        real.advance(35)  # NETWORK
+        session.press()  # STATUS (NET RX NO DATA)
+        self.assertIs(mode_page(session)[0], Mode.STATUS)
+        real.advance(30)
+        self.assertEqual(mode_page(session), (Mode.CAROUSEL, "NEXUS"))
+        real.advance(299.9)
+        self.assertIs(mode_page(session)[0], Mode.CAROUSEL)
+        real.advance(0.1)
+        self.assertEqual(mode_page(session), (Mode.SLEEP, None))
 
 
 class StatusTest(unittest.TestCase):
@@ -211,8 +231,9 @@ class StatusTest(unittest.TestCase):
 
 
 class ScenarioTest(unittest.TestCase):
-    def test_six_scenarios_and_live(self):
-        self.assertEqual(list(SCENARIOS), ["ok", "warning", "error", "unknown", "many", "unconnected", LIVE])
+    def test_scenarios_and_live(self):
+        self.assertEqual(list(SCENARIOS), ["ok", "warning", "error", "unknown", "many", "unconnected", "net_down",
+                                           "net_no_ipv4", "net_low", "net_high", "net_invalid", LIVE])
 
     def test_fictitious_values_are_simulated(self):
         for name in SCENARIOS:
@@ -235,6 +256,12 @@ class ScenarioTest(unittest.TestCase):
             "unknown": {State.UNKNOWN},
             "many": {State.CRITICAL, State.ERROR, State.WARNING, State.UNKNOWN},
             "unconnected": {State.UNKNOWN},
+            # DOWN, chybějící IPv4 i provoz jsou platná měření (INFO), ne závady.
+            "net_down": set(),
+            "net_no_ipv4": set(),
+            "net_low": set(),
+            "net_high": set(),
+            "net_invalid": {State.UNKNOWN},
         }
         for name, states in expected.items():
             session, _ = make_session(name)
@@ -359,6 +386,33 @@ class LiveTest(unittest.TestCase):
         system = [r for r in session.results if r.id in SYSTEM_LABELS]
         self.assertEqual({r.state for r in system}, {State.UNKNOWN})
         self.assertIn("měření selhalo", system[0].summary)
+
+    def test_live_uses_collectors_from_config(self):
+        # Výchozí továrna: skutečné kolektory systému a sítě s rozhraním z [network].
+        # Jen se vytvoří, nic se nečte: měření je v testu náhradní kolektor.
+        created = []
+
+        def factory(config):
+            created.append(config)
+            return FakeMonitor(config)
+
+        config = Config(network=NetworkConfig("end0"))
+        session = PreviewSession(config, scenario=LIVE, clock=SessionClock(real_clock=FakeRealClock()),
+                                 utc_clock=lambda: START_UTC, wall_clock=lambda: WALL, monitor_factory=factory)
+        self.assertEqual(created, [config])
+        self.assertIs(session.monitor_factory, factory)
+        self.assertIs(inspect.signature(PreviewSession).parameters["monitor_factory"].default, live_monitor)
+        monitor = live_monitor(config)
+        self.assertIsInstance(monitor, Collectors)
+        self.assertEqual([type(m) for m in monitor.monitors], [SystemMonitor, NetworkMonitor])
+        self.assertEqual(monitor.monitors[1].interface, "end0")
+        self.assertEqual(list(monitor.labels), list(SYSTEM_LABELS) + list(NETWORK_LABELS))
+
+    def test_live_without_network_results_shows_unkn(self):
+        # Náhradní kolektor bez sítě: stránka NETWORK nic nedomýšlí.
+        session, _ = make_session(LIVE)
+        self.assertEqual(network_rows(session.results, session.clock.now()),
+                         [("LINK", "UNKN"), ("RX", "UNKN"), ("TX", "UNKN"), ("IPV4", "UNKN")])
 
     def test_back_to_simulation(self):
         session, _ = make_session(LIVE)

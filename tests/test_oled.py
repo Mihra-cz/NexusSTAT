@@ -75,26 +75,28 @@ class CarouselTest(unittest.TestCase):
         self.assertEqual(at(controller, 109.9), (Mode.CAROUSEL, "NEXUS"))
         self.assertEqual(at(controller, 110), (Mode.CAROUSEL, "SYSTEM"))
         self.assertEqual(at(controller, 120), (Mode.CAROUSEL, "DISK"))
-        self.assertEqual(at(controller, 130), (Mode.CAROUSEL, "SERVICES"))
-        self.assertEqual(at(controller, 139.9), (Mode.CAROUSEL, "SERVICES"))
-        self.assertEqual(at(controller, 140), (Mode.CAROUSEL, "NEXUS"))  # cyklus znovu
+        self.assertEqual(at(controller, 130), (Mode.CAROUSEL, "NETWORK"))
+        self.assertEqual(at(controller, 140), (Mode.CAROUSEL, "SERVICES"))
+        self.assertEqual(at(controller, 149.9), (Mode.CAROUSEL, "SERVICES"))
+        self.assertEqual(at(controller, 150), (Mode.CAROUSEL, "NEXUS"))  # cyklus znovu
 
-    def test_four_pages_in_order(self):
-        self.assertEqual(CAROUSEL_PAGES, ("NEXUS", "SYSTEM", "DISK", "SERVICES"))
+    def test_five_pages_in_order(self):
+        # STORAGE (místo DISK) a CPU FAN jsou plán další fáze, zatím ne.
+        self.assertEqual(CAROUSEL_PAGES, ("NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES"))
         self.assertEqual(OledController(OledConfig()).pages, CAROUSEL_PAGES)
 
     def test_rotation_over_whole_window_returns_to_nexus(self):
         controller = awake_controller(at=0)
         seen = [at(controller, now)[1] for now in range(0, 300, 10)]
-        # 300 s / 10 s = 30 přepnutí: 7 celých cyklů a půl dalšího, pořád v pořadí.
-        self.assertEqual(seen, list(CAROUSEL_PAGES) * 7 + ["NEXUS", "SYSTEM"])
-        self.assertEqual(at(controller, 300), (Mode.SLEEP, None))  # okno se čtvrtou stránkou neprodloužilo
+        # 300 s / 10 s = 30 přepnutí: přesně 6 celých cyklů, pořád v pořadí.
+        self.assertEqual(seen, list(CAROUSEL_PAGES) * 6)
+        self.assertEqual(at(controller, 300), (Mode.SLEEP, None))  # okno se pátou stránkou neprodloužilo
 
-    def test_custom_page_interval_with_four_pages(self):
+    def test_custom_page_interval_with_five_pages(self):
         config = OledConfig(carousel_seconds=60, page_seconds=4, status_idle_seconds=30)
         controller = awake_controller(at=0, config=config)
-        self.assertEqual([at(controller, now)[1] for now in (0, 4, 8, 12, 16)],
-                         ["NEXUS", "SYSTEM", "DISK", "SERVICES", "NEXUS"])
+        self.assertEqual([at(controller, now)[1] for now in (0, 4, 8, 12, 16, 20)],
+                         ["NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES", "NEXUS"])
         self.assertEqual(at(controller, 60), (Mode.SLEEP, None))
 
     def test_sleeps_after_300_seconds(self):
@@ -227,9 +229,9 @@ class FullScenarioTest(unittest.TestCase):
             (40, "press", (Mode.STATUS, None)),
             (69.9, None, (Mode.STATUS, None)),
             (70, None, (Mode.CAROUSEL, "NEXUS")),  # 30 s nečinnosti
-            # 299,9 s od návratu v čase 70: 29. přepnutí, se čtyřmi stránkami SYSTEM
-            # (dříve se třemi stránkami DISK). Časování okna se nezměnilo.
-            (369.9, None, (Mode.CAROUSEL, "SYSTEM")),
+            # 299,9 s od návratu v čase 70: 29. přepnutí, s pěti stránkami SERVICES
+            # (dříve se čtyřmi SYSTEM, se třemi DISK). Časování okna se nezměnilo.
+            (369.9, None, (Mode.CAROUSEL, "SERVICES")),
             (370, None, (Mode.SLEEP, None)),  # 300 s od návratu
         ]
         for now, action, expected in steps:
@@ -242,20 +244,43 @@ class FullScenarioTest(unittest.TestCase):
 class ServicesPageStatusTest(unittest.TestCase):
     def test_press_on_services_page_opens_status(self):
         controller = awake_controller(at=0)
-        self.assertEqual(at(controller, 35), (Mode.CAROUSEL, "SERVICES"))
-        controller.press(35, problem_count=1)
+        self.assertEqual(at(controller, 45), (Mode.CAROUSEL, "SERVICES"))
+        controller.press(45, problem_count=1)
         self.assertIs(controller.mode, Mode.STATUS)
         # Nečinnost 30 s: návrat vždy na NEXUS s novým oknem, ne na SERVICES.
-        self.assertEqual(at(controller, 65), (Mode.CAROUSEL, "NEXUS"))
-        self.assertEqual(at(controller, 95), (Mode.CAROUSEL, "SERVICES"))
-        self.assertEqual(at(controller, 365), (Mode.SLEEP, None))
+        self.assertEqual(at(controller, 75), (Mode.CAROUSEL, "NEXUS"))
+        self.assertEqual(at(controller, 115), (Mode.CAROUSEL, "SERVICES"))
+        self.assertEqual(at(controller, 375), (Mode.SLEEP, None))
 
     def test_return_by_press_from_services_starts_on_nexus(self):
         controller = awake_controller(at=0)
-        controller.press(32, problem_count=0)  # ze SERVICES do STATUS
-        controller.press(33, problem_count=0)  # jediná stránka → zpět
-        self.assertEqual(at(controller, 33), (Mode.CAROUSEL, "NEXUS"))
-        self.assertEqual(at(controller, 63), (Mode.CAROUSEL, "SERVICES"))
+        controller.press(42, problem_count=0)  # ze SERVICES do STATUS
+        controller.press(43, problem_count=0)  # jediná stránka → zpět
+        self.assertEqual(at(controller, 43), (Mode.CAROUSEL, "NEXUS"))
+        self.assertEqual(at(controller, 83), (Mode.CAROUSEL, "SERVICES"))
+
+
+class NetworkPageStatusTest(unittest.TestCase):
+    """Stránka NETWORK se ovládá stejně jako ostatní; STATUS a jeho timeouty beze změny."""
+
+    def test_press_on_network_page_opens_status_and_returns_by_timeout(self):
+        controller = awake_controller(at=0)
+        self.assertEqual(at(controller, 35), (Mode.CAROUSEL, "NETWORK"))
+        controller.press(35, problem_count=5)  # 2 stránky STATUS
+        self.assertIs(controller.mode, Mode.STATUS)
+        controller.press(40, problem_count=5)  # stránka 2/2, 30 s běží znovu od stisku
+        self.assertEqual(at(controller, 69.9)[0], Mode.STATUS)
+        self.assertEqual(at(controller, 70), (Mode.CAROUSEL, "NEXUS"))  # nové okno od vypršení
+        self.assertEqual(at(controller, 100), (Mode.CAROUSEL, "NETWORK"))
+        self.assertEqual(at(controller, 369.9)[0], Mode.CAROUSEL)
+        self.assertEqual(at(controller, 370), (Mode.SLEEP, None))  # 300 s od návratu
+
+    def test_return_by_press_from_network_starts_on_nexus(self):
+        controller = awake_controller(at=0)
+        controller.press(31, problem_count=0)  # z NETWORK do STATUS (bez závad = 1 stránka)
+        controller.press(32, problem_count=0)
+        self.assertEqual(at(controller, 32), (Mode.CAROUSEL, "NEXUS"))
+        self.assertEqual(at(controller, 62), (Mode.CAROUSEL, "NETWORK"))
 
 
 def service(service_id, state, expires=1000, simulated=True):
@@ -389,10 +414,10 @@ class ServiceConsistencyTest(unittest.TestCase):
 
 
 class FakeMonitor:
-    """Náhrada SystemMonitor pro simulate --live: skutečná (ne simulovaná) data bez závady."""
+    """Náhrada skutečných kolektorů pro simulate --live: skutečná (ne simulovaná) data bez závady."""
 
-    def __init__(self, validity_seconds):
-        self.validity_seconds = validity_seconds
+    def __init__(self, config):
+        self.validity_seconds = config.collector.validity_seconds
 
     def collect(self, now, observed_utc):
         return [CheckResult(check_id, State.INFO, f"{label} 50 %", observed_utc, now + self.validity_seconds,
@@ -402,7 +427,7 @@ class FakeMonitor:
 class SimulatorScenarioTest(unittest.TestCase):
     def test_live_mode_completes_services(self):
         output = io.StringIO()
-        with mock.patch.object(simulate, "SystemMonitor", FakeMonitor), \
+        with mock.patch.object(simulate, "live_monitor", FakeMonitor), \
                 mock.patch.object(simulate.time, "sleep"), \
                 mock.patch.object(simulate, "load_renderer", return_value=None), \
                 contextlib.redirect_stdout(output):
@@ -419,7 +444,7 @@ class SimulatorScenarioTest(unittest.TestCase):
             simulate.run(None, OledConfig())
         states = [line.split()[-1] for line in output.getvalue().splitlines()]
         self.assertEqual(states, [
-            "SLEEP", "CAROUSEL/NEXUS", "CAROUSEL/SYSTEM", "CAROUSEL/DISK", "CAROUSEL/SERVICES",
+            "SLEEP", "CAROUSEL/NEXUS", "CAROUSEL/SYSTEM", "CAROUSEL/DISK", "CAROUSEL/NETWORK", "CAROUSEL/SERVICES",
             "CAROUSEL/NEXUS",  # po SERVICES zpět na NEXUS
             "STATUS/1", "STATUS/2", "CAROUSEL/NEXUS", "STATUS/1",
             "CAROUSEL/NEXUS",  # 30 s bez stisku

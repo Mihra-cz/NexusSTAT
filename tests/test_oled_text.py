@@ -13,6 +13,17 @@ from unittest import mock
 from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmRule, AlarmsConfig, Config
 from nexusstat.core import CheckResult, Measurement, State, active_problems, effective
+from nexusstat.network_monitor import (
+    ADDRESS,
+    BYTES_PER_SECOND,
+    INTERFACE,
+    IPV4_ID,
+    LABELS as NETWORK_LABELS,
+    LINK,
+    LINK_ID,
+    RX_RATE_ID,
+    TX_RATE_ID,
+)
 from nexusstat.oled_text import (
     CHECK_NAMES,
     FAULT_TEXT,
@@ -22,14 +33,16 @@ from nexusstat.oled_text import (
     check_code,
     check_name,
     measurement_text,
+    network_rows,
     page_rows,
+    rate_text,
     service_rows,
     status_texts,
     value_text,
 )
 from nexusstat.preview import LIVE, SCENARIOS, PreviewSession, SessionClock
 from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, SERVICE_LABELS, complete_service_results
-from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
+from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS as SYSTEM_LABELS, MEMORY_ID
 
 try:
     from PIL import Image, ImageDraw
@@ -42,12 +55,24 @@ OBSERVED = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
 WALL = datetime(2026, 10, 19, 14, 5)
 
 # Znaky, které smí displej ukázat: ASCII bez malých písmen, ° a výpustka u zkrácení.
-ALLOWED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 %°/:.-?!…")
+ALLOWED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 %°/:._-?!…")
+# Jediná výslovná výjimka s malým písmenem: jednotky rychlosti na stránce NETWORK.
+RATE_UNITS = ("B/s", "KB/s", "MB/s")
 
 
-def result(check_id, state, value=None, unit="°C", expires=1000, summary="Český popis, který displej nečte"):
+def drawn_chars(text):
+    """Znaky textu displeje; malé "s" je povolené jen v jednotce rychlosti na konci."""
+    for unit in RATE_UNITS:
+        if text.endswith(" " + unit):
+            return set(text[:-len(unit)] + unit.upper())
+    return set(text)
+
+
+def result(check_id, state, value=None, unit="°C", expires=1000, summary="Český popis, který displej nečte",
+           details=None):
     measurement = Measurement(value, unit) if value is not None else None
-    return CheckResult(check_id, state, summary, OBSERVED, expires, simulated=False, measurement=measurement)
+    return CheckResult(check_id, state, summary, OBSERVED, expires, simulated=False, measurement=measurement,
+                       details=details or {})
 
 
 def status_line(problem, now):
@@ -222,6 +247,93 @@ class StatusTextTest(unittest.TestCase):
         self.assertIs(original.state, State.ERROR)
 
 
+class NetworkTextTest(unittest.TestCase):
+    """Texty stránky NETWORK: jen z id, stavu, measurement a details, nikdy ze summary."""
+
+    def network(self, link="UP", rx=1500.0, tx=0.0, address="192.0.2.10", interface="eth0", expires=1000):
+        on_interface = {INTERFACE: interface}
+        return [
+            result(LINK_ID, State.INFO, details={**on_interface, LINK: link}, expires=expires),
+            result(RX_RATE_ID, State.INFO, rx, BYTES_PER_SECOND, details=on_interface, expires=expires),
+            result(TX_RATE_ID, State.INFO, tx, BYTES_PER_SECOND, details=on_interface, expires=expires),
+            result(IPV4_ID, State.INFO, details={**on_interface, **({ADDRESS: address} if address else {})},
+                   expires=expires),
+        ]
+
+    def test_rate_units_and_boundaries(self):
+        cases = {
+            0: "0 B/s", 0.4: "0 B/s", 999.4: "999 B/s",
+            999.6: "1.0 KB/s",  # zaokrouhlení by dalo "1000 B/s": jednotka se volí až po něm
+            1000: "1.0 KB/s", 9_940: "9.9 KB/s", 9_960: "10 KB/s", 85_300: "85 KB/s", 999_400: "999 KB/s",
+            999_600: "1.0 MB/s", 1_234_000: "1.2 MB/s", 112_400_000: "112 MB/s", 999_400_000: "999 MB/s",
+            1_250_000_000: "1250 MB/s",  # 10 Gbit/s: nad MB/s už jednotka není
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(rate_text(value), expected)
+                self.assertEqual(measurement_text(Measurement(value, BYTES_PER_SECOND)), expected)
+
+    def test_decimal_units_not_binary(self):
+        # 1 KB/s = 1000 B/s (jako u síťových rychlostí), ne 1024.
+        self.assertEqual(rate_text(1024), "1.0 KB/s")
+        self.assertEqual(rate_text(2_000_000), "2.0 MB/s")
+
+    def test_rows_from_valid_results(self):
+        self.assertEqual(network_rows(self.network(), 0),
+                         [("ETH0", "UP"), ("RX", "1.5 KB/s"), ("TX", "0 B/s"), ("IPV4", "192.0.2.10")])
+        self.assertEqual(network_rows(self.network(link="DOWN", address=None, interface="enp0s31f6"), 0),
+                         [("ENP0S31F6", "DOWN"), ("RX", "1.5 KB/s"), ("TX", "0 B/s"), ("IPV4", "NONE")])
+
+    def test_rows_never_depend_on_summary(self):
+        rows = network_rows(self.network(), 0)
+        for item in self.network():
+            self.assertNotIn("Český", "".join(label + value for label, value in rows))
+            self.assertEqual(item.summary, "Český popis, který displej nečte")
+
+    def test_missing_results_are_unkn(self):
+        self.assertEqual(network_rows([], 0), [("LINK", "UNKN"), ("RX", "UNKN"), ("TX", "UNKN"), ("IPV4", "UNKN")])
+
+    def test_expired_results_are_unkn_without_old_interface_or_address(self):
+        rows = network_rows(self.network(expires=10), 10)
+        self.assertEqual(rows, [("LINK", "UNKN"), ("RX", "UNKN"), ("TX", "UNKN"), ("IPV4", "UNKN")])
+        self.assertEqual(effective(self.network(expires=10)[3], 10).details, {})
+
+    def test_unknown_with_known_interface(self):
+        # Nastavené rozhraní neexistuje: víme jeho název, stav ne.
+        eth1 = {INTERFACE: "eth1"}
+        unknown = [result(check_id, State.UNKNOWN, details=eth1) for check_id in NETWORK_LABELS]
+        self.assertEqual(network_rows(unknown, 0), [("ETH1", "UNKN"), ("RX", "UNKN"), ("TX", "UNKN"), ("IPV4", "UNKN")])
+
+    def test_unknown_ipv4_differs_from_no_ipv4(self):
+        no_address = self.network(address=None)
+        unknown = no_address[:3] + [result(IPV4_ID, State.UNKNOWN, details={INTERFACE: "eth0"})]
+        self.assertEqual(network_rows(no_address, 0)[3], ("IPV4", "NONE"))
+        self.assertEqual(network_rows(unknown, 0)[3], ("IPV4", "UNKN"))
+
+    def test_link_without_value_is_unkn_and_na_stays_na(self):
+        without_value = [result(LINK_ID, State.INFO, details={INTERFACE: "eth0"})]
+        self.assertEqual(network_rows(without_value, 0)[0], ("ETH0", "UNKN"))
+        disabled = [result(check_id, State.NA) for check_id in NETWORK_LABELS]
+        self.assertEqual(network_rows(disabled, 0), [("LINK", "N/A"), ("RX", "N/A"), ("TX", "N/A"), ("IPV4", "N/A")])
+
+    def test_no_web_address_is_shown(self):
+        # Dokud NexusSTAT nemá běžící web, je na stránce jen samotná IP, bez portu.
+        texts = "".join(label + value for label, value in network_rows(self.network(), 0))
+        self.assertNotIn("8765", texts)
+        self.assertNotIn("HTTP", texts)
+        self.assertEqual(network_rows(self.network(), 0)[3][1], "192.0.2.10")
+
+    def test_status_texts(self):
+        self.assertEqual([check_name(i) for i in NETWORK_LABELS], ["LINK", "NET RX", "NET TX", "IPV4"])
+        self.assertEqual(status_line(result(RX_RATE_ID, State.UNKNOWN), 0), ("UNKN", "NET RX NO DATA"))
+        self.assertEqual(status_line(self.network(expires=10)[0], 10), ("UNKN", "LINK STALE"))
+        # Potvrzený alarm (zatím žádné pravidlo neexistuje) by ukázal naměřenou rychlost.
+        self.assertEqual(status_line(result(TX_RATE_ID, State.WARNING, 112_400_000, BYTES_PER_SECOND), 0),
+                         ("WARN", "NET TX 112 MB/s"))
+        # Platná síťová měření nejsou problém, ani linka DOWN bez IPv4.
+        self.assertEqual(active_problems(self.network(link="DOWN", address=None), 0), [])
+
+
 class FakeRealClock:
     def __init__(self):
         self.now = 5000.0
@@ -231,23 +343,28 @@ class FakeRealClock:
 
 
 class FakeMonitor:
-    """Skutečná (ne simulovaná) data pro LIVE bez čtení /proc."""
+    """Skutečná (ne simulovaná) data pro LIVE bez čtení /proc a /sys/class/net."""
 
     simulated = False
+    labels = {**SYSTEM_LABELS, **NETWORK_LABELS}
 
-    def __init__(self, validity_seconds):
-        self.validity_seconds = validity_seconds
+    def __init__(self, config):
+        self.validity_seconds = config.collector.validity_seconds
 
     def collect(self, now, observed_utc):
+        def real(check_id, state, value=None, **details):
+            return CheckResult(check_id, state, "česky", observed_utc, now + self.validity_seconds, simulated=False,
+                               measurement=Measurement(*value) if value else None, details=details)
+
         values = {CPU_USAGE_ID: (7.4, "%"), CPU_TEMP_ID: (52.6, "°C"), MEMORY_ID: (31.0, "%")}
-        results = [
-            CheckResult(check_id, State.INFO, "česky", observed_utc, now + self.validity_seconds, simulated=False,
-                        measurement=Measurement(*value))
-            for check_id, value in values.items()
+        wifi = {INTERFACE: "wlp2s0"}
+        return [real(check_id, State.INFO, value) for check_id, value in values.items()] + [
+            real(DISK_ROOT_ID, State.UNKNOWN),  # Disk / se nepodařilo změřit.
+            real(LINK_ID, State.INFO, **wifi, **{LINK: "UP"}),
+            real(RX_RATE_ID, State.INFO, (12_345.6, BYTES_PER_SECOND), **wifi),
+            real(TX_RATE_ID, State.INFO, (2_100, BYTES_PER_SECOND), **wifi),
+            real(IPV4_ID, State.INFO, **wifi, **{ADDRESS: "192.0.2.77"}),  # dokumentační rozsah
         ]
-        # Disk / se nepodařilo změřit.
-        return results + [CheckResult(DISK_ROOT_ID, State.UNKNOWN, "Disk /: nedostupné", observed_utc,
-                                      now + self.validity_seconds, simulated=False)]
 
 
 def session(scenario):
@@ -284,6 +401,42 @@ class ScenarioTextTest(unittest.TestCase):
         self.assertEqual(self.lines(LIVE), [("UNKN", "ROOT NO DATA"), ("UNKN", "BACKUP NO DATA"),
                                             ("UNKN", "NAS NO DATA"), ("UNKN", "NEXUS NO DATA")])
 
+    def test_network_scenarios(self):
+        # Linka DOWN, chybějící IPv4 i nízký či vysoký provoz jsou platná měření (INFO),
+        # ne závady: STATUS je nehlásí. Neplatné RX je UNKNOWN.
+        for scenario in ("net_down", "net_no_ipv4", "net_low", "net_high"):
+            with self.subTest(scenario=scenario):
+                self.assertEqual(self.lines(scenario), [])
+        self.assertEqual(self.lines("net_invalid"), [("UNKN", "NET RX NO DATA")])
+
+    def test_network_page_in_scenarios(self):
+        def rows(scenario):
+            preview_session, _ = session(scenario)
+            return network_rows(preview_session.results, preview_session.clock.now())
+
+        self.assertEqual(rows("ok"), [("ETH0", "UP"), ("RX", "1.2 MB/s"), ("TX", "85 KB/s"), ("IPV4", "192.0.2.10")])
+        self.assertEqual(rows("net_down"), [("ETH0", "DOWN"), ("RX", "0 B/s"), ("TX", "0 B/s"), ("IPV4", "NONE")])
+        self.assertEqual(rows("net_no_ipv4"), [("ETH0", "UP"), ("RX", "412 B/s"), ("TX", "0 B/s"), ("IPV4", "NONE")])
+        self.assertEqual(rows("net_low"), [("ETH0", "UP"), ("RX", "312 B/s"), ("TX", "96 B/s"), ("IPV4", "192.0.2.10")])
+        self.assertEqual(rows("net_high"),
+                         [("ETH0", "UP"), ("RX", "112 MB/s"), ("TX", "49 MB/s"), ("IPV4", "192.0.2.10")])
+        self.assertEqual(rows("net_invalid"), [("ETH0", "UP"), ("RX", "UNKN"), ("TX", "85 KB/s"), ("IPV4", "192.0.2.10")])
+        # Ve scénáři bez síťových výsledků je všechno UNKN, nic se nedomýšlí.
+        self.assertEqual(rows("unknown"), [("LINK", "UNKN"), ("RX", "UNKN"), ("TX", "UNKN"), ("IPV4", "UNKN")])
+        self.assertEqual(rows(LIVE), [("WLP2S0", "UP"), ("RX", "12 KB/s"), ("TX", "2.1 KB/s"), ("IPV4", "192.0.2.77")])
+
+    def test_stale_network_data(self):
+        preview_session, real = session("net_invalid")
+        preview_session.set_speed(10)
+        for _ in range(25):
+            real.now += 0.1  # 25 s simulovaného času: TX a IPv4 změřené jen při startu prošly
+            preview_session._refresh_if_due(preview_session.clock.now())
+        now = preview_session.clock.now()
+        self.assertEqual([status_line(p, now) for p in active_problems(preview_session.results, now)],
+                         [("UNKN", "IPV4 STALE"), ("UNKN", "NET RX NO DATA"), ("UNKN", "NET TX STALE")])
+        self.assertEqual(network_rows(preview_session.results, now),
+                         [("ETH0", "UP"), ("RX", "UNKN"), ("TX", "UNKN"), ("IPV4", "UNKN")])
+
     def test_stale_data_in_unknown_scenario(self):
         preview_session, real = session("unknown")
         preview_session.set_speed(10)
@@ -317,12 +470,12 @@ class RenderedTextTest(unittest.TestCase):
         return texts
 
     def all_screens(self, scenario):
-        """Všechny obrazovky scénáře: NEXUS, SYSTEM, DISK, SERVICES a každá stránka STATUS."""
+        """Všechny obrazovky scénáře: NEXUS, SYSTEM, DISK, NETWORK, SERVICES a každá stránka STATUS."""
         preview_session, real = session(scenario)
         frames = {}
         preview_session.press()
         start = real.now
-        for offset, page in ((0, "NEXUS"), (10, "SYSTEM"), (20, "DISK"), (30, "SERVICES")):
+        for offset, page in ((0, "NEXUS"), (10, "SYSTEM"), (20, "DISK"), (30, "NETWORK"), (40, "SERVICES")):
             real.now = start + offset
             frames[page] = preview_session.tick()
         preview_session.press()
@@ -339,11 +492,16 @@ class RenderedTextTest(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 self.assertTrue(texts)
                 for text in texts:
-                    self.assertLessEqual(set(text), ALLOWED, text)
+                    self.assertLessEqual(drawn_chars(text), ALLOWED, text)
+
+    def test_lowercase_only_in_rate_units(self):
+        self.assertEqual(drawn_chars("112 MB/s"), set("112 MB/S"))
+        self.assertIn("s", drawn_chars("ETH0 s"))  # jinde malé písmeno neprojde
+        self.assertIn("s", drawn_chars("Ms/s B"))
 
     def test_page_titles_are_english(self):
         texts = set(self.recorded_texts(lambda: self.all_screens("many")))
-        self.assertLessEqual({"NEXUS", "SYSTEM", "DISK", "SERVICES", "STATUS"}, texts)
+        self.assertLessEqual({"NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES", "STATUS"}, texts)
         self.assertFalse({"SLUŽBY", "SLUZBY"} & texts)
 
     def test_screens_stay_one_bit_128x64(self):

@@ -172,6 +172,8 @@ class SystemMonitor:
     Pamatuje si jen předchozí vzorek CPU, protože vytížení vyžaduje dva vzorky.
     """
 
+    labels = LABELS  # id výsledků, které collect() vrací (pro run.failed_results)
+
     def __init__(self, validity_seconds, proc_dir=DEFAULT_PROC_DIR, thermal_dir=DEFAULT_THERMAL_DIR,
                  statvfs=os.statvfs):
         # Platnost výsledků dodává volající z konfigurace (CollectorConfig, trojnásobek

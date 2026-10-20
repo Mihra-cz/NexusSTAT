@@ -162,8 +162,8 @@ class ServicesRenderTest(RenderCase):
     def services(self, results):
         self.controller = OledController(OledConfig())
         self.controller.press(0, problem_count=0)
-        self.assertEqual(self.controller.current_page(30), "SERVICES")  # čtvrtá stránka po 30 s
-        return self.render(results, now=30)
+        self.assertEqual(self.controller.current_page(40), "SERVICES")  # pátá stránka po 40 s
+        return self.render(results, now=40)
 
     def test_layout_fits_128x64_for_every_label_and_state(self):
         def placed(xy, text, text_font):
@@ -225,7 +225,7 @@ class ServicesRenderTest(RenderCase):
         self.assertNotEqual(self.services(ok).tobytes(), self.services([]).tobytes())
         # Bez kolektorů nikde OK: UNKN a N/A se kreslí jinak.
         unmonitored = complete_service_results([], OBSERVED, 1000)
-        self.assertEqual(service_rows(unmonitored, 30)[0], ("NEXUS", "UNKN"))
+        self.assertEqual(service_rows(unmonitored, 40)[0], ("NEXUS", "UNKN"))
         self.assertNotEqual(self.services(unmonitored).tobytes(), self.services(ok).tobytes())
 
     def test_services_page_differs_from_value_pages(self):
@@ -235,6 +235,99 @@ class ServicesRenderTest(RenderCase):
         self.controller.press(0, problem_count=0)
         disk = self.render(results, now=20).tobytes()
         self.assertNotEqual(services, disk)
+
+
+@unittest.skipIf(render_screen is None, "Pillow není dostupné")
+class NetworkRenderTest(RenderCase):
+    """Stránka NETWORK: 4 řádky v 128 × 64, název vlevo, hodnota vpravo, nic se nepřekrývá."""
+
+    LINK_VALUES = ("UP", "DOWN", "UNKN", "N/A")
+    RATE_VALUES = ("0 B/s", "999 B/s", "9.9 KB/s", "999 KB/s", "1.2 MB/s", "999 MB/s", "1250 MB/s", "UNKN", "N/A")
+    # Nejdelší možný formát (15 znaků, broadcast, ne adresa stroje) a dokumentační adresy RFC 5737.
+    ADDRESS_VALUES = ("255.255.255.255", "198.51.100.255", "192.0.2.10", "192.0.2.1", "NONE", "UNKN", "N/A")
+    INTERFACES = ("LINK", "ETH0", "END0", "WLP2S0", "ENP0S31F6", "WLX00E04C68A1B2", "A" * 15, "W" * 15)
+
+    def network(self, results):
+        self.controller = OledController(OledConfig())
+        self.controller.press(0, problem_count=0)
+        self.assertEqual(self.controller.current_page(30), "NETWORK")  # čtvrtá stránka po 30 s
+        return self.render(results, now=30)
+
+    def rows_on_canvas(self, rows):
+        image = Image.new("1", (200, 100))  # větší plátno: přesah by byl vidět
+        render.draw_network_page(image, rows, True)
+        return image
+
+    def assert_layout(self, image):
+        self.assertIsNone(image.crop((128, 0, 200, 100)).getbbox())  # nic mimo 128 × 64
+        self.assertIsNone(image.crop((0, 64, 200, 100)).getbbox())
+        self.assertIsNone(image.crop((127, 14, 128, 64)).getbbox())  # sloupec 127 volný pod čarou
+        bands = []
+        for row in range(4):
+            top = render.SERVICES_ROW_TOP + row * render.SERVICES_ROW_STEP
+            groups = ink_groups(image, top, top + 13, merge_gap=render.LABEL_GAP - 1)
+            # Název a hodnota jsou dva oddělené bloky (mezi nimi aspoň LABEL_GAP sloupců).
+            self.assertGreaterEqual(len(groups), 2, (row, groups))
+            self.assertGreaterEqual(groups[-1][0] - groups[-2][1], render.LABEL_GAP, (row, groups))
+            box = image.crop((0, top, 128, top + 13)).getbbox()
+            bands.append((top + box[1], top + box[3]))
+        self.assertGreater(bands[0][0], HEADER_LINE_Y)
+        for upper, lower in zip(bands, bands[1:]):
+            self.assertLessEqual(upper[1], lower[0])  # řádky se nepřekrývají
+
+    def test_worst_case_texts_fit_without_ellipsis(self):
+        for interface, link in product(self.INTERFACES, self.LINK_VALUES):
+            rows = [(interface, link), ("RX", "1250 MB/s"), ("TX", "999 KB/s"), ("IPV4", "255.255.255.255")]
+            image = self.rows_on_canvas(rows)
+            with self.subTest(interface=interface, link=link):
+                self.assert_layout(image)
+                # Vejde se celé: 15znakový název rozhraní i nejdelší IPv4 bez výpustky.
+                self.assertEqual(render.fit_text(interface, font(TEXT_FONT), RIGHT_EDGE + 1 - 4
+                                                 - ink_width(link, font(TITLE_FONT))), interface)
+        for rate, address in product(self.RATE_VALUES, self.ADDRESS_VALUES):
+            with self.subTest(rate=rate, address=address):
+                self.assert_layout(self.rows_on_canvas([("ETH0", "UP"), ("RX", rate), ("TX", rate),
+                                                        ("IPV4", address)]))
+                self.assertEqual(render.fit_text(rate, font(TITLE_FONT), render.VALUE_MAX_WIDTH), rate)
+                self.assertEqual(render.fit_text(address, font(TEXT_FONT), render.ADDRESS_MAX_WIDTH), address)
+
+    def test_address_uses_regular_font_values_bold(self):
+        rows = [("ETH0", "UP"), ("RX", "1.2 MB/s"), ("TX", "85 KB/s"), ("IPV4", "192.0.2.10")]
+        image = Image.new("1", (128, 64))
+        render.draw_network_page(image, rows, False)
+        expected = Image.new("1", (128, 64))
+        draw = render.draw_header(expected, "NETWORK", False)
+        for index, (label, value) in enumerate(rows):
+            y = render.SERVICES_ROW_TOP + index * render.SERVICES_ROW_STEP
+            value_font = font(TEXT_FONT) if index == 3 else font(TITLE_FONT)
+            render.draw_right(draw, value, value_font, y)
+            draw.text((0, y), label, font=font(TEXT_FONT), fill=1)
+        self.assertEqual(image.tobytes(), expected.tobytes())
+
+    def test_page_from_results_and_states_differ(self):
+        def results(link, address):
+            details = {"interface": "eth0"}
+            return [
+                CheckResult("network.link", State.INFO, "x", OBSERVED, 1000, simulated=False,
+                            details={**details, "link": link}),
+                CheckResult("network.rx_rate", State.INFO, "x", OBSERVED, 1000, simulated=False,
+                            measurement=Measurement(1_234_000, "B/s"), details=details),
+                CheckResult("network.tx_rate", State.UNKNOWN, "x", OBSERVED, 1000, simulated=False, details=details),
+                CheckResult("network.ipv4", State.INFO, "x", OBSERVED, 1000, simulated=False,
+                            details={**details, **({"ipv4": address} if address else {})}),
+            ]
+
+        up = self.network(results("UP", "192.0.2.10"))
+        down = self.network(results("DOWN", None))
+        missing = self.network([])
+        self.assertEqual(len({up.tobytes(), down.tobytes(), missing.tobytes()}), 3)
+        self.assertIsNone(up.crop((100, 0, 128, 13)).getbbox())  # skutečná data: bez SIM
+        self.assertIsNotNone(self.network(sample_results(OBSERVED)).crop((100, 0, 128, 13)).getbbox())
+
+    def test_title_and_sim_mark_do_not_overlap(self):
+        title_right = ink_width("NETWORK", font(TITLE_FONT))
+        sim_left = RIGHT_EDGE + 1 - ink_width("SIM", font(TEXT_FONT))
+        self.assertLess(title_right + 4, sim_left)
 
 
 @unittest.skipIf(render_screen is None, "Pillow není dostupné")
@@ -374,7 +467,9 @@ class PageBoundsTest(unittest.TestCase):
         rows = [(label, "UNKN") for label in SERVICE_LABELS.values()]
         problems = [self.problem(state) for state in (State.CRITICAL, State.ERROR, State.WARNING, State.UNKNOWN)]
         long_rows = [(self.LONG, "1" * 30)] * 3  # nesmyslně dlouhý název i hodnota
+        long_network = [(self.LONG, "1" * 30)] * 4
         return {
+            "NETWORK": lambda image: render.draw_network_page(image, long_network, True),
             "NEXUS ! SIM": lambda image: render.draw_nexus_page(image, late, ALERT_SYMBOL, True),
             "NEXUS ? SIM": lambda image: render.draw_nexus_page(image, late, UNKNOWN_SYMBOL, True),
             "SYSTEM": lambda image: render.draw_value_page(image, "SYSTEM", long_rows, True),
@@ -417,7 +512,7 @@ class PageBoundsTest(unittest.TestCase):
             with self.subTest(counter=counter):
                 self.assertEqual(len(groups), 3, groups)  # STATUS, SIM, čítač
                 self.assertTrue(all(b[0] - a[1] > 6 for a, b in zip(groups, groups[1:])))  # aspoň 6 volných sloupců
-        for title in ("SYSTEM", "DISK", "SERVICES"):
+        for title in ("SYSTEM", "DISK", "NETWORK", "SERVICES"):
             image = Image.new("1", (128, 64))
             render.draw_header(image, title, True)
             with self.subTest(title=title):
@@ -432,8 +527,9 @@ class PageBoundsTest(unittest.TestCase):
                 self.assertLessEqual(len(image.getcolors()), 2)  # jen černá a bílá
 
 
-# Všechny znaky, které může displej ukázat (oled_text: ASCII velkými písmeny, °, …).
-OLED_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%°/:.-?!…"
+# Všechny znaky, které může displej ukázat (oled_text: ASCII velkými písmeny, °, …,
+# "_" z názvu rozhraní a malé "s" jen v jednotkách B/s, KB/s, MB/s).
+OLED_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%°/:._-?!…s"
 
 
 @unittest.skipIf(render_screen is None, "Pillow není dostupné")

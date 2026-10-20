@@ -5,12 +5,15 @@ Texty se skládají jen ze stabilního id kontroly, stavu a číselné hodnoty
 jazyk ani formát displej neovlivní. Funkce výsledky jen čtou: stavy, prahy,
 hodnoty ani id kontrol se tu nemění.
 
-Na displeji je jen ASCII velkými písmeny a symboly °C, %, / a „…“ u zkrácení.
+Na displeji je jen ASCII velkými písmeny a symboly °C, %, /, :, ., _, - a „…“
+u zkrácení. Jedinou výjimkou s malým písmenem jsou jednotky rychlosti B/s,
+KB/s a MB/s (výslovně zadané pro stránku NETWORK).
 """
 
 import hashlib
 
 from .core import ALERT_STATES, State, effective
+from .network_monitor import ADDRESS, BYTES_PER_SECOND, INTERFACE, IPV4_ID, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
 from .services import BACKUP_ID, NAS_ID, SERVICE_LABELS
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
 
@@ -33,6 +36,11 @@ CHECK_NAMES = {
     CPU_TEMP_ID: "CPU TEMP",
     MEMORY_ID: "RAM",
     DISK_ROOT_ID: "ROOT",
+    # Síť: nejvýš 6 znaků, aby se ve STATUS vešlo i "NET RX NO DATA" (15 znaků).
+    LINK_ID: "LINK",
+    RX_RATE_ID: "NET RX",
+    TX_RATE_ID: "NET TX",
+    IPV4_ID: "IPV4",
     **SERVICE_LABELS,
     # Plánované kontroly, zatím jen ve fiktivních datech simulátoru.
     "system.time_sync": "TIME SYNC",
@@ -66,6 +74,14 @@ PAGE_CHECKS = {
     "DISK": (DISK_ROOT_ID,),
 }
 
+# Stránka NETWORK. Řádek linky má místo názvu jméno rozhraní; když rozhraní
+# neznáme (žádné nenalezeno, data chybí nebo prošla), zůstane obecné LINK.
+LINK_LABEL = "LINK"
+NO_ADDRESS = "NONE"  # rozhraní platně nemá IPv4 (např. linka DOWN); jiné než neznámá adresa (UNKN)
+
+# Jednotky rychlosti přenosu od nejmenší, desítkově: 1 KB/s = 1000 B/s.
+RATE_UNITS = ("B/s", "KB/s", "MB/s")
+
 
 def check_code(check_id):
     """Dohledatelný kód kontroly: první 4 znaky SHA-256 jejího id velkými písmeny.
@@ -84,14 +100,34 @@ def check_name(check_id):
     return f"CHECK {check_code(check_id)}"
 
 
+def rate_text(bytes_per_second):
+    """Rychlost přenosu: nejvýš 3 platné číslice a jednotka B/s, KB/s nebo MB/s.
+
+    Desetinné místo jen pod 10 KB/s nebo MB/s (1.2 MB/s), jinak celé číslo
+    (85 KB/s), aby se řádek vešel. Jednotka se volí až po zaokrouhlení, takže
+    nevznikne "1000 B/s" ani "1000 KB/s". Nad 999 MB/s zůstává MB/s.
+    """
+    value = bytes_per_second
+    for unit in RATE_UNITS:
+        text = f"{value:.1f}" if unit != RATE_UNITS[0] and value < 9.95 else f"{value:.0f}"
+        if float(text) < 1000 or unit == RATE_UNITS[-1]:
+            return f"{text} {unit}"
+        value /= 1000
+
+
 def measurement_text(measurement):
-    """Hodnota na celé jednotky stejně jako v summary (48°C, 24%). Jen ASCII a °."""
+    """Hodnota na celé jednotky stejně jako v summary (48°C, 24%). Jen ASCII a °.
+
+    Rychlost přenosu (B/s) se převede na vhodnou jednotku (rate_text).
+    """
+    if measurement.unit == BYTES_PER_SECOND:
+        return rate_text(measurement.value)
     unit = "".join(char for char in measurement.unit if char == "°" or "!" <= char <= "~")
     return f"{measurement.value:.0f}{unit}"
 
 
 def value_text(result, now):
-    """Hodnota pro stránky SYSTEM a DISK: číslo s jednotkou, jinak text stavu.
+    """Hodnota pro stránky SYSTEM, DISK a RX/TX na NETWORK: číslo s jednotkou, jinak text stavu.
 
     Chybějící, prošlý nebo neměřitelný výsledek je UNKN, nikdy staré číslo.
     Ne N/A: to znamená záměrně vypnutou integraci, ne neznámou hodnotu.
@@ -108,6 +144,35 @@ def page_rows(page, results, now):
     """Řádky stránek SYSTEM a DISK: (název, hodnota) v pevném pořadí podle id."""
     by_id = {result.id: result for result in results}
     return [(check_name(check_id), value_text(by_id.get(check_id), now)) for check_id in PAGE_CHECKS.get(page, ())]
+
+
+def detail_text(result, key, missing):
+    """Textový údaj z details (UP, adresa): UNKN bez platného výsledku, N/A u vypnuté
+    integrace, `missing`, když platný výsledek údaj nemá."""
+    if result is None or result.state is State.UNKNOWN:
+        return STATE_TEXT[State.UNKNOWN]
+    if result.state is State.NA:
+        return STATE_TEXT[State.NA]
+    return result.details.get(key, missing)
+
+
+def network_rows(results, now):
+    """Řádky stránky NETWORK: rozhraní a linka, RX, TX, IPv4 jako (název, hodnota).
+
+    Chybějící, prošlý nebo neměřitelný údaj je UNKN, nikdy stará hodnota
+    (effective() u prošlého výsledku smaže i název rozhraní a adresu).
+    Ukazuje se jen samotná lokální IPv4: adresa webového rozhraní ne, dokud
+    NexusSTAT žádný běžící web nemá.
+    """
+    current = {result.id: effective(result, now) for result in results}
+    link = current.get(LINK_ID)
+    interface = link.details.get(INTERFACE) if link is not None else None
+    return [
+        (interface.upper() if interface else LINK_LABEL, detail_text(link, LINK, STATE_TEXT[State.UNKNOWN])),
+        ("RX", value_text(current.get(RX_RATE_ID), now)),
+        ("TX", value_text(current.get(TX_RATE_ID), now)),
+        ("IPV4", detail_text(current.get(IPV4_ID), ADDRESS, NO_ADDRESS)),
+    ]
 
 
 def service_rows(results, now):

@@ -1,5 +1,6 @@
-"""Načtení a validace konfiguračního TOML: sekce [oled], [collector] a [alarms]."""
+"""Načtení a validace konfiguračního TOML: sekce [oled], [collector], [network] a [alarms]."""
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 
@@ -28,7 +29,18 @@ KNOWN_OLED_KEYS = {
     "status_idle_seconds",
 }
 KNOWN_COLLECTOR_KEYS = {"interval_seconds"}
+KNOWN_NETWORK_KEYS = {"interface"}
 KNOWN_RULE_KEYS = {"enabled", "warning", "error", "hysteresis", "confirm_count", "clear_count"}
+
+# Názvy síťových rozhraní, se kterými NexusSTAT pracuje: nejvýš 15 znaků jako
+# v jádře (IFNAMSIZ − 1), jen písmena, číslice, "_", "." a "-". Jádro povoluje
+# víc znaků, ale takový název by nešel bezpečně ukázat na displeji ani poslat
+# do ioctl. Rozhraní s jiným názvem automatický výběr přeskočí.
+INTERFACE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
+
+
+def is_valid_interface_name(name):
+    return isinstance(name, str) and INTERFACE_NAME.fullmatch(name) is not None and name not in (".", "..")
 
 # Veličiny s alarmovým pravidlem a rozsah, ve kterém smějí ležet jejich prahy
 # (dolní mez vyloučená, horní včetně). Teplota odpovídá kontrole věrohodnosti
@@ -49,7 +61,7 @@ MAX_CONFIRM_COUNT = 60
 
 # Načítané sekce. Ostatní ([web], [storage], ...) jsou chyba,
 # dokud je kód skutečně nepoužívá, jinak by se tiše ignorovaly.
-KNOWN_SECTIONS = {"oled", "collector", "alarms"}
+KNOWN_SECTIONS = {"oled", "collector", "network", "alarms"}
 
 
 class ConfigError(ValueError):
@@ -113,6 +125,26 @@ class CollectorConfig:
         """Platnost výsledků. Nenastavuje se zvlášť, aby nemohla být kratší než
         interval a hodnoty mezi dvěma měřeními neblikaly na UNKNOWN."""
         return VALIDITY_INTERVALS * self.interval_seconds
+
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    """Sledované síťové rozhraní pro stránku NETWORK.
+
+    None (výchozí) = automatický výběr fyzického rozhraní podle výchozí trasy
+    (network_monitor.choose_interface). Zadaný název se použije přesně tak,
+    i kdyby šlo o virtuální rozhraní (např. most "br0"): je to výslovná volba.
+    Existence rozhraní se nekontroluje tady, ale při každém měření, protože
+    se může objevit nebo zmizet za běhu.
+    """
+
+    interface: str | None = None
+
+    def __post_init__(self):
+        if self.interface is not None and not is_valid_interface_name(self.interface):
+            raise ConfigError(
+                f"interface musí být název rozhraní (1–15 znaků A–Z, a–z, 0–9, _ . -), ne {self.interface!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -194,6 +226,7 @@ class Config:
     oled: OledConfig = field(default_factory=OledConfig)
     collector: CollectorConfig = field(default_factory=CollectorConfig)
     alarms: AlarmsConfig = field(default_factory=AlarmsConfig)
+    network: NetworkConfig = field(default_factory=NetworkConfig)
 
 
 def oled_config_from_dict(section):
@@ -213,6 +246,12 @@ def collector_config_from_dict(section):
     """Vytvoří CollectorConfig ze slovníku sekce [collector]. Chybějící klíče = výchozí."""
     _check_section("collector", section, KNOWN_COLLECTOR_KEYS)
     return CollectorConfig(**section)
+
+
+def network_config_from_dict(section):
+    """Vytvoří NetworkConfig ze slovníku sekce [network]. Bez klíče interface = automatický výběr."""
+    _check_section("network", section, KNOWN_NETWORK_KEYS)
+    return NetworkConfig(**section)
 
 
 def alarms_config_from_dict(section):
@@ -242,4 +281,5 @@ def load_config(path):
         oled=oled_config_from_dict(data.get("oled", {})),
         collector=collector_config_from_dict(data.get("collector", {})),
         alarms=alarms_config_from_dict(data.get("alarms", {})),
+        network=network_config_from_dict(data.get("network", {})),
     )

@@ -224,5 +224,47 @@ class CheckResultTest(unittest.TestCase):
         self.assertEqual(State.NA.value, "N/A")
 
 
+class DetailsTest(unittest.TestCase):
+    """Krátké textové údaje k výsledku (název rozhraní, IPv4) pro displej."""
+
+    def make(self, details, state=State.INFO, expires=10):
+        return CheckResult("network.ipv4", state, "popis", OBSERVED, expires, simulated=False, details=details)
+
+    def test_default_is_empty(self):
+        self.assertEqual(result("x", State.OK).details, {})
+
+    def test_details_are_kept_and_read_only(self):
+        given = {"interface": "eth0", "ipv4": "192.0.2.10"}
+        checked = self.make(given)
+        self.assertEqual(checked.details, given)
+        given["ipv4"] = "198.51.100.1"  # změna předaného slovníku výsledek nezmění
+        self.assertEqual(checked.details["ipv4"], "192.0.2.10")
+        with self.assertRaises(TypeError):
+            checked.details["ipv4"] = "198.51.100.1"
+
+    def test_unknown_may_name_what_is_measured(self):
+        self.assertEqual(self.make({"interface": "eth1"}, state=State.UNKNOWN).details, {"interface": "eth1"})
+
+    def test_invalid_details(self):
+        for details in ({"": "x"}, {"x": ""}, {"x": 5}, {5: "x"}, {"x": "eth\n0"}, {"x": "ethé"}, ["x"], "x"):
+            with self.subTest(details=details):
+                with self.assertRaises((TypeError, ValueError)):
+                    self.make(details)
+
+    def test_expiry_removes_details(self):
+        expired = effective(self.make({"interface": "eth0", "ipv4": "192.0.2.10"}), 10)
+        self.assertIs(expired.state, State.UNKNOWN)
+        self.assertEqual(expired.details, {})
+        self.assertEqual(effective(self.make({"interface": "eth0"}), 9.9).details, {"interface": "eth0"})
+
+    def test_na_keeps_details(self):
+        self.assertEqual(effective(self.make({"interface": "eth0"}, state=State.NA), 1000).details,
+                         {"interface": "eth0"})
+
+    def test_equality_includes_details(self):
+        self.assertEqual(self.make({"interface": "eth0"}), self.make({"interface": "eth0"}))
+        self.assertNotEqual(self.make({"interface": "eth0"}), self.make({"interface": "eth1"}))
+
+
 if __name__ == "__main__":
     unittest.main()

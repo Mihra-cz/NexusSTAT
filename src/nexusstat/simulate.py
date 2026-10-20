@@ -6,7 +6,8 @@ Použití:
 
 Bez --live: skriptovaný scénář stisků s fiktivními daty, simulovaný čas, nic se nečeká.
 S --live: jeden snímek každé obrazovky ze skutečného read-only měření tohoto
-počítače (system_monitor). Ani jeden režim nepřistupuje k hardwaru displeje.
+počítače (system_monitor a network_monitor). Ani jeden režim nepřistupuje
+k hardwaru displeje a nic neposílá do sítě.
 """
 
 import argparse
@@ -17,9 +18,21 @@ from pathlib import Path
 
 from .config import Config, load_config
 from .core import CheckResult, Measurement, State, active_problems
+from .network_monitor import (
+    ADDRESS,
+    BYTES_PER_SECOND,
+    INTERFACE,
+    IPV4_ID,
+    LINK,
+    LINK_ID,
+    LINK_UP,
+    RX_RATE_ID,
+    TX_RATE_ID,
+)
 from .oled import CAROUSEL_PAGES, Mode, OledController
+from .run import live_monitor
 from .services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
-from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT, SystemMonitor
+from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
 
 # Snímky se ukládají zvětšené, aby byly 128 × 64 pixely na monitoru čitelné.
 PNG_SCALE = 4
@@ -35,8 +48,12 @@ def sample_results(observed_utc):
     """
     valid = 10_000  # monotónní sekundy, dost dlouho na celý scénář
 
-    def sim(check_id, state, summary, expires=valid, value=None):
-        return CheckResult(check_id, state, summary, observed_utc, expires, simulated=True, measurement=value)
+    def sim(check_id, state, summary, expires=valid, value=None, details=None):
+        return CheckResult(check_id, state, summary, observed_utc, expires, simulated=True, measurement=value,
+                           details=details or {})
+
+    # Fiktivní síť: adresa z dokumentačního rozsahu 192.0.2.0/24 (RFC 5737).
+    eth0 = {INTERFACE: "eth0"}
 
     return [
         sim("system.load", State.OK, "Zátěž v normě"),
@@ -53,6 +70,11 @@ def sample_results(observed_utc):
         sim(CPU_TEMP_ID, State.INFO, "Teplota CPU 48 °C", value=Measurement(48, CELSIUS)),
         sim(MEMORY_ID, State.INFO, "RAM 24 % z 7,9 GiB", value=Measurement(24, PERCENT)),
         sim(DISK_ROOT_ID, State.INFO, "Disk / 31 % z 117 GiB", value=Measurement(31, PERCENT)),
+        # Fiktivní hodnoty pro stránku NETWORK (stejná id a details jako kolektor).
+        sim(LINK_ID, State.INFO, "Síť eth0 UP", details={**eth0, LINK: LINK_UP}),
+        sim(RX_RATE_ID, State.INFO, "Síť RX 1,2 MB/s", value=Measurement(1_234_000, BYTES_PER_SECOND), details=eth0),
+        sim(TX_RATE_ID, State.INFO, "Síť TX 85,3 kB/s", value=Measurement(85_300, BYTES_PER_SECOND), details=eth0),
+        sim(IPV4_ID, State.INFO, "IPv4 192.0.2.10", details={**eth0, ADDRESS: "192.0.2.10"}),
         # Fiktivní stavy služeb pro stránku SERVICES (skutečné kolektory zatím nejsou).
         sim(NEXUS_SERVICES_ID, State.OK, "Služby Nexusu běží"),
         sim(ANIMEDB_ID, State.OK, "AnimeDB odpovídá"),
@@ -67,14 +89,15 @@ SCENARIO = [
     (1, "press"),  # probuzení na NEXUS
     (11, "wait"),  # SYSTEM
     (21, "wait"),  # DISK
-    (31, "wait"),  # SERVICES
-    (41, "wait"),  # kolotoč dokola: znovu NEXUS
-    (45, "press"),  # STATUS 1/2
-    (50, "press"),  # STATUS 2/2
-    (55, "press"),  # z poslední stránky zpět na NEXUS, nové okno
-    (60, "press"),  # STATUS 1/2
-    (90, "wait"),  # 30 s bez stisku → zpět do kolotoče
-    (390, "wait"),  # 300 s od návratu → spánek
+    (31, "wait"),  # NETWORK
+    (41, "wait"),  # SERVICES
+    (51, "wait"),  # kolotoč dokola: znovu NEXUS
+    (55, "press"),  # STATUS 1/2
+    (60, "press"),  # STATUS 2/2
+    (65, "press"),  # z poslední stránky zpět na NEXUS, nové okno
+    (70, "press"),  # STATUS 1/2
+    (100, "wait"),  # 30 s bez stisku → zpět do kolotoče
+    (400, "wait"),  # 300 s od návratu → spánek
 ]
 
 
@@ -123,10 +146,11 @@ def run(output_dir, config):
 def run_live(output_dir, config):
     """Snímek každé obrazovky ze skutečného měření. Čas je skutečný monotónní.
 
-    `config` je celá konfigurace: [oled] pro automat, [collector] pro platnost výsledků.
+    `config` je celá konfigurace: [oled] pro automat, [collector] pro platnost
+    výsledků, [network] pro sledované rozhraní.
     """
-    monitor = SystemMonitor(validity_seconds=config.collector.validity_seconds)
-    monitor.collect(time.monotonic(), datetime.now(timezone.utc))  # první vzorek CPU
+    monitor = live_monitor(config)
+    monitor.collect(time.monotonic(), datetime.now(timezone.utc))  # první vzorek CPU a síťových čítačů
     time.sleep(1)
     now = time.monotonic()
     observed_utc = datetime.now(timezone.utc)
@@ -157,7 +181,7 @@ def run_live(output_dir, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Offline simulace OLED NexusSTAT")
     parser.add_argument("output_dir", type=Path, help="složka pro PNG snímky")
-    parser.add_argument("--config", type=Path, help="TOML se sekcemi [oled] a [collector]")
+    parser.add_argument("--config", type=Path, help="TOML se sekcemi [oled], [collector] a [network]")
     parser.add_argument("--live", action="store_true", help="skutečné read-only měření tohoto počítače")
     args = parser.parse_args(argv)
     config = load_config(args.config) if args.config else Config()

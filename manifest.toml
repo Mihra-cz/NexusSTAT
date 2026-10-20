@@ -6,7 +6,7 @@ id = "nexusstat"
 name = "NexusSTAT"
 description = "Lokální diagnostika Nexusu a plánovaná náhrada aplikačních funkcí Pironman 5"
 created = "2026-10-19"
-last_reviewed = "2026-10-19"
+last_reviewed = "2026-10-20"
 owner = "Mihra-cz" # veřejná identita (GitHub)
 license = "MIT" # viz LICENSE
 status = "development" # lokální vývoj na notebooku; nasazení viz platform.deployment
@@ -46,8 +46,9 @@ last_restore_test = "not-tested"
 
 [integrations]
 pironman5 = "replacement-planned; existing-service-must-remain-running"
-oled = "planned; offline-simulator-only (local tests, 4 carousel pages); hardware-not-integrated"
-oled_language = "english-ascii" # texty displeje z id, stavu a measurement (oled_text.py), ne ze summary; terminál a dokumentace česky
+oled = "planned; offline-simulator-only (local tests, 5 carousel pages incl. NETWORK); hardware-not-integrated"
+oled_language = "english-ascii" # texty displeje z id, stavu, measurement a details (oled_text.py), ne ze summary; výjimka jen jednotky B/s, KB/s, MB/s; terminál a dokumentace česky
+network = "implemented-locally (v0.6, notebook only); not-deployed" # read-only: /sys/class/net, /proc/net/route, ioctl SIOCGIFADDR bez odesílání
 oled_font = "bundled X11 misc-fixed 8x13B + 6x13 (public domain, src/nexusstat/fonts)"
 service_collectors = "not-implemented" # stránka SERVICES jen zobrazuje; Docker, NAS, Restic, AnimeDB se nečtou
 rgb = "planned; not-integrated"
@@ -64,13 +65,15 @@ dependencies_optional = ["Pillow", "tkinter"] # Pillow: obraz OLED (ověřeno 10
 [development]
 # Lokální vývoj na notebooku. Nic z toho neběží na Nexusu (viz platform.deployment).
 location = "developer-notebook-only"
-last_verified = "2026-10-19"
-implemented_locally = ["core-state-model", "oled-state-machine", "oled-image-simulator", "system-collector-readonly", "periodic-collection-loop-terminal", "numeric-measurements", "threshold-evaluator", "oled-services-page-display-only", "oled-live-preview-tkinter", "oled-english-text-layer"]
+last_verified = "2026-10-20"
+implemented_locally = ["core-state-model", "oled-state-machine", "oled-image-simulator", "system-collector-readonly", "periodic-collection-loop-terminal", "numeric-measurements", "threshold-evaluator", "oled-services-page-display-only", "oled-live-preview-tkinter", "oled-english-text-layer", "network-collector-readonly", "oled-network-page"]
 preview_window_tested = true # skutečné okno na notebooku (X11, Tk 8.6.14); jen vývojový nástroj, ne hardware displeje
 system_collector_sources = ["/proc/stat", "/proc/meminfo", "/sys/class/thermal", "statvfs(/)"]
+network_collector_sources = ["/sys/class/net", "/proc/net/route", "ioctl SIOCGIFADDR (unconnected socket, no traffic)"]
+network_interface_selection = "[network] interface, else physical with default IPv4 route (lowest metric) > physical link up > any physical; ties by name; virtual never auto-selected"
 collector_interval_default_seconds = 10 # [collector] interval_seconds; platnost výsledků = 3 × interval
 periodic_loop = "foreground-terminal-only; not-a-service"
-verified_on = "x86_64 Linux Mint (unit tests + read-only run + periodic loop in terminal, incl. illustrative test thresholds)"
+verified_on = "x86_64 Linux Mint (unit tests + read-only run + periodic loop in terminal incl. network, illustrative test thresholds)"
 raspberry_pi_tested = false
 hardware_display_tested = false
 alarm_thresholds = "configurable (cpu_temp, disk_root); disabled-by-default; no-approved-values"
@@ -88,8 +91,8 @@ pironman_replacement = "target: replace Pironman 5 application software function
 history_database = "sqlite on local SSD under paths.appdata (file name TBD); WAL considered; Backup API copy for existing Restic; not-implemented"
 history_retention = "proposal: raw 10 s 30 days, 1 min aggregates 1 year, hourly/daily long-term; alarms and events separate"
 influxdb = "not-required by nexusstat; shutdown only after verifying no other users and approval"
-oled_carousel = ["NEXUS", "SYSTEM", "STORAGE", "NETWORK", "SERVICES"] # plán; implementováno NEXUS, SYSTEM, DISK, SERVICES (v0.5)
-milestones = "proposal M1-M7, see docs/ARCHITECTURE.md; none started beyond v0.5"
+oled_carousel = ["NEXUS", "SYSTEM", "STORAGE", "NETWORK", "SERVICES"] # plán; implementováno lokálně NEXUS, SYSTEM, DISK, NETWORK, SERVICES (v0.6); STORAGE a CPU FAN další fáze
+milestones = "proposal M1-M7, see docs/ARCHITECTURE.md; v0.6 = NETWORK part of M4/M5 locally; SQLite (M2-M3), STORAGE and CPU FAN still planned"
 
 [documentation]
 readme = "README.md"

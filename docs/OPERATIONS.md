@@ -4,22 +4,26 @@
 
 Na Nexusu zatím neběží žádný kód, service ani port. Není co instalovat, spouštět či zastavovat. Příkazy v sekcích o Nexusu níže nejsou příkazem k nasazení.
 
-## Lokální vývoj (simulace, read-only kolektor a pravidelné měření)
+## Lokální vývoj (simulace, read-only kolektory a pravidelné měření)
 
-Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku, síti ani NAS. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`; nic nezapisuje a nespouští žádné příkazy.
+Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku ani NAS a nic neposílá do sítě. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`. Síťový kolektor (v0.6) jen čte `/sys/class/net` a `/proc/net/route` a lokální IPv4 zjistí dotazem na jádro (`ioctl SIOCGIFADDR` na nepřipojeném socketu: žádný paket, žádný port, žádné připojení). Nic nezapisují a nespouštějí žádné příkazy.
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 PYTHONPATH=src python3 -m nexusstat.simulate /tmp/nexusstat-sim
 PYTHONPATH=src python3 -m nexusstat.simulate /tmp/nexusstat-live --live
 PYTHONPATH=src python3 -m nexusstat.system_monitor
+PYTHONPATH=src python3 -m nexusstat.network_monitor
+PYTHONPATH=src python3 -m nexusstat.network_monitor eth0
 PYTHONPATH=src python3 -m nexusstat.run
 PYTHONPATH=src python3 -m nexusstat.run --config config/config.example.toml
 ```
 
-`nexusstat.run` měří v popředí terminálu každých `[collector] interval_seconds` (výchozí 10 s) a vypisuje jeden řádek na měření. Ukončení Ctrl+C (kód 0); neplatná nebo chybějící konfigurace skončí kódem 2 bez měření. Neběží jako služba, nezapisuje soubory, neotevírá port a SIGTERM zvlášť neobsluhuje (proces skončí výchozím způsobem, nic se neukládá). Interval i prahy jde ověřit vlastní kopií konfigurace mimo Git, např. `config/config.toml` (ignorováno v `.gitignore`).
+`nexusstat.run` měří systém a síť v popředí terminálu každých `[collector] interval_seconds` (výchozí 10 s) a vypisuje jeden řádek na měření. Ukončení Ctrl+C (kód 0); neplatná nebo chybějící konfigurace skončí kódem 2 bez měření. Neběží jako služba, nezapisuje soubory, neotevírá port a SIGTERM zvlášť neobsluhuje (proces skončí výchozím způsobem, nic se neukládá). Interval i prahy jde ověřit vlastní kopií konfigurace mimo Git, např. `config/config.toml` (ignorováno v `.gitignore`).
 
 Alarmové prahy (`[alarms.cpu_temp]`, `[alarms.disk_root]`) jsou ve výchozím stavu vypnuté a nemají výchozí hodnoty. Zapnutí vyžaduje `enabled = true` a všechny tři hodnoty `warning`, `error`, `hysteresis`; neplatná kombinace ukončí program kódem 2. Konkrétní hodnoty pro Nexus zatím nejsou schválené, pro lokální zkoušku používej jen zjevně ilustrační prahy. Alarm pouze změní stav a ve výpisu označí hodnotu (`[WARNING]`, `[ERROR]`); nic nevypíná, neřídí ventilátory ani neposílá zprávy. Změna prahů se projeví až po novém spuštění (stav potvrzení začne znovu).
+
+Síťové rozhraní (v0.6): bez `[network] interface` se vybírá automaticky (fyzické s výchozí trasou IPv4 a nejnižší metrikou → fyzické s linkou UP → jakékoli fyzické, při shodě abecedně; Docker, VPN, loopback ani jiná virtuální rozhraní ne). Pro lokální zkoušku jiného rozhraní stačí `python3 -m nexusstat.network_monitor <rozhraní>` nebo vlastní `config/config.toml` mimo Git. Neexistující rozhraní je `UNKNOWN` („rozhraní nenalezeno“), neplatný název ukončí program kódem 2. První měření rychlosti RX/TX je vždy `UNKNOWN`. Výpis obsahuje lokální IPv4 notebooku: do dokumentace, issue ani veřejného repozitáře ji nekopíruj (příklady používají dokumentační rozsah 192.0.2.0/24).
 
 Simulátor kreslí i stránku SERVICES: ve scénáři s fiktivními stavy a značkou `SIM`, v režimu `--live` bez kolektorů služeb: NEXUS, NAS a BACKUP jsou `UNKNOWN` na SERVICES (`UNKN`) i ve STATUS (`NAS NO DATA`) a stránka NEXUS ukazuje `?`; AnimeDB je `N/A`. Snímky ukládej mimo repozitář (např. do `/tmp`).
 
@@ -38,11 +42,11 @@ PYTHONPATH=src python3 -m nexusstat.preview --scenario many --scale 6 --config c
 - Ovládání: „Stisk“, mezerník nebo Enter = krátký stisk fyzického tlačítka (skutečná logika `OledController`); nabídka scénářů; rychlost 1×/5×/10× (jen simulace); Esc, křížek nebo Ctrl+C v terminálu okno čistě zavřou (žádná vlákna ani procesy na pozadí).
 - Displej je anglicky (texty z `oled_text.py`), ovládání okna česky.
 - Pod displejem je režim (SLEEP / CAROUSEL – stránka / STATUS – stránka x/y) a zdroj dat: „SIMULACE: fiktivní data“ nebo „LIVE: měření tohoto NOTEBOOKU, ne Nexusu“.
-- Scénáře: 1 Vše v pořádku, 2 WARNING (teplota), 3 ERROR a CRITICAL, 4 UNKNOWN (neplatná, chybějící a po 20/40 s zastaralá data), 5 Více problémů (2 stránky STATUS), 6 Nenapojené služby (NEXUS, NAS, BACKUP `UNKNOWN`, AnimeDB `N/A`). Změna scénáře začne data, paměť alarmů i okno kolotoče znovu; rozsvícený displej zůstane rozsvícený od stránky NEXUS.
-- LIVE: `SystemMonitor` a `AlarmEvaluator` (prahy z `--config`) v intervalu `[collector]`, vždy 1×, bez značky `SIM`. Měření běží v okně (typicky jednotky ms); zaseknuté čtení `/` by okno zablokovalo stejně jako `nexusstat.run`. První vzorek CPU je `UNKNOWN`.
+- Scénáře: 1 Vše v pořádku, 2 WARNING (teplota), 3 ERROR a CRITICAL, 4 UNKNOWN (neplatná, chybějící a po 20/40 s zastaralá data), 5 Více problémů (2 stránky STATUS), 6 Nenapojené služby (NEXUS, NAS, BACKUP `UNKNOWN`, AnimeDB `N/A`), 7–11 NETWORK (v0.6): linka DOWN, bez IPv4, nízký provoz, vysoký provoz, neplatná a po 20 s zastaralá data. Změna scénáře začne data, paměť alarmů i okno kolotoče znovu; rozsvícený displej zůstane rozsvícený od stránky NEXUS.
+- LIVE: `SystemMonitor`, `NetworkMonitor` (rozhraní z `[network]`) a `AlarmEvaluator` (prahy z `--config`) v intervalu `[collector]`, vždy 1×, bez značky `SIM`. Měření běží v okně (typicky jednotky ms); zaseknuté čtení `/` by okno zablokovalo stejně jako `nexusstat.run`. První vzorek CPU je `UNKNOWN`.
 - Bez tkinter skončí příkaz kódem 2 se zprávou, bez grafického displeje kódem 1.
 
-Úspěšné testy dokládají logiku automatu, validaci, výpočty kolektoru nad vzorovými vstupy, plánování smyčky a vyhodnocení prahů se simulovaným časem a hodnotami a vykreslení do obrázku. Nedokládají vhodnost konkrétních prahů pro Nexus. Nedokládají funkci displeje, tlačítka ani správnou volbu teplotního senzoru na Raspberry Pi 5; to vyžaduje samostatné schválené read-only ověření na cílovém stroji. Ruční běh `nexusstat.run` dokládá jen funkci na notebooku.
+Úspěšné testy dokládají logiku automatu, validaci, výpočty kolektorů nad vzorovými vstupy (síťové stavy výhradně ve fixturách, nezávisle na síti počítače), plánování smyčky a vyhodnocení prahů se simulovaným časem a hodnotami a vykreslení do obrázku. Nedokládají vhodnost konkrétních prahů pro Nexus. Nedokládají funkci displeje, tlačítka ani správnou volbu teplotního senzoru na Raspberry Pi 5; to vyžaduje samostatné schválené read-only ověření na cílovém stroji. Ruční běh `nexusstat.run` dokládá jen funkci na notebooku.
 
 ### Návratový postup lokálního vývoje
 
@@ -60,7 +64,7 @@ Skutečné názvy jednotek a cesty mountů jsou v soukromé dokumentaci Nexusu, 
 
 Kontrola mountu nikdy není náhradou za ověřený read-only test dostupnosti NAS s timeoutem. Nespouštěj restic backup, retention ani test zápisu bez schválení.
 
-Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje dat na RPi 5, např. typy a stav `/sys/class/thermal/cooling_device*` (`type`, `cur_state`, `max_state`), dostupnost otáček v `/sys/class/hwmon/hwmon*/` (`name`, `fan*_input`) a rozhraní v `/sys/class/net/*/operstate`. Nic se nezapisuje; GPIO se ani nečte bez samostatného schválení.
+Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje dat na RPi 5, např. typy a stav `/sys/class/thermal/cooling_device*` (`type`, `cur_state`, `max_state`), dostupnost otáček v `/sys/class/hwmon/hwmon*/` (`name`, `fan*_input`) a rozhraní v `/sys/class/net/*/operstate` (název ethernetu na RPi 5 s Debianem 13, např. `eth0` nebo `end0`, a zda automatický výběr zvolí správné rozhraní). Nic se nezapisuje; GPIO se ani nečte bez samostatného schválení.
 
 ## Před přechodem na hardware
 

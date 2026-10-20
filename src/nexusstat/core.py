@@ -1,9 +1,11 @@
 """Stavový model diagnostických výsledků a výběr aktivních problémů."""
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
+from types import MappingProxyType
 
 
 class State(Enum):
@@ -77,6 +79,9 @@ class CheckResult:
     `simulated` odlišuje vymyšlená data simulace od skutečného měření.
     `measurement` je číselná hodnota pro vyhodnocení prahů; None = hodnota
     nedostupná. UNKNOWN a N/A ji mít nesmějí.
+    `details` jsou krátké strojové údaje jako text ASCII (např. název síťového
+    rozhraní nebo IPv4 adresa), které se do čísla převést nedají. Displej je
+    čte místo `summary`; prahy je nečtou. Po vytvoření je nejde změnit.
     """
 
     id: str
@@ -86,6 +91,7 @@ class CheckResult:
     expires_monotonic: float
     simulated: bool = field(kw_only=True)
     measurement: Measurement | None = field(default=None, kw_only=True)
+    details: Mapping[str, str] = field(default_factory=dict, kw_only=True)
 
     def __post_init__(self):
         # Řetězec "OK" místo State.OK by tiše obešel řazení i vypršení.
@@ -109,6 +115,16 @@ class CheckResult:
         # Neznámý stav s číslem by mohl dál vypadat jako platně naměřená hodnota.
         if self.measurement is not None and self.state in STATES_WITHOUT_VALUE:
             raise ValueError(f"stav {self.state.value} nesmí mít naměřenou hodnotu")
+        if not isinstance(self.details, Mapping):
+            raise TypeError("details musí být slovník textů")
+        for key, value in self.details.items():
+            # Jen tisknutelné ASCII: údaj jde beze změny na displej i do výpisu
+            # a řídicí znaky nebo diakritika by tam nadělaly nepořádek.
+            if not (isinstance(key, str) and key and isinstance(value, str) and value
+                    and value.isascii() and value.isprintable()):
+                raise ValueError(f"neplatný údaj details: {key!r}={value!r}")
+        # Kopie jen pro čtení: výsledek je neměnný i pro toho, kdo slovník předal.
+        object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
 
 
 def effective(result, now):
@@ -118,7 +134,7 @@ def effective(result, now):
     nesmí vypadat jako aktuální OK a staré ERROR nesmí vypadat jako potvrzená
     trvající závada. Mění se i popis, protože původní text (např. "SMART bez
     chyb") by vedle UNKNOWN dál tvrdil něco, co už neplatí. Ze stejného důvodu
-    zmizí i číselná hodnota.
+    zmizí i číselná hodnota a údaje `details` (např. staré rozhraní a IP adresa).
 
     N/A nevyprší: je to rozhodnutí v konfiguraci, ne měření. Přechod z N/A na
     aktivní sledování musí přijít jako nový výsledek, ne jako timeout.
@@ -126,7 +142,8 @@ def effective(result, now):
     if result.state is State.NA:
         return result
     if now >= result.expires_monotonic:
-        return replace(result, state=State.UNKNOWN, summary=f"{result.id}: zastaralá data", measurement=None)
+        return replace(result, state=State.UNKNOWN, summary=f"{result.id}: zastaralá data", measurement=None,
+                       details={})
     return result
 
 
