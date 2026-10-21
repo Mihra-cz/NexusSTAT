@@ -1,4 +1,4 @@
-"""Testy SQLite historie: vytvoření, otevření, ověření a zámek (M3.1a) a zápis (M3.1b).
+"""Testy SQLite historie: vytvoření, otevření, ověření a zámek (M3.1a), zápis (M3.1b) a agregace (M3.2a).
 
 Vše jen v tempfile.TemporaryDirectory. Simulace chyb upravují výhradně kopie
 databáze vytvořené testem; žádná produkční cesta, žádné skutečné čekání ani
@@ -20,13 +20,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 from nexusstat import history
 from nexusstat.core import CheckResult, Measurement, State
-from nexusstat.history import Event, HistoryError, HistoryRecorder, PendingSample
+from nexusstat.history import Event, HistoryError, HistoryRecorder, PendingSample, QueueState
 from nexusstat.network_monitor import BYTES_PER_SECOND, INTERFACE, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
 from nexusstat.system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
 
@@ -471,6 +472,23 @@ elif point == "writer":
     database.connection.execute(
         "INSERT INTO run (id, started_utc, app_version, interval_s) VALUES (1, 1800001234, 'x', 10)")
     os._exit(72)  # nečisté ukončení: data jen ve -wal
+elif point == "aggregate":
+    from datetime import datetime, timezone
+    class Crashing(sqlite3.Connection):
+        armed = False
+        def execute(self, sql, *args):
+            if sql == history.AGGREGATE_5M_SQL:
+                Crashing.armed = True
+            elif sql == "COMMIT" and Crashing.armed:
+                os._exit(74)  # pád po vložení 5min oken, před COMMIT
+            return super().execute(sql, *args)
+    real_connect = sqlite3.connect
+    sqlite3.connect = lambda *a, **k: real_connect(*a, factory=Crashing, **k)
+    now = datetime.fromtimestamp(int(sys.argv[4]), timezone.utc)
+    recorder = history.HistoryRecorder(history.open_writer(db, "test", host))
+    recorder.start_run("test", 10, now)
+    recorder.aggregate(now, "synced", history.QueueState.empty())
+    os._exit(75)  # sem se nesmí dostat
 """
 
 
@@ -666,6 +684,19 @@ class FlakyCommit:
         return getattr(self._connection, name)
 
 
+class Passthrough:
+    """Obal spojení pro simulace chyb v testech; sám nic nemění, podtřídy přepíší execute()."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, sql, *args):
+        return self._connection.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 class RecorderTest(TempDirTest):
     def setUp(self):
         super().setUp()
@@ -709,7 +740,9 @@ class WriterContractTest(RecorderTest):
         for name, value in (("insert-sample", history.INSERT_SAMPLE_SQL), ("sample-conflict", history.SAMPLE_CONFLICT_SQL),
                             ("batch-guard", history.BATCH_GUARD_SQL), ("run-last-write", history.RUN_LAST_WRITE_SQL),
                             ("close-unclean-runs", history.CLOSE_UNCLEAN_RUNS_SQL),
-                            ("high-water", history.HIGH_WATER_SQL), ("insert-change", history.INSERT_CHANGE_SQL)):
+                            ("high-water", history.HIGH_WATER_SQL), ("insert-change", history.INSERT_CHANGE_SQL),
+                            ("progress-5m", history.PROGRESS_5M_SQL), ("aggregate-5m", history.AGGREGATE_5M_SQL),
+                            ("progress-1h", history.PROGRESS_1H_SQL), ("rollup-1h", history.ROLLUP_1H_SQL)):
             with self.subTest(block=name):
                 self.assertEqual(value, doc_block(name))
 
@@ -1346,6 +1379,595 @@ class HighWaterTest(TempDirTest):
                     recorder.add_results(batch, [result(MEMORY_ID, State.INFO, 21.0, PERCENT, ts=probe + 1, cycle=11.0)])
                     self.assertEqual(recorder.write(batch).samples, 1 if expected is not None else 2)
                     self.assertEqual(recorder.rejected["before_high_water"], 0 if expected is None else 1)
+
+
+# --- M3.2a: agregace ----------------------------------------------------------------
+
+AGG_ROWS = ("SELECT m.check_id, m.subject, a.bucket, a.n_samples, a.n_valid, a.min_value, a.max_value, a.sum_value "
+            "FROM {table} a JOIN metric m ON m.id = a.metric_id ORDER BY m.check_id, m.subject, a.bucket")
+
+
+def direct_rows(written, size, start, end):
+    """Přímý výpočet agregací ze zapsaných hodnot v Pythonu, nezávisle na SQL."""
+    rows = []
+    for (check_id, subject), points in sorted(written.items()):
+        windows = {}
+        for ts, value in points:
+            if start <= ts < end:
+                windows.setdefault(ts - ts % size, []).append(value)
+        for bucket, values in sorted(windows.items()):
+            valid = [value for value in values if value is not None]
+            rows.append((check_id, subject, bucket, len(values), len(valid), min(valid) if valid else None,
+                         max(valid) if valid else None, sum(valid) if valid else None))
+    return rows
+
+
+class AggregationTest(RecorderTest):
+    """Agregace uzavřených oken (HISTORY.md 6) nad dočasnou databází a se simulovaným časem.
+
+    Databáze z RecorderTest má done_until obou úrovní BASE − 3600 (hodina vytvoření).
+    Hodnoty jsou násobky 0,25, takže součty jsou v binární aritmetice přesné.
+    """
+
+    TEMP = (CPU_TEMP_ID, None, lambda k: 40.0 + (k * 7) % 13 * 0.25)
+    USAGE = (CPU_USAGE_ID, None, lambda k: None if k % 11 == 3 else float(k % 5))  # nuly i UNKNOWN
+
+    def fill(self, start, end, step=10, series=(TEMP, USAGE), per_batch=30):
+        """Měření každých `step` s v [start, end); vrací {(check_id, subject): [(ts, hodnota)]}."""
+        written, cycles = {}, []
+        for k, ts in enumerate(range(start, end, step)):
+            cycle = []
+            for check_id, details, value_of in series:
+                value = value_of(k)
+                unit = history.SERIES[check_id].unit
+                cycle.append(result(check_id, State.UNKNOWN if value is None else State.INFO, value,
+                                    None if value is None else unit, ts=ts, details=details))
+                written.setdefault((check_id, (details or {}).get(INTERFACE, "")), []).append((ts, value))
+            cycles.append(cycle)
+        for first in range(0, len(cycles), per_batch):
+            self.write(*cycles[first:first + per_batch])
+        return written
+
+    def aggregate(self, now, quality="synced", queue=None):
+        return self.recorder.aggregate(at(now), quality, QueueState.empty() if queue is None else queue)
+
+    def catch_up(self, now, queue=None):
+        """Volá agregaci, dokud zbývají uzavřená okna (jedno volání zpracuje nejvýš hodinu)."""
+        for _ in range(200):
+            outcome = self.aggregate(now, queue=queue)
+            if not outcome.more:
+                return outcome
+        self.fail("agregace nedohnala ani po 200 voláních")
+
+    def stored(self, table="agg_5m"):
+        return self.query(AGG_ROWS.format(table=table))
+
+    def done(self):
+        return dict(self.query("SELECT level, done_until FROM aggregation_state"))
+
+    def reopen(self, now):
+        self.database.close()  # bez finish_run: jako pád procesu
+        self.database = history.open_writer(self.db, "test", HOST)
+        self.recorder = HistoryRecorder(self.database)
+        self.recorder.start_run("test", 10, at(now))
+
+
+class AggregationValueTest(AggregationTest):
+    def test_one_full_window_matches_direct_computation(self):
+        written = self.fill(BASE, BASE + 310)  # 30 měření v okně + jedno v dalším
+        outcome = self.catch_up(BASE + 300 + 120)
+        self.assertEqual((outcome.done_5m, outcome.done_1h), (BASE + 300, BASE))
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, BASE + 300))
+        self.assertEqual([row[3:5] for row in self.stored()], [(30, 30), (30, 27)])  # 3 × UNKNOWN
+        average = self.query(doc_block("read-agg"), {"metric_id": 1, "start": BASE, "end": BASE + 3600})
+        expected = direct_rows(written, 300, BASE, BASE + 300)[0]
+        self.assertEqual([row[5] for row in average], [expected[7] / expected[4]])  # průměr = součet / platné
+
+    def test_zero_unknown_gap_and_partial_windows(self):
+        points = [(BASE + 10 * k, None if k % 3 == 0 else 0.0) for k in range(30)]  # skutečné nuly a UNKNOWN
+        points += [(BASE + 300 + 30 * k, None) for k in range(10)]  # okno jen s UNKNOWN; okno BASE + 600 prázdné
+        points += list(zip(range(BASE + 900, BASE + 1200, 60), (2.5, 7.5, 0.0, 5.0, None)))  # neúplné okno
+        points += [(BASE + 1200, 1.0)]
+        cycles = [[result(CPU_USAGE_ID, State.UNKNOWN if value is None else State.INFO, value,
+                          None if value is None else PERCENT, ts=ts)] for ts, value in points]
+        self.write(*cycles)
+        self.catch_up(BASE + 1200 + 120)
+        self.assertEqual(self.stored(), [(CPU_USAGE_ID, "", BASE, 30, 20, 0.0, 0.0, 0.0),
+                                         (CPU_USAGE_ID, "", BASE + 300, 10, 0, None, None, None),
+                                         (CPU_USAGE_ID, "", BASE + 900, 5, 4, 0.0, 7.5, 15.0)])
+        self.assertEqual(self.stored(), direct_rows({(CPU_USAGE_ID, ""): points}, 300, BASE, BASE + 1200))
+        average = self.query(doc_block("read-agg"), {"metric_id": 1, "start": BASE, "end": BASE + 3600})
+        self.assertEqual([(row[0], row[5]) for row in average], [(BASE, 0.0), (BASE + 300, None), (BASE + 900, 3.75)])
+
+    def test_hour_is_exact_rollup_of_twelve_windows(self):
+        # Okno j má j hodnot UNKNOWN: různý počet platných vzorků, průměr průměrů by byl špatně.
+        temp = (CPU_TEMP_ID, None, lambda k: None if k % 30 < k // 30 else 20.0 + (k % 7) * 0.25)
+        written = self.fill(BASE, BASE + 3610, series=(temp,), per_batch=60)
+        outcome = self.catch_up(BASE + 3600 + 120)
+        self.assertEqual((outcome.done_5m, outcome.done_1h), (BASE + 3600, BASE + 3600))
+        windows = self.stored()
+        self.assertEqual(len(windows), 12)
+        self.assertEqual(windows, direct_rows(written, 300, BASE, BASE + 3600))
+        hourly = self.stored("agg_1h")
+        self.assertEqual(hourly, direct_rows(written, 3600, BASE, BASE + 3600))
+        self.assertEqual(hourly[0][3:5], (360, 360 - sum(range(12))))
+        exact = hourly[0][7] / hourly[0][4]
+        mean_of_means = sum(row[7] / row[4] for row in windows) / len(windows)
+        self.assertGreater(abs(exact - mean_of_means), 1e-6)  # test by chybu průměrování opravdu poznal
+
+    def test_several_series_and_interfaces_match_m2_benchmark(self):
+        series = (self.TEMP, self.USAGE,
+                  (RX_RATE_ID, {INTERFACE: "eth0"}, lambda k: float(k % 4) * 256.0),
+                  (RX_RATE_ID, {INTERFACE: "wlan0"}, lambda k: None if k % 9 == 0 else 1024.0 + k % 3))
+        written = self.fill(BASE, BASE + 7210, step=20, series=series, per_batch=90)
+        now = BASE + 7200 + 120
+        self.database.close()
+        reference = self.copy("m2.sqlite3")  # stejná surová data pro smyčku zapisovače z benchmarku M2
+        self.database = history.open_writer(self.db, "test", HOST)
+        self.recorder = HistoryRecorder(self.database)
+        self.recorder.start_run("test", 10, at(now))
+        self.catch_up(now)
+        module = benchmark()
+        conn = sqlite3.connect(reference, isolation_level=None)
+        try:
+            writer = object.__new__(module.SteadyWriter)
+            writer.conn, writer.transactions = conn, Counter()
+            writer.sql = {name: module.doc_sql(name) for name in module.STEADY_SQL}
+            writer.aggregate(now)  # M2: hodina 5min oken na transakci, rezerva GRACE
+            m2 = {table: conn.execute(AGG_ROWS.format(table=table)).fetchall() for table in ("agg_5m", "agg_1h")}
+        finally:
+            conn.close()
+        self.assertEqual(module.GRACE, history.AGGREGATION_GRACE_SECONDS)
+        self.assertEqual(self.stored(), m2["agg_5m"])
+        self.assertEqual(self.stored("agg_1h"), m2["agg_1h"])
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, BASE + 7200))
+        self.assertEqual(self.stored("agg_1h"), direct_rows(written, 3600, BASE, BASE + 7200))
+        counted = self.query("SELECT sum(n_samples) FROM agg_5m")[0][0]
+        self.assertEqual(counted, self.query("SELECT count(*) FROM sample WHERE ts < ?", (BASE + 7200,))[0][0])
+
+
+class AggregationClosingTest(AggregationTest):
+    def test_window_closes_exactly_after_grace(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 299)])
+        self.write([result(CPU_TEMP_ID, State.INFO, 60.0, CELSIUS, ts=BASE + 300)])
+        self.assertEqual(self.catch_up(BASE + 300 + 119).done_5m, BASE)  # rezerva 119 s nestačí
+        self.assertEqual(self.stored(), [])
+        self.assertEqual(self.catch_up(BASE + 300 + 120).done_5m, BASE + 300)  # přesně 120 s
+        self.assertEqual(self.stored(), [(CPU_TEMP_ID, "", BASE, 1, 1, 50.0, 50.0, 50.0)])  # BASE + 300 je další okno
+
+    def test_queue_state_is_explicit_contract(self):
+        self.fill(BASE, BASE + 610)
+        with self.assertRaises(TypeError):
+            self.recorder.aggregate(at(BASE + 720), "synced", None)  # chybějící fronta není prázdná fronta
+        with self.assertRaises(TypeError):
+            QueueState("ano")
+        for build in (lambda: QueueState.waiting_since(None), lambda: QueueState.waiting_since(1_700_000_000),
+                      lambda: QueueState.waiting_since(True), lambda: QueueState(False, BASE)):
+            with self.subTest(build=build), self.assertRaises(ValueError):
+                build()
+        unknown = self.aggregate(BASE + 720, queue=QueueState.unknown())
+        self.assertEqual((unknown.blocked, unknown.done_5m, unknown.windows_5m, unknown.more),
+                         ("queue_unknown", BASE - 3600, 0, False))
+        self.assertEqual(self.catch_up(BASE + 720, queue=QueueState.waiting_since(BASE + 299)).done_5m, BASE)
+        self.assertEqual(self.catch_up(BASE + 720, queue=QueueState.waiting_since(BASE + 300)).done_5m, BASE + 300)
+        self.assertEqual(self.catch_up(BASE + 720).done_5m, BASE + 600)
+
+    def test_open_batch_keeps_its_window_open(self):
+        self.fill(BASE, BASE + 610)
+        batch = self.recorder.begin_batch()  # přijatý, ale ještě nezapsaný vzorek nové řady
+        self.recorder.add_results(batch, [result(MEMORY_ID, State.INFO, 30.0, PERCENT, ts=BASE + 450)])
+        self.assertEqual(self.catch_up(BASE + 720).done_5m, BASE + 300)
+        self.recorder.write(batch)
+        self.assertEqual(self.catch_up(BASE + 720).done_5m, BASE + 600)
+        self.assertIn((MEMORY_ID, "", BASE + 300, 1, 1, 30.0, 30.0, 30.0), self.stored())
+        self.assertEqual(self.recorder.rejected["late"], 0)
+
+    def test_untrusted_time_closes_nothing(self):
+        self.fill(BASE, BASE + 610)
+        for now, quality in ((BASE + 720, "unsynced"), (BASE + 720, "derived"), (1_700_000_000, "synced")):
+            with self.subTest(now=now, quality=quality):
+                outcome = self.aggregate(now, quality)
+                self.assertEqual((outcome.blocked, outcome.done_5m, outcome.done_1h), ("time_unsynced", BASE - 3600, BASE - 3600))
+        self.assertEqual((self.stored(), self.stored("agg_1h")), ([], []))
+        with self.assertRaises(ValueError):
+            self.aggregate(BASE + 720, "guess")
+
+    def test_clock_step_back_never_moves_boundary_back(self):
+        self.fill(BASE, BASE + 610)
+        self.catch_up(BASE + 720)
+        rows = self.stored()
+        outcome = self.aggregate(BASE - 7200)  # hodiny o 2 h zpět, pořád po 2026-01-01
+        self.assertEqual((outcome.done_5m, outcome.windows_5m, outcome.blocked), (BASE + 600, 0, None))
+        self.assertEqual(self.stored(), rows)
+
+    def test_forward_clock_jump_without_new_samples_closes_no_future_window(self):
+        written = self.fill(BASE, BASE + 310)
+        for _ in range(5):  # hodiny o den dopředu (synced), kolektor zatím bez nového vzorku
+            outcome = self.aggregate(BASE + 86_400)
+        self.assertEqual((outcome.done_5m, outcome.more), (BASE + 300, False))
+        for key, points in self.fill(BASE + 320, BASE + 610).items():  # po návratu hodin měření pokračuje
+            written[key] += points
+        self.assertEqual(self.recorder.rejected["late"], 0)
+        self.catch_up(BASE + 720)
+        self.assertEqual(self.stored()[-1][2:5], (BASE + 300, 29, 26))
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, BASE + 600))
+
+    def test_catch_up_is_bounded_per_call(self):
+        self.fill(BASE, BASE + 5 * 3600 + 60, step=60, per_batch=120)
+        steps = []
+        while True:
+            before = self.done()["5m"]
+            outcome = self.aggregate(BASE + 5 * 3600 + 120)
+            steps.append(outcome.done_5m - before)
+            if not outcome.more:
+                break
+        self.assertEqual(steps, [3600] * 6)  # jedno volání = nejvýš hodina 5min oken, zarovnaná na hodinu
+        self.assertEqual(self.done(), {"5m": BASE + 5 * 3600, "1h": BASE + 5 * 3600})
+        self.assertEqual(len(self.stored("agg_1h")), 2 * 5)
+
+    def test_aggregation_needs_running_recorder(self):
+        fresh = HistoryRecorder(self.database)
+        self.assertRefused("run", fresh.aggregate, at(BASE), "synced", QueueState.empty())
+        self.recorder.finish_run(at(BASE))
+        self.assertRefused("run", self.aggregate, BASE + 720)
+
+
+class AggregationSafetyTest(AggregationTest):
+    def test_repeated_aggregation_changes_nothing(self):
+        self.fill(BASE, BASE + 610)
+        first = self.catch_up(BASE + 720)
+        rows, hourly = self.stored(), self.stored("agg_1h")
+        again = self.aggregate(BASE + 720)
+        self.assertEqual((again.windows_5m, again.windows_1h, again.done_5m, again.done_1h),
+                         (0, 0, first.done_5m, first.done_1h))
+        # Krok nad hotovým intervalem odmítne progress-5m: nic se nezapíše ani nezdvojí.
+        self.assertEqual(self.recorder._aggregation_step("5m", lambda conn: (BASE, BASE + 300), BASE + 720), (None, 0))
+        self.assertEqual((self.stored(), self.stored("agg_1h")), (rows, hourly))
+
+    def test_hour_waits_for_all_its_windows(self):
+        self.fill(BASE, BASE + 1810, step=30)
+        self.assertEqual(self.catch_up(BASE + 1800 + 120).done_5m, BASE + 1800)  # půl hodiny oken
+        self.assertEqual((self.done()["1h"], self.stored("agg_1h")), (BASE, []))
+        # I bez kontroly v kódu odmítne neúplnou hodinu samo SQL progress-1h (druhá vrstva).
+        step = self.recorder._aggregation_step("1h", lambda conn: (BASE, BASE + 3600), BASE + 1920)
+        self.assertEqual((step, self.done()["1h"], self.stored("agg_1h")), ((None, 0), BASE, []))
+
+    def test_existing_window_is_conflict_and_never_overwritten(self):
+        self.fill(BASE, BASE + 610)
+        self.aggregate(BASE + 200)  # jen prázdná hodina před BASE
+        conn = self.database.connection
+        metric = conn.execute("SELECT id FROM metric WHERE check_id = ?", (CPU_TEMP_ID,)).fetchone()[0]
+        conn.execute("INSERT INTO agg_5m VALUES (?, ?, 1, 1, 99.0, 99.0, 99.0)", (metric, BASE + 300))  # cizí zásah
+        self.assertRefused("conflict", self.aggregate, BASE + 720)
+        self.assertEqual(self.stored(), [(CPU_TEMP_ID, "", BASE + 300, 1, 1, 99.0, 99.0, 99.0)])  # nic přepsáno ani přidáno
+        self.assertEqual(self.done()["5m"], BASE)
+        self.assertFalse(conn.in_transaction)
+        conflicts = self.events("history.aggregation_conflict")
+        self.assertEqual([(row[1], json.loads(row[3])) for row in conflicts],
+                         [("ERROR", {"level": "5m", "start": BASE, "end": BASE + 600, "existing": 1,
+                                     "first": BASE + 300, "last": BASE + 300})])
+        self.assertRefused("conflict", self.aggregate, BASE + 720)  # agregace stojí, doklad se neopakuje
+        self.assertEqual(len(self.events("history.aggregation_conflict")), 1)
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 700)])  # měření se zapisují dál
+        self.reopen(BASE + 800)
+        self.assertRefused("conflict", self.aggregate, BASE + 920)  # nový běh konflikt doloží znovu
+        self.assertEqual(len(self.events("history.aggregation_conflict")), 2)
+
+    def test_existing_hour_is_conflict_after_finished_windows(self):
+        self.fill(BASE, BASE + 3660, step=60, per_batch=61)
+        conn = self.database.connection
+        metric = conn.execute("SELECT id FROM metric WHERE check_id = ?", (CPU_TEMP_ID,)).fetchone()[0]
+        conn.execute("INSERT INTO agg_1h VALUES (?, ?, 1, 1, 99.0, 99.0, 99.0)", (metric, BASE))
+        self.assertRefused("conflict", self.catch_up, BASE + 3600 + 120)
+        self.assertEqual(self.done(), {"5m": BASE + 3600, "1h": BASE})  # 5min okna hotová, hodina ne
+        self.assertEqual(self.stored("agg_1h"), [(CPU_TEMP_ID, "", BASE, 1, 1, 99.0, 99.0, 99.0)])
+        self.assertEqual(json.loads(self.events("history.aggregation_conflict")[0][3])["level"], "1h")
+
+    def test_crash_before_commit_in_child_process_leaves_nothing(self):
+        written = self.fill(BASE, BASE + 310)
+        self.aggregate(BASE + 200)  # prázdná hodina před BASE je hotová
+        self.database.close()
+        env = dict(os.environ, PYTHONPATH=str(REPO / "src"))
+        code = subprocess.run([sys.executable, "-c", CHILD, "aggregate", str(self.db), HOST, str(BASE + 420)],
+                              env=env, capture_output=True, text=True, timeout=60).returncode
+        self.assertEqual(code, 74)
+        self.database = history.open_writer(self.db, "test", HOST)
+        self.recorder = HistoryRecorder(self.database)
+        self.recorder.start_run("test", 10, at(BASE + 430))
+        self.assertEqual((self.done()["5m"], self.stored()), (BASE, []))  # vložená okna zmizela s transakcí
+        self.assertEqual(self.recorder._gate.done_until, BASE)
+        self.assertEqual(self.catch_up(BASE + 430).done_5m, BASE + 300)
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, BASE + 300))
+
+    def test_failure_mid_insert_rolls_back_everything(self):
+        written = self.fill(BASE, BASE + 610)
+        self.aggregate(BASE + 200)
+        conn = self.database.connection
+        calls = []
+
+        def fail_second():
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("simulované selhání uprostřed vkládání")
+            return 0
+
+        conn.create_function("fail_second", 0, fail_second)
+        conn.execute("CREATE TEMP TRIGGER fail_mid BEFORE INSERT ON main.agg_5m BEGIN SELECT fail_second(); END")
+        try:
+            self.assertRefused("write", self.aggregate, BASE + 720)
+        finally:
+            conn.execute("DROP TRIGGER temp.fail_mid")
+        self.assertEqual(len(calls), 2)  # první okno už bylo vložené, druhé selhalo
+        self.assertEqual((self.stored(), self.done()["5m"], self.recorder._gate.done_until), ([], BASE, BASE))
+        self.assertFalse(conn.in_transaction)
+        self.assertEqual(self.catch_up(BASE + 720).done_5m, BASE + 600)
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, BASE + 600))
+
+    def test_interrupt_mid_aggregation_rolls_back(self):
+        self.fill(BASE, BASE + 610)
+        self.aggregate(BASE + 200)
+        real = self.database.connection
+
+        class Interrupting(Passthrough):
+            def execute(self, sql, *args):
+                if sql == history.AGGREGATE_5M_SQL:
+                    raise KeyboardInterrupt  # např. Ctrl+C po posunu done_until, před vložením oken
+                return super().execute(sql, *args)
+
+        self.database.connection = Interrupting(real)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.aggregate(BASE + 720)
+        finally:
+            self.database.connection = real
+        self.assertFalse(real.in_transaction)  # zámek zápisu uvolněn, posun done_until vrácen
+        self.assertEqual((self.done()["5m"], self.recorder._gate.done_until, self.stored()), (BASE, BASE, []))
+        self.assertEqual(self.catch_up(BASE + 720).done_5m, BASE + 600)
+
+    def test_restart_continues_without_gaps_or_double_counting(self):
+        written = self.fill(BASE, BASE + 7210, step=30, per_batch=60)
+        self.assertEqual(self.catch_up(BASE + 4200 + 120).done_5m, BASE + 4200)
+        self.reopen(BASE + 7300)
+        self.assertEqual(self.recorder._gate.done_until, BASE + 4200)  # hranice z databáze, ne z paměti
+        final = self.catch_up(BASE + 7200 + 120)
+        self.assertEqual((final.done_5m, final.done_1h), (BASE + 7200, BASE + 7200))
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, BASE + 7200))
+        self.assertEqual(self.stored("agg_1h"), direct_rows(written, 3600, BASE, BASE + 7200))
+        counted = self.query("SELECT sum(n_samples) FROM agg_5m")[0][0]
+        self.assertEqual(counted, self.query("SELECT count(*) FROM sample WHERE ts < ?", (BASE + 7200,))[0][0])
+
+
+class AggregationDataBoundTest(AggregationTest):
+    """Podmínka 4 (HISTORY.md 6.1): uzavření nepředběhne nejnovější zapsaný vzorek."""
+
+    def drive(self, now, limit=500):
+        """Volá agregaci se stejným časem, dokud hlásí `more`; ověří, že každé `more` znamená postup."""
+        calls = []
+        for _ in range(limit):
+            before = self.done()
+            outcome = self.aggregate(now)
+            after = (outcome.done_5m, outcome.done_1h)
+            self.assertGreaterEqual(after, (before["5m"], before["1h"]))  # hranice nikdy neklesne
+            self.assertLessEqual(outcome.done_5m - before["5m"], 3600)  # nejvýš hodina oken za volání
+            calls.append((outcome.more, after != (before["5m"], before["1h"])))
+            if not outcome.more:
+                break
+        else:
+            self.fail(f"agregace hlásí more i po {limit} voláních")
+        self.assertTrue(all(progressed for more, progressed in calls[:-1]))  # more vždy s postupem
+        return outcome, len(calls)
+
+    def merged(self, *parts):
+        written = {}
+        for part in parts:
+            for key, points in part.items():
+                written.setdefault(key, []).extend(points)
+        return written
+
+    def test_last_sample_inside_window_keeps_that_window_open(self):
+        written = self.fill(BASE, BASE + 160)  # poslední vzorek BASE + 150, uprostřed okna
+        for now in (BASE + 420, BASE + 3600, BASE + 86_400):
+            outcome, _ = self.drive(now)
+            self.assertEqual((outcome.done_5m, outcome.more, self.stored()), (BASE, False, []))
+        written = self.merged(written, self.fill(BASE + 300, BASE + 310))  # další vzorek okno uzavře
+        self.assertEqual(self.drive(BASE + 86_400)[0].done_5m, BASE + 300)
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, BASE + 300))
+
+    def test_last_sample_on_window_boundary_closes_previous_window(self):
+        written = self.fill(BASE, BASE + 310)  # poslední vzorek přesně BASE + 300
+        outcome, _ = self.drive(BASE + 86_400)
+        self.assertEqual((outcome.done_5m, outcome.more), (BASE + 300, False))
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, BASE + 300))  # okno BASE + 300 zůstává otevřené
+
+    def test_stopped_measurement_never_loops_and_keeps_last_window_open(self):
+        self.fill(BASE, BASE + 610)
+        reports = []
+        for step in range(200):  # dva dny bez měření, volání každých 15 min
+            outcome = self.aggregate(BASE + 720 + 900 * step)
+            reports.append(outcome.more)
+            self.assertLessEqual(outcome.done_5m, BASE + 600)
+        self.assertEqual(self.done(), {"5m": BASE + 600, "1h": BASE})
+        self.assertEqual(reports[2:], [False] * 198)  # po dohnání už nic nehlásí
+
+    def test_measurement_resuming_after_an_hour_closes_the_gap(self):
+        first = self.fill(BASE, BASE + 610)
+        self.drive(BASE + 3000)
+        second = self.fill(BASE + 4210, BASE + 4510)  # po více než hodinové mezeře
+        outcome, _ = self.drive(BASE + 4500 + 120)
+        written = self.merged(first, second)
+        self.assertEqual((outcome.done_5m, outcome.done_1h), (BASE + 4500, BASE + 3600))
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, BASE + 4500))  # mezera bez řádků
+        self.assertEqual(self.stored("agg_1h"), direct_rows(written, 3600, BASE, BASE + 3600))
+
+    def test_measurement_resuming_after_days_is_caught_up_gradually(self):
+        first = self.fill(BASE, BASE + 610)
+        self.drive(BASE + 720)
+        resume = BASE + 3 * 86_400
+        second = self.fill(resume, resume + 310)
+        outcome, calls = self.drive(resume + 300 + 120)
+        written = self.merged(first, second)
+        self.assertEqual((outcome.done_5m, outcome.done_1h), (resume + 300, resume))
+        self.assertEqual(calls, 73)  # zbytek první hodiny + 71 celých hodin + poslední okno, po hodině na volání
+        self.assertEqual(self.stored(), direct_rows(written, 300, BASE, resume + 300))
+        self.assertEqual(self.stored("agg_1h"), direct_rows(written, 3600, BASE, resume))
+
+    def test_restart_during_outage_keeps_bound_of_previous_run(self):
+        first = self.fill(BASE, BASE + 610)
+        self.reopen(BASE + 7200)  # pád a restart během výpadku měření
+        outcome, _ = self.drive(BASE + 7200)
+        self.assertEqual((outcome.done_5m, outcome.more), (BASE + 600, False))  # mez z last_write předchozího běhu
+        second = self.fill(BASE + 7210, BASE + 7510)
+        outcome, _ = self.drive(BASE + 7500 + 120)
+        self.assertEqual(outcome.done_5m, BASE + 7500)
+        self.assertEqual(self.stored(), direct_rows(self.merged(first, second), 300, BASE, BASE + 7500))
+
+    def test_forward_jump_with_samples_then_clock_returns(self):
+        first = self.fill(BASE, BASE + 310)
+        future = BASE + 86_400
+        jumped = self.fill(future, future + 610)  # hodiny o den dopředu, měření pokračuje (synced)
+        self.drive(future + 720)
+        self.assertEqual(self.done()["5m"], future + 600)
+        rows = self.stored()
+        self.fill(BASE + 320, BASE + 610)  # hodiny zpět na správný čas
+        self.write([result(MEMORY_ID, State.INFO, 30.0, PERCENT, ts=BASE + 330)])  # nová řada
+        self.assertEqual(self.recorder.rejected["clock_backward"], 2 * 29)
+        self.assertEqual(self.recorder.rejected["late"], 1)  # do hotového okna se nic nevloží
+        self.assertEqual(self.drive(BASE + 720)[0].done_5m, future + 600)  # hranice neklesla
+        self.assertEqual(self.stored(), rows)
+        self.assertEqual(rows, direct_rows(self.merged(first, jumped), 300, BASE, future + 600))
+
+    def test_queue_and_data_bound_together(self):
+        self.fill(BASE, BASE + 1210)
+        self.assertEqual(self.drive_queue(QueueState.waiting_since(BASE + 450)), BASE + 300)  # starší čekající vzorek
+        self.assertEqual(self.drive_queue(QueueState.waiting_since(BASE + 600)), BASE + 600)  # přesně na hranici
+        unknown = self.aggregate(BASE + 86_400, queue=QueueState.unknown())
+        self.assertEqual((unknown.blocked, unknown.done_5m, unknown.more), ("queue_unknown", BASE + 600, False))
+        self.assertEqual(self.drive_queue(QueueState.empty()), BASE + 1200)  # prázdná fronta: mez dají data
+
+    def drive_queue(self, queue):
+        for _ in range(50):
+            outcome = self.aggregate(BASE + 86_400, queue=queue)
+            if not outcome.more:
+                return outcome.done_5m
+        self.fail("agregace s frontou nedoběhla")
+
+    def test_no_new_data_still_finishes_older_hour(self):
+        written = self.fill(BASE, BASE + 3610, step=60, per_batch=61)
+        real = self.database.connection
+
+        class StopRollup(Passthrough):
+            def execute(self, sql, *args):
+                if sql == history.ROLLUP_1H_SQL and args[0]["start"] == BASE:
+                    raise KeyboardInterrupt  # přerušení hodinového kroku po potvrzených 5min oknech
+                return super().execute(sql, *args)
+
+        self.database.connection = StopRollup(real)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.drive(BASE + 3720)
+        finally:
+            self.database.connection = real
+        self.assertEqual(self.done(), {"5m": BASE + 3600, "1h": BASE})
+        outcome = self.aggregate(BASE + 3720)  # žádná nová data, hotová 5min okna se dosčítají
+        self.assertEqual((outcome.done_1h, outcome.windows_1h, outcome.more), (BASE + 3600, 2, False))
+        self.assertEqual(self.stored("agg_1h"), direct_rows(written, 3600, BASE, BASE + 3600))
+
+
+class AggregationConflictTest(AggregationTest):
+    def conflict_row(self, table, bucket):
+        conn = self.database.connection
+        metric = conn.execute("SELECT id FROM metric WHERE check_id = ?", (CPU_TEMP_ID,)).fetchone()[0]
+        conn.execute(f"INSERT INTO {table} VALUES (?, ?, 1, 1, 99.0, 99.0, 99.0)", (metric, bucket))
+
+    def test_failed_conflict_record_is_not_claimed(self):
+        self.fill(BASE, BASE + 610)
+        self.aggregate(BASE + 200)
+        self.conflict_row("agg_5m", BASE + 300)
+        with mock.patch.object(history, "INSERT_EVENT_SQL", "INSERT INTO neexistuje VALUES (1)"):
+            error = self.assertRefused("conflict", self.aggregate, BASE + 720)
+        self.assertIn("nepodařilo potvrdit", str(error))  # žádné tvrzení, že doklad existuje
+        self.assertEqual(self.events("history.aggregation_conflict"), [])
+        self.assertFalse(self.database.connection.in_transaction)
+        self.assertEqual((self.done()["5m"], self.recorder._gate.done_until), (BASE, BASE))
+        self.assertEqual(self.stored(), [(CPU_TEMP_ID, "", BASE + 300, 1, 1, 99.0, 99.0, 99.0)])
+        later = self.assertRefused("conflict", self.aggregate, BASE + 720)  # zastaveno i bez dokladu
+        self.assertIn("nepodařilo potvrdit", str(later))
+        self.assertEqual(self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 700)]).samples, 1)
+
+    def test_recorded_conflict_keeps_gate_and_writing(self):
+        self.fill(BASE, BASE + 610)
+        self.aggregate(BASE + 200)
+        self.conflict_row("agg_5m", BASE + 300)
+        error = self.assertRefused("conflict", self.aggregate, BASE + 720)
+        self.assertIn("doklad history.aggregation_conflict zapsán", str(error))
+        self.assertEqual(self.recorder._gate.done_until, BASE)  # rollback: brána beze změny
+        self.assertEqual(self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 700)]).samples, 1)
+        self.reopen(BASE + 800)
+        self.assertEqual(self.recorder._gate.done_until, BASE)  # po restartu skutečná potvrzená hranice
+
+    def test_conflict_check_failure_is_write_error_not_conflict(self):
+        self.fill(BASE, BASE + 610)
+        self.aggregate(BASE + 200)
+        self.conflict_row("agg_5m", BASE + 300)
+        real = self.database.connection
+
+        class BrokenLookup(Passthrough):
+            def execute(self, sql, *args):
+                if sql.startswith("SELECT count(*), min(bucket)"):
+                    raise sqlite3.OperationalError("disk I/O error (simulace)")
+                return super().execute(sql, *args)
+
+        self.database.connection = BrokenLookup(real)
+        try:
+            self.assertRefused("write", self.aggregate, BASE + 720)  # konflikt nedoložen: nezastavuje se
+        finally:
+            self.database.connection = real
+        self.assertEqual(self.events("history.aggregation_conflict"), [])
+        error = self.assertRefused("conflict", self.aggregate, BASE + 720)  # další volání konflikt ověří a doloží
+        self.assertIn("doklad history.aggregation_conflict zapsán", str(error))
+        self.assertEqual(len(self.events("history.aggregation_conflict")), 1)
+
+
+class AggregationGateTest(AggregationTest):
+    def test_gate_follows_confirmed_boundary_in_same_run(self):
+        self.fill(BASE, BASE + 610)
+        self.assertEqual(self.recorder._gate.done_until, BASE - 3600)
+        self.catch_up(BASE + 720)
+        self.assertEqual(self.recorder._gate.done_until, BASE + 600)
+        rows = self.stored()
+        # Opožděné měření (nová řada) s časem v hotovém okně: late, agregace ani surová data beze změny.
+        self.write([result(MEMORY_ID, State.INFO, 30.0, PERCENT, ts=BASE + 550, cycle=BASE + 700.5)])
+        self.assertEqual((self.recorder.rejected["late"], self.samples(MEMORY_ID)), (1, []))
+        self.assertEqual(self.stored(), rows)
+        self.reopen(BASE + 800)
+        self.assertEqual(self.recorder._gate.done_until, BASE + 600)
+
+    def test_open_batch_cannot_be_bypassed(self):
+        self.fill(BASE, BASE + 910)
+        batch = self.recorder.begin_batch()
+        batch.samples.append(PendingSample(MEMORY_ID, "", PERCENT, BASE + 350, "synced", 30.0))  # mimo add_results
+        self.assertEqual(self.catch_up(BASE + 1020).done_5m, BASE + 300)
+        real = self.database.connection
+        self.database.connection = FlakyCommit(real)
+        try:
+            self.assertRefused("write", self.recorder.write, batch)  # nejistý commit, dávka zůstává otevřená
+        finally:
+            self.database.connection = real
+        self.assertEqual(self.catch_up(BASE + 1020).done_5m, BASE + 300)  # zapečetěná dávka dál blokuje
+        self.assertTrue(self.recorder.write(batch).already_written)
+        self.assertEqual(self.catch_up(BASE + 1020).done_5m, BASE + 900)
+        self.assertIn((MEMORY_ID, "", BASE + 300, 1, 1, 30.0, 30.0, 30.0), self.stored())
+
+    def test_late_sample_bypassing_gate_is_never_written(self):
+        self.fill(BASE, BASE + 610)
+        self.catch_up(BASE + 720)
+        rows = self.stored()
+        batch = self.recorder.begin_batch()
+        batch.samples.append(PendingSample(CPU_TEMP_ID, "", CELSIUS, BASE + 299, "synced", 1.0))  # obejde SampleGate
+        self.assertEqual(self.recorder.write(batch).samples, 0)
+        self.assertEqual(self.recorder.rejected["late"], 1)
+        self.assertEqual(self.stored(), rows)
+        self.assertEqual(self.query("SELECT count(*) FROM sample WHERE ts >= ? AND ts < ?", (BASE, BASE + 300)), [(60,)])
 
 
 class HelpersTest(unittest.TestCase):

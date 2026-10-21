@@ -1,5 +1,17 @@
 # Changelog NexusSTAT
 
+## 2026-10-21 – M3.2a: agregace historie 5 min a 1 h (lokálně, nenapojeno)
+
+- `src/nexusstat/history.py`: `HistoryRecorder.aggregate(now_utc, ts_quality, queue)` → `AggregationResult` a kontrakt fronty `QueueState` (`empty`, `waiting_since`, `unknown`). Stejné zapisující spojení, žádné vlákno. SQL `progress-5m`, `aggregate-5m`, `progress-1h` a `rollup-1h` jsou doslovné kopie bloků z `docs/HISTORY.md`. Schéma v1 beze změny.
+- Uzavření okna (`HISTORY.md` 6.1): konec okna nejpozději `now − 120 s`, žádný čekající vzorek ve frontě ani v otevřené dávce, čas `synced` a nově (4, schváleno jako konzervativní ochrana) okno nepředběhne nejnovější zapsaný vzorek, aby skok hodin dopředu bez dat neuzavřel budoucí okna. Neznámý stav fronty nebo `None` neuzavře nic. Hodina až po všech svých 5min oknech.
+- Jedno volání = nejvýš jedna transakce 5min oken (do konce hodiny) a jedna hodinová; dohánění je postupné. Chyba i přerušení vrátí celou transakci, opakování hotového intervalu nic nezapíše, existující okno se nepřepíše: `history.aggregation_conflict` (`ERROR`), `HistoryError("conflict")` a zastavení agregace do konce běhu.
+- `SampleGate` převezme novou hranici až po potvrzené agregaci; `write()` navíc v transakci dávky nevloží vzorek s časem v hotovém okně (`late`), ani když obešel pravidla přijetí.
+- Finální kontrola: podmínka 4 ověřena 9 scénáři (poslední vzorek uprostřed i na hranici okna, zastavené měření bez nekonečného `more`, obnova po hodině i po 3 dnech postupně 73 voláními, restart během výpadku, skok hodin dopředu s daty i bez nich a návrat, fronta, hodina bez nových dat); poslední interval zůstává nedokončený do dalšího vzorku (`HISTORY.md` 6.1). Opraveno (reprodukováno na původním kódu): selhání zápisu dokladu konfliktu propustilo holou výjimku SQLite místo `HistoryError("conflict")` a selhání ověření existujících oken holou výjimku místo `HistoryError("write")`; zpráva nově rozlišuje potvrzený a nepotvrzený doklad (`HISTORY.md` 13.6).
+- `tests/test_history.py`: 35 nových testů (135 v modulu, celkem 632), včetně pádu před `COMMIT` v odděleném procesu, selhání uprostřed vkládání, konfliktu 5 min i 1 h, restartu, posunu hodin a srovnání s přímým výpočtem i se smyčkou zapisovače benchmarku M2. 26 z 27 kontrolních mutací agregace testy odhalí (zbylá je ekvivalentní: totéž hlídá SQL `progress-1h`); 49 z 49 mutací M3.1b dál odhaleno.
+- Výkon (notebook, syntetických 7 dní, 20 řad po 10 s): jedno volání medián 9 ms, nejvýš 25 ms; `aggregate-5m` čte přes primární klíč `sample`, žádný nový index.
+- Dokumentace: `docs/HISTORY.md` (6.1 podmínka 4, 6.2 a 6.4 stav implementace, 11 rozdělení M3.2a/M3.2b, nová 11.2), `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `README.md`, `manifest.toml` (stav dál `development`/`not-deployed`).
+- Beze změny: retence a mazání (M3.2b), `run.py`, kolektory, OLED, alarmy, konfigurace. Žádné vlákno, fronta, sekce `[history]`, snímek, Restic ani produkční databáze.
+
 ## 2026-10-20 – M3.1b: transakční zápis měření a změn stavů (lokálně, nenapojeno)
 
 - `src/nexusstat/history.py`: synchronní `HistoryRecorder` (`start_run`, `begin_batch`, `add_results`, `add_event`, `write`, `finish_run`), `Event`, `Batch`, `BatchResult`, `run_info()`, `high_water()`, katalog `SERIES`, pravidla přijetí `SampleGate` a pravidlo R4 `ChangeTracker`. SQL `insert-sample`, `sample-conflict`, `batch-guard`, `close-unclean-runs`, `high-water` a `insert-change` jsou doslovné kopie bloků z `docs/HISTORY.md`. Schéma v1 beze změny.

@@ -1,13 +1,14 @@
 """SQLite historie NexusSTAT: databáze schématu v1 a synchronní zápis (M3.1a, M3.1b).
 
-Podle docs/HISTORY.md (sekce 3–5, 7.1):
+Podle docs/HISTORY.md (sekce 3–7.1):
 - vytvoření nové testovací nebo vývojové databáze na výslovně zadané cestě,
 - otevření pro zápis s ověřením identity a zámkem jediného zapisovače,
 - otevření jen pro čtení, které nic nezapíše ani neprovede checkpoint,
-- HistoryRecorder: běh, transakční dávky vzorků, změn stavu a událostí.
+- HistoryRecorder: běh, transakční dávky vzorků, změn stavu a událostí
+  a agregace uzavřených oken do agg_5m a agg_1h (M3.2a).
 
-Zápis je synchronní a zatím ho nic nevolá: vlákno, fronty a napojení na
-run.py jsou M3.3, agregace, retence a snímky přijdou později. Modul nemá
+Zápis i agregace jsou synchronní a zatím je nic nevolá: vlákno, fronty a
+napojení na run.py jsou M3.3, retence (M3.2b) a snímky přijdou později. Modul nemá
 žádnou výchozí cestu, nikdy nevytváří adresář a nikdy nepřepíše ani nesmaže
 existující soubor; maže jen vlastní dočasné soubory z nepovedeného vytvoření.
 Produkční databáze se zatím nevytváří ani neotevírá. Nečte docs/HISTORY.md:
@@ -211,8 +212,9 @@ class HistoryError(Exception):
     selhalo), "settings" (nastavení spojení se nepodařilo), "alias" (druhé
     jméno databáze po přerušeném vytvoření má vlastní -wal, -shm nebo -journal),
     "run" (běh nezahájený, už zahájený nebo ukončený), "batch" (dávka mimo
-    pořadí nebo nezapsaná předchozí) a "write" (transakce zápisu selhala a byla
-    vrácena).
+    pořadí nebo nezapsaná předchozí), "write" (transakce zápisu selhala a byla
+    vrácena) a "conflict" (hotová agregace už existuje; nic se nepřepsalo a
+    agregace je do konce běhu zastavená).
     """
 
     def __init__(self, reason, message):
@@ -641,8 +643,8 @@ class HistoryDatabase:
 # --- M3.1b: zápis vzorků, změn stavu a událostí ------------------------------------
 
 # SQL z docs/HISTORY.md: doslovné kopie bloků insert-sample, sample-conflict,
-# batch-guard, run-last-write, close-unclean-runs, high-water a insert-change;
-# shodu hlídá test.
+# batch-guard, run-last-write, close-unclean-runs, high-water, insert-change,
+# progress-5m, aggregate-5m, progress-1h a rollup-1h; shodu hlídá test.
 INSERT_SAMPLE_SQL = """\
 INSERT INTO sample (metric_id, ts, value) VALUES (:metric_id, :ts, :value)
 ON CONFLICT DO NOTHING;
@@ -677,6 +679,34 @@ INSERT_CHANGE_SQL = """\
 INSERT INTO check_change (ts, ts_quality, run_id, check_id, from_state, to_state, value, unit, details, note)
 VALUES (:ts, :ts_quality, :run_id, :check_id, :from_state, :to_state, :value, :unit, :details, :note);
 """
+PROGRESS_5M_SQL = """\
+-- První příkaz transakce agregace; 0 změněných řádků = interval už je hotový: ROLLBACK.
+UPDATE aggregation_state SET done_until = :end
+WHERE level = '5m' AND done_until = :start;
+"""
+AGGREGATE_5M_SQL = """\
+-- :start a :end jsou násobky 300; okna končící nejpozději v :end. Bez ON CONFLICT:
+-- existující okno je rozpor, transakce selže a nic se nepřepíše.
+INSERT INTO agg_5m (metric_id, bucket, n_samples, n_valid, min_value, max_value, sum_value)
+SELECT metric_id, ts - ts % 300, count(*), count(value), min(value), max(value), sum(value)
+FROM sample
+WHERE metric_id IN (SELECT id FROM metric) AND ts >= :start AND ts < :end
+GROUP BY metric_id, ts - ts % 300;
+"""
+PROGRESS_1H_SQL = """\
+UPDATE aggregation_state SET done_until = :end
+WHERE level = '1h' AND done_until = :start
+  AND :end <= (SELECT done_until FROM aggregation_state WHERE level = '5m');
+"""
+ROLLUP_1H_SQL = """\
+-- :start a :end jsou násobky 3600.
+INSERT INTO agg_1h (metric_id, bucket, n_samples, n_valid, min_value, max_value, sum_value)
+SELECT metric_id, bucket - bucket % 3600, sum(n_samples), sum(n_valid),
+       min(min_value), max(max_value), sum(sum_value)
+FROM agg_5m
+WHERE metric_id IN (SELECT id FROM metric) AND bucket >= :start AND bucket < :end
+GROUP BY metric_id, bucket - bucket % 3600;
+"""
 INSERT_EVENT_SQL = """\
 INSERT INTO event (ts, ts_quality, run_id, kind, severity, check_id, message, data)
 VALUES (:ts, :ts_quality, :run_id, :kind, :severity, :check_id, :message, :data);
@@ -685,6 +715,9 @@ INSERT_METRIC_SQL = ("INSERT INTO metric (check_id, subject, unit, created_utc) 
                      "ON CONFLICT (check_id, subject) DO NOTHING")
 # Kvalita času startu běhu (run sám kvalitu nemá, nese ji událost process.start).
 START_QUALITY_SQL = "SELECT ts_quality FROM event WHERE run_id = ? AND kind = 'process.start' ORDER BY id LIMIT 1"
+DONE_UNTIL_SQL = "SELECT done_until FROM aggregation_state WHERE level = ?"
+# Úroveň agregace -> (posun done_until, vložení oken, tabulka).
+AGGREGATION_SQL = {"5m": (PROGRESS_5M_SQL, AGGREGATE_5M_SQL, "agg_5m"), "1h": (PROGRESS_1H_SQL, ROLLUP_1H_SQL, "agg_1h")}
 
 TIME_QUALITIES = ("synced", "derived", "unsynced")
 SEVERITIES = ("INFO", "WARNING", "ERROR", "CRITICAL")
@@ -694,6 +727,10 @@ MIN_TRUSTED_UTC = 1767225600
 CLOCK_JUMP_SECONDS = 2
 # Souhrn odmítnutých vzorků history.rejected nejvýš jednou za hodinu (HISTORY.md 5.4).
 LOSS_SUMMARY_SECONDS = 3600
+# Agregace (HISTORY.md 6.1): 5min okno, hodina a rezerva po konci okna před uzavřením.
+WINDOW_SECONDS = 300
+HOUR_SECONDS = 3600
+AGGREGATION_GRACE_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -855,6 +892,54 @@ class BatchResult:
 
 
 @dataclass(frozen=True)
+class QueueState:
+    """Kontrakt s frontou měření M3.3 pro uzavírání oken (HISTORY.md 6.1, podmínka 2).
+
+    Zapisovač frontu nemá a nic nepředpokládá: volající stav vždy výslovně uvede.
+    empty() = žádné nezapsané měření; waiting_since(ts) = nejstarší čekající
+    měření má čas ts (celé Unixové sekundy UTC); unknown() = stav neznámý nebo
+    měření čekají na synchronizaci hodin (čas nemají), pak se neuzavře nic.
+    """
+
+    known: bool
+    oldest_utc: int | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.known, bool):
+            raise TypeError("known musí být bool")
+        if self.oldest_utc is None:
+            return
+        if not self.known:
+            raise ValueError("neznámý stav fronty nemá čas nejstaršího měření")
+        if isinstance(self.oldest_utc, bool) or not isinstance(self.oldest_utc, int) or self.oldest_utc < MIN_TRUSTED_UTC:
+            raise ValueError("čekající měření bez důvěryhodného času se vyjádří jako QueueState.unknown()")
+
+    @classmethod
+    def empty(cls):
+        return cls(True)
+
+    @classmethod
+    def waiting_since(cls, oldest_utc):
+        if oldest_utc is None:
+            raise ValueError("prázdná fronta je QueueState.empty()")
+        return cls(True, oldest_utc)
+
+    @classmethod
+    def unknown(cls):
+        return cls(False)
+
+
+@dataclass(frozen=True)
+class AggregationResult:
+    done_5m: int  # potvrzená hranice: 5min okna končící nejpozději zde jsou hotová
+    done_1h: int
+    windows_5m: int = 0  # nově vložené řádky agg_5m
+    windows_1h: int = 0  # nově vložené řádky agg_1h
+    blocked: str | None = None  # "time_unsynced" nebo "queue_unknown": nic se nezpracovalo
+    more: bool = False  # zbývají uzavřená okna na další volání (postupné dohánění)
+
+
+@dataclass(frozen=True)
 class RunInfo:
     id: int
     started_utc: int
@@ -964,6 +1049,7 @@ class HistoryRecorder:
         self._latest = None  # (ts, kvalita) nejnovějšího výsledku: čas souhrnu ztrát
         self._seen = {}  # (check_id, simulated) -> poslední zpracovaný výsledek: opakované odeslání
         self._committing = None  # (číslo dávky, výsledek pokusu) posledního pokusu, který došel ke COMMIT
+        self._aggregation_stopped = None  # popis konfliktu agregace; do konce běhu se neagreguje
 
     def start_run(self, app_version, interval_s, now_utc, boot_id=None, ts_quality="synced"):
         """Zahájí běh: uzavře nečisté běhy, zjistí horní mez, zapíše process.start. Vrací run_id."""
@@ -1100,10 +1186,16 @@ class HistoryRecorder:
             if conn.execute(BATCH_GUARD_SQL, guard).rowcount != 1:
                 conn.execute("ROLLBACK")
                 return self._not_applied(conn, batch)
+            # Potvrzená hranice agregace v téže transakci: vzorek do hotového okna se nevloží
+            # nikdy, ani když obešel SampleGate (hotová agregace = surová data, HISTORY.md 6.4).
+            aggregated = conn.execute(DONE_UNTIL_SQL, ("5m",)).fetchone()[0]
             for sample in batch.samples:
+                if sample.ts < aggregated:
+                    rejected.append(("late", sample))
+                    continue
                 metric_id = self._metric_id(conn, sample, tentative, extra_events)
                 if metric_id is None:
-                    rejected.append(sample)
+                    rejected.append(("unit_mismatch", sample))
                     continue
                 params = {"metric_id": metric_id, "ts": sample.ts, "value": sample.value}
                 if conn.execute(INSERT_SAMPLE_SQL, params).rowcount == 1:
@@ -1139,6 +1231,58 @@ class HistoryRecorder:
         self._settle(batch, (tentative, duplicates, conflicts, rejected))
         return BatchResult(batch.number, False, inserted, duplicates, tuple(conflicts), len(batch.changes), len(events))
 
+    def aggregate(self, now_utc, ts_quality, queue):
+        """Agreguje uzavřená okna (HISTORY.md 6); vrací AggregationResult.
+
+        Okno [b, b + 300) je uzavřené, když (1) b + 300 ≤ now − 120 s, (2) ve
+        frontě (`queue`, kontrakt s M3.3) ani v otevřené dávce zapisovače není
+        vzorek s časem před b + 300, (3) čas je synchronizovaný a (4) okno
+        nepředbíhá nejnovější zapsaný vzorek. Jedno volání provede nejvýš jednu
+        transakci 5min oken (nejvýš do konce hodiny) a jednu hodinovou, takže
+        dohánění je postupné. Hotové okno se nikdy nepřepíše: konflikt zapíše
+        history.aggregation_conflict, vyvolá HistoryError("conflict") a agregaci
+        do konce běhu zastaví.
+        """
+        self._require_run()
+        if not isinstance(queue, QueueState):
+            raise TypeError("stav fronty musí být QueueState (empty, waiting_since nebo unknown)")
+        _check_quality(ts_quality)
+        now = _utc_seconds(now_utc)
+        if self._aggregation_stopped is not None:
+            raise HistoryError("conflict", self._aggregation_stopped)
+        if _trusted_quality(now, ts_quality) != "synced":
+            return self._aggregation_result(None, "time_unsynced")
+        if not queue.known:
+            return self._aggregation_result(None, "queue_unknown")
+        # (1) rezerva po konci okna, (2) nejstarší nezapsaný vzorek ve frontě a v otevřené dávce.
+        limit = (now - AGGREGATION_GRACE_SECONDS) // WINDOW_SECONDS * WINDOW_SECONDS
+        pending = [queue.oldest_utc]
+        if self._open_batch is not None:
+            pending += [sample.ts for sample in self._open_batch.samples]
+        for oldest in pending:
+            if oldest is not None:
+                limit = min(limit, oldest // WINDOW_SECONDS * WINDOW_SECONDS)
+
+        def plan_5m(conn):
+            start = conn.execute(DONE_UNTIL_SQL, ("5m",)).fetchone()[0]
+            newest = conn.execute(HIGH_WATER_SQL).fetchone()[0]
+            if newest is None:
+                return None  # žádný zapsaný vzorek: není co uzavřít
+            # (4) okno s nejnovějším zapsaným vzorkem a pozdější zůstávají otevřené (skok času dopředu).
+            end = min(limit, newest // WINDOW_SECONDS * WINDOW_SECONDS, (start // HOUR_SECONDS + 1) * HOUR_SECONDS)
+            return (start, end) if end > start else None
+
+        def plan_1h(conn):
+            start = conn.execute(DONE_UNTIL_SQL, ("1h",)).fetchone()[0]
+            ready = conn.execute(DONE_UNTIL_SQL, ("5m",)).fetchone()[0]
+            return (start, start + HOUR_SECONDS) if start + HOUR_SECONDS <= ready else None
+
+        done, windows_5m = self._aggregation_step("5m", plan_5m, now)
+        if done is not None:
+            self._gate.done_until = max(self._gate.done_until, done)  # až po COMMIT
+        _, windows_1h = self._aggregation_step("1h", plan_1h, now)
+        return self._aggregation_result(limit, None, windows_5m, windows_1h)
+
     def finish_run(self, now_utc, ts_quality="synced"):
         """Čisté ukončení běhu (stopped_utc, clean_stop = 1, process.stop); opakované volání nic nezdvojí."""
         if self.run_id is None:
@@ -1169,6 +1313,80 @@ class HistoryRecorder:
             self._loss = {}
         self._finished = True
         return bool(closed)
+
+    def _aggregation_step(self, level, plan, now):
+        """BEGIN IMMEDIATE → progress → INSERT oken → COMMIT; vrací (nové done_until, vložené řádky)."""
+        progress, insert, table = AGGREGATION_SQL[level]
+        conn = self.database.connection
+        span = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            span = plan(conn)
+            if span is None:
+                conn.execute("ROLLBACK")
+                return None, 0
+            params = {"start": span[0], "end": span[1]}
+            if conn.execute(progress, params).rowcount != 1:
+                conn.execute("ROLLBACK")  # interval už je hotový (opakování): nic se nezapíše
+                return None, 0
+            rows = conn.execute(insert, params).rowcount
+            conn.execute("COMMIT")
+        except sqlite3.IntegrityError as error:
+            _rollback(conn)
+            self._aggregation_conflict(level, table, span, now, error)
+        except sqlite3.Error as error:
+            _rollback(conn)
+            raise HistoryError("write", f"agregaci {level} {span} nelze zapsat, vrácena: {error}") from None
+        except BaseException:
+            _rollback(conn)  # i Ctrl+C nebo chyba programu: nic rozepsaného, zámek zápisu uvolněn
+            raise
+        return span[1], rows
+
+    def _aggregation_conflict(self, level, table, span, now, error):
+        """Doloží a ohlásí okno, které už existuje; nic se nepřepíše a agregace se zastaví."""
+        conn = self.database.connection
+        start, end = span
+        try:
+            existing, first, last = conn.execute(f"SELECT count(*), min(bucket), max(bucket) FROM {table} "
+                                                 "WHERE bucket >= ? AND bucket < ?", (start, end)).fetchone()
+        except sqlite3.Error as failure:
+            # Konflikt nelze doložit: obecná chyba zápisu, agregace se nezastavuje.
+            raise HistoryError("write", f"agregaci {level} {span} nelze zapsat ({error}) "
+                                        f"a existující okna nelze ověřit: {failure}") from None
+        if not existing:
+            raise HistoryError("write", f"agregaci {level} {span} nelze zapsat, vrácena: {error}") from None
+        message = (f"agregace {level} [{start}, {end}): {existing} oken už existuje; "
+                   "nic se nepřepsalo, agregace zastavena do zásahu správce")
+        event = Event(now, "synced", "history.aggregation_conflict", "ERROR", message,
+                      data={"level": level, "start": start, "end": end, "existing": existing,
+                            "first": first, "last": last})
+        # Konflikt je doložený existujícími okny, agregace se zastaví v každém případě. Zpráva
+        # tvrdí zapsaný doklad jen po potvrzeném COMMIT; jinak „nepodařilo potvrdit“ (i nejistý commit).
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(INSERT_EVENT_SQL, event.row(self.run_id))
+            conn.execute("COMMIT")
+            note = "doklad history.aggregation_conflict zapsán"
+        except sqlite3.Error as failure:
+            _rollback(conn)
+            note = f"doklad history.aggregation_conflict se nepodařilo potvrdit: {failure}"
+        except BaseException:
+            _rollback(conn)
+            self._aggregation_stopped = f"{message}; doklad history.aggregation_conflict se nepodařilo potvrdit (přerušeno)"
+            raise
+        self._aggregation_stopped = f"{message}; {note}"
+        raise HistoryError("conflict", self._aggregation_stopped)
+
+    def _aggregation_result(self, limit, blocked, windows_5m=0, windows_1h=0):
+        conn = self.database.connection
+        done_5m = conn.execute(DONE_UNTIL_SQL, ("5m",)).fetchone()[0]
+        done_1h = conn.execute(DONE_UNTIL_SQL, ("1h",)).fetchone()[0]
+        more = False
+        if blocked is None:
+            newest = conn.execute(HIGH_WATER_SQL).fetchone()[0]
+            reachable = done_5m if newest is None else min(limit, newest // WINDOW_SECONDS * WINDOW_SECONDS)
+            more = reachable > done_5m or done_1h + HOUR_SECONDS <= done_5m
+        return AggregationResult(done_5m, done_1h, windows_5m, windows_1h, blocked, more)
 
     def _check_open(self, batch):
         if not isinstance(batch, Batch):
@@ -1229,8 +1447,8 @@ class HistoryRecorder:
         self._metric_ids.update(tentative)
         self.duplicates += duplicates
         self.conflicts += len(conflicts)
-        for sample in rejected:
-            self._lose("unit_mismatch", sample.ts, sample.ts_quality)
+        for reason, sample in rejected:
+            self._lose(reason, sample.ts, sample.ts_quality)
         self.last_batch = max(self.last_batch, batch.number)
         if batch is self._open_batch:
             self._open_batch = None
