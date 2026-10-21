@@ -102,7 +102,7 @@ RETENTION = "DELETE FROM sample WHERE metric_id IN (SELECT id FROM metric) AND t
 READ_AGG = "SELECT bucket, n_valid, min_value, max_value, sum_value / n_valid FROM agg WHERE metric_id = ? AND bucket >= ? AND bucket < ? ORDER BY bucket"
 
 # Bloky SQL z dokumentace, které používá dlouhodobý cyklus.
-STEADY_SQL = ("insert-sample", "batch-guard", "aggregate-5m", "progress-5m", "rollup-1h", "progress-1h",
+STEADY_SQL = ("insert-sample", "batch-guard", "run-last-write", "aggregate-5m", "progress-5m", "rollup-1h", "progress-1h",
               "oldest-sample", "retention-sample", "oldest-5m", "retention-5m", "read-agg")
 CHANGE_SQL = """INSERT INTO check_change (ts, ts_quality, run_id, check_id, from_state, to_state, details, note)
                 VALUES (:ts, 'synced', :run_id, 'network.link', 'INFO', 'INFO', :details, 'Síť eth0')"""
@@ -370,13 +370,14 @@ def selfcheck(directory):
     conn.executemany("INSERT INTO aggregation_state (level, done_until) VALUES (?, ?)", [("5m", t), ("1h", t)])
 
     def batch(number, rows):
-        """Dávka podle HISTORY.md 5.1: ochrana pořadím dávky, pak vzorky, jedna transakce."""
+        """Dávka podle HISTORY.md 5.2: ochrana pořadím dávky, vzorky, evidence běhu, jedna transakce."""
         conn.execute("BEGIN IMMEDIATE")
-        guard = {"run_id": 1, "batch": number, "max_ts": max(ts for ts, _ in rows)}
-        if conn.execute(sql["batch-guard"], guard).rowcount != 1:
+        if conn.execute(sql["batch-guard"], {"run_id": 1, "batch": number}).rowcount != 1:
             conn.execute("ROLLBACK")
             return False
-        conn.executemany(sql["insert-sample"], [{"metric_id": 1, "ts": ts, "value": value} for ts, value in rows])
+        inserted = [ts for ts, value in rows
+                    if conn.execute(sql["insert-sample"], {"metric_id": 1, "ts": ts, "value": value}).rowcount == 1]
+        conn.execute(sql["run-last-write"], {"run_id": 1, "max_ts": max(inserted, default=None)})
         conn.execute("COMMIT")
         return True
 
@@ -663,7 +664,7 @@ def selfcheck_r4(directory):
         """Dávka podle 5.2: batch-guard, změny, COMMIT; fail = transakce selže před commitem."""
         number = batch["done"] + 1 if number is None else number
         conn.execute("BEGIN IMMEDIATE")
-        if conn.execute(sql["batch-guard"], {"run_id": 1, "batch": number, "max_ts": None}).rowcount != 1:
+        if conn.execute(sql["batch-guard"], {"run_id": 1, "batch": number}).rowcount != 1:
             conn.execute("ROLLBACK")
             return False
         conn.executemany(sql["insert-change"], [dict(row, run_id=1, ts_quality="synced") for row in rows])
@@ -793,7 +794,7 @@ def bench_changes(directory, hours):
                 row = {"from_state": "INFO" if k % 2 == 0 else "CRITICAL", "to_state": "CRITICAL" if k % 2 == 0 else "INFO",
                        "value": value, "unit": "°C", "note": f"Teplota CPU {value:.0f} °C", "details": None}
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(guard, {"run_id": 1, "batch": k + 1, "max_ts": None})
+            conn.execute(guard, {"run_id": 1, "batch": k + 1})
             conn.execute(insert, dict(row, ts=START + 10 * k, run_id=1, check_id=check_id, ts_quality="synced"))
             conn.execute("COMMIT")
         elapsed = time.perf_counter() - began
@@ -1210,12 +1211,15 @@ class SteadyWriter:
             self.batch += 1
             began = time.perf_counter()
             conn.execute("BEGIN IMMEDIATE")
-            guard = {"run_id": 1, "batch": self.batch, "max_ts": max(row["ts"] for row in rows) if rows else None}
-            if conn.execute(self.sql["batch-guard"], guard).rowcount != 1:
+            if conn.execute(self.sql["batch-guard"], {"run_id": 1, "batch": self.batch}).rowcount != 1:
                 raise RuntimeError("ochrana dávky odmítla novou dávku")
-            if rows:
-                self.conflicts += len(rows) - conn.executemany(self.sql["insert-sample"], rows).rowcount
+            inserted = conn.executemany(self.sql["insert-sample"], rows).rowcount if rows else 0
+            self.conflicts += len(rows) - inserted
             conn.executemany(CHANGE_SQL, changes)
+            # Horní mez jen z vložených vzorků; při konfliktu (v tomto syntetickém provozu nenastává,
+            # počítá se) se konzervativně neposune.
+            newest = max(row["ts"] for row in rows) if rows and inserted == len(rows) else None
+            conn.execute(self.sql["run-last-write"], {"run_id": 1, "max_ts": newest})
             conn.execute("COMMIT")
             self.latencies.append((time.perf_counter() - began) * 1000)
             self.transactions["dávka"] += 1

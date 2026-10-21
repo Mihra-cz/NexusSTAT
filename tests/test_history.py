@@ -1,12 +1,16 @@
-"""Testy základu SQLite historie (M3.1a): vytvoření, otevření, ověření a zámek.
+"""Testy SQLite historie: vytvoření, otevření, ověření a zámek (M3.1a) a zápis (M3.1b).
 
 Vše jen v tempfile.TemporaryDirectory. Simulace chyb upravují výhradně kopie
-databáze vytvořené testem; žádná produkční cesta, žádné skutečné čekání.
+databáze vytvořené testem; žádná produkční cesta, žádné skutečné čekání ani
+změna systémového času (čas měření je parametr výsledků).
 """
 
 import fcntl
 import hashlib
+import importlib.util
 import inspect
+import json
+import math
 import os
 import re
 import shutil
@@ -16,11 +20,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 from nexusstat import history
-from nexusstat.history import HistoryError
+from nexusstat.core import CheckResult, Measurement, State
+from nexusstat.history import Event, HistoryError, HistoryRecorder, PendingSample
+from nexusstat.network_monitor import BYTES_PER_SECOND, INTERFACE, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
+from nexusstat.system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
 
 REPO = Path(__file__).resolve().parent.parent
 DOC = REPO / "docs" / "HISTORY.md"
@@ -614,6 +622,730 @@ class VerificationTest(TempDirTest):
         change(tampered, "INSERT INTO sample (metric_id, ts, value) VALUES (99, 1, 1.0)")
         with history.open_writer(tampered, "test", HOST) as database:
             self.assertEqual(len(database.connection.execute("PRAGMA foreign_key_check").fetchall()), 1)
+
+
+# --- M3.1b: zápis ------------------------------------------------------------------
+
+BASE = 1_800_003_600  # po vytvoření databáze (done_until '5m' = 1_800_000_000), násobek 600 i 3600
+VALIDITY = 30.0
+
+
+def at(ts):
+    return datetime.fromtimestamp(ts, timezone.utc)
+
+
+def result(check_id, state, value=None, unit=None, ts=BASE, cycle=None, details=None, simulated=False, summary=None):
+    """Výsledek kontroly jako od kolektoru; `cycle` = monotónní čas měření (totožnost měření)."""
+    cycle = ts if cycle is None else cycle
+    return CheckResult(check_id, state, summary or f"{check_id} {state.value}", at(ts), float(cycle) + VALIDITY,
+                       simulated=simulated, measurement=None if value is None else Measurement(value, unit),
+                       details=details or {})
+
+
+def benchmark():
+    """Modely pravidel M2 z tools/sqlite_history_benchmark.py (ChangeRules, TimeRules)."""
+    spec = importlib.util.spec_from_file_location("m2_benchmark", REPO / "tools" / "sqlite_history_benchmark.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class FlakyCommit:
+    """Spojení, kterému COMMIT proběhne, ale volající dostane chybu (nejistý commit)."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, sql, *args):
+        cursor = self._connection.execute(sql, *args)
+        if sql == "COMMIT":
+            raise sqlite3.OperationalError("disk I/O error (simulace po úspěšném commitu)")
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+class RecorderTest(TempDirTest):
+    def setUp(self):
+        super().setUp()
+        self.create()
+        self.database = history.open_writer(self.db, "test", HOST)
+        self.recorder = HistoryRecorder(self.database)
+        self.run_id = self.recorder.start_run("test", 10, at(BASE - 60))
+
+    def tearDown(self):
+        self.database.close()
+        super().tearDown()
+
+    def write(self, *cycles, quality="synced", events=()):
+        batch = self.recorder.begin_batch()
+        for cycle in cycles:
+            self.recorder.add_results(batch, cycle, quality)
+        for event in events:
+            self.recorder.add_event(batch, event)
+        return self.recorder.write(batch)
+
+    def query(self, sql, params=()):
+        """Čtení přes samostatné spojení jen pro čtení (jako budoucí web)."""
+        with history.open_reader(self.db) as reader:
+            return reader.connection.execute(sql, params).fetchall()
+
+    def samples(self, check_id=None):
+        where, params = ("WHERE m.check_id = ?", (check_id,)) if check_id else ("", ())
+        return self.query(f"SELECT m.check_id, m.subject, s.ts, s.value FROM sample s JOIN metric m ON m.id = s.metric_id "
+                          f"{where} ORDER BY s.ts, m.check_id, m.subject", params)
+
+    def changes(self, check_id):
+        return self.query("SELECT ts, from_state, to_state, details FROM check_change WHERE check_id = ? ORDER BY id",
+                          (check_id,))
+
+    def events(self, kind):
+        return self.query("SELECT ts, severity, check_id, data FROM event WHERE kind = ? ORDER BY id", (kind,))
+
+
+class WriterContractTest(RecorderTest):
+    def test_sql_matches_documented_blocks(self):
+        for name, value in (("insert-sample", history.INSERT_SAMPLE_SQL), ("sample-conflict", history.SAMPLE_CONFLICT_SQL),
+                            ("batch-guard", history.BATCH_GUARD_SQL), ("run-last-write", history.RUN_LAST_WRITE_SQL),
+                            ("close-unclean-runs", history.CLOSE_UNCLEAN_RUNS_SQL),
+                            ("high-water", history.HIGH_WATER_SQL), ("insert-change", history.INSERT_CHANGE_SQL)):
+            with self.subTest(block=name):
+                self.assertEqual(value, doc_block(name))
+
+    def test_catalog_has_only_collector_series(self):
+        self.assertEqual({check_id: (spec.unit, spec.subject_key) for check_id, spec in history.SERIES.items()}, {
+            CPU_USAGE_ID: (PERCENT, None), CPU_TEMP_ID: (CELSIUS, None), MEMORY_ID: (PERCENT, None),
+            DISK_ROOT_ID: (PERCENT, None), RX_RATE_ID: (BYTES_PER_SECOND, INTERFACE), TX_RATE_ID: (BYTES_PER_SECOND, INTERFACE)})
+
+    def test_start_run_records_run_and_event(self):
+        info = history.run_info(self.database.connection, self.run_id)
+        self.assertEqual((info.started_utc, info.stopped_utc, info.last_batch, info.last_write_utc), (BASE - 60, None, 0, None))
+        self.assertEqual(len(self.events("process.start")), 1)
+
+    def test_recorder_needs_writer_and_started_run(self):
+        with history.open_reader(self.db) as reader:
+            with self.assertRaises(HistoryError):
+                HistoryRecorder(reader)  # čtecí spojení nikdy nezapisuje
+        with self.assertRaises(HistoryError):
+            HistoryRecorder(None)
+        fresh = HistoryRecorder(self.database)
+        with self.assertRaises(HistoryError):
+            fresh.begin_batch()  # bez start_run
+        with self.assertRaises(HistoryError):
+            self.recorder.start_run("test", 10, at(BASE))  # druhý start téhož zapisovače
+        self.assertRefused("locked", history.open_writer, self.db, "test", HOST)  # jediný zapisovač
+
+    def test_foreign_database_never_gets_a_recorder(self):
+        other = self.folder / "other.sqlite3"
+        history.create_database(other, "test", OTHER_HOST, now_utc=CREATED)
+        self.assertRefused("host", history.open_writer, other, "test", HOST)  # databáze jiného stroje
+        self.assertRefused("role", history.open_writer, other, "development", OTHER_HOST)
+        foreign = self.folder / "foreign.sqlite3"
+        change(foreign, "CREATE TABLE sample (ts INTEGER)")  # cizí SQLite soubor se stejným názvem tabulky
+        self.assertRefused("foreign", history.open_writer, foreign, "test", HOST)
+        with history.open_reader(other) as reader:  # odmítnutí nic nezapsalo
+            self.assertEqual(reader.connection.execute("SELECT count(*) FROM run").fetchall(), [(0,)])
+
+
+class SampleContractTest(RecorderTest):
+    def test_zero_value_unknown_and_missing_measurement(self):
+        self.write([result(CPU_USAGE_ID, State.INFO, 0.0, PERCENT), result(CPU_TEMP_ID, State.UNKNOWN),
+                    result(MEMORY_ID, State.INFO, 24.5, PERCENT)])  # disk.root chybí
+        self.assertEqual(self.samples(), [(CPU_TEMP_ID, "", BASE, None), (CPU_USAGE_ID, "", BASE, 0.0),
+                                          (MEMORY_ID, "", BASE, 24.5)])
+        self.assertEqual(self.query("SELECT typeof(value) FROM sample s JOIN metric m ON m.id = s.metric_id "
+                                    "WHERE m.check_id = ?", (CPU_USAGE_ID,)), [("real",)])
+        self.assertEqual(self.query("SELECT check_id FROM metric WHERE check_id = ?", (DISK_ROOT_ID,)), [])
+
+    def test_na_creates_change_but_no_sample(self):
+        self.write([result(CPU_TEMP_ID, State.NA), result("service.animedb", State.NA)])
+        self.assertEqual(self.samples(), [])
+        self.assertEqual(self.changes("service.animedb"), [(BASE, None, "N/A", None)])
+
+    def test_simulated_results_are_never_stored(self):
+        outcome = self.write([result(CPU_TEMP_ID, State.WARNING, 80.0, CELSIUS, simulated=True),
+                              result(LINK_ID, State.INFO, details={INTERFACE: "eth0", LINK: "UP"}, simulated=True)])
+        self.assertEqual((self.samples(), self.changes(CPU_TEMP_ID), self.changes(LINK_ID)), ([], [], []))
+        self.assertEqual(self.recorder.rejected["simulated"], 2)
+        self.assertEqual(len(self.events("history.simulated_rejected")), 1)
+        self.assertEqual(outcome.samples, 0)
+
+    def test_unknown_series_and_wrong_unit_create_no_series(self):
+        self.write([result("custom.metric", State.INFO, 5.0, "x"), result(CPU_TEMP_ID, State.INFO, 320.0, "K")])
+        self.write([result(CPU_TEMP_ID, State.INFO, 321.0, "K", ts=BASE + 10)])
+        self.assertEqual(self.query("SELECT check_id FROM metric"), [])
+        self.assertEqual((self.recorder.rejected["unknown_series"], self.recorder.rejected["unit_mismatch"]), (1, 2))
+        self.assertEqual(len(self.events("history.unit_mismatch")), 1)  # jen jednou za běh
+        self.assertEqual(self.changes("custom.metric"), [(BASE, None, "INFO", None)])  # stav se eviduje i tak
+
+    def test_stored_series_with_other_unit_is_not_mixed(self):
+        # Řada z jiné verze katalogu (jiná jednotka v databázi): vzorek se nezapíše ani nepřevede.
+        self.database.connection.execute("INSERT INTO metric (check_id, subject, unit, created_utc) VALUES (?, '', 'K', ?)",
+                                         (CPU_TEMP_ID, CREATED))
+        outcome = self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        self.assertEqual((outcome.samples, self.samples(), self.recorder.rejected["unit_mismatch"]), (0, [], 1))
+        self.assertEqual(len(self.events("history.unit_mismatch")), 1)
+        self.assertEqual(self.query("SELECT unit FROM metric"), [("K",)])
+
+    def test_invalid_number_is_refused(self):
+        broken = result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)
+        object.__setattr__(broken.measurement, "value", float("nan"))  # poškozený objekt mimo kontrolu core
+        self.write([broken])
+        self.assertEqual((self.samples(), self.recorder.rejected["invalid_value"]), ([], 1))
+
+    def test_network_rates_keep_interface_identity(self):
+        self.write([result(RX_RATE_ID, State.INFO, 1200.0, BYTES_PER_SECOND, details={INTERFACE: "eth0"}),
+                    result(TX_RATE_ID, State.UNKNOWN, details={INTERFACE: "eth0"})])
+        self.write([result(RX_RATE_ID, State.INFO, 300.0, BYTES_PER_SECOND, ts=BASE + 10, details={INTERFACE: "wlan0"}),
+                    result(RX_RATE_ID, State.UNKNOWN, ts=BASE + 10, cycle=BASE + 10.5)])  # bez rozhraní
+        self.assertEqual(self.query("SELECT check_id, subject, unit FROM metric ORDER BY id"),
+                         [(RX_RATE_ID, "eth0", "B/s"), (TX_RATE_ID, "eth0", "B/s"), (RX_RATE_ID, "wlan0", "B/s")])
+        self.assertEqual(self.samples(RX_RATE_ID), [(RX_RATE_ID, "eth0", BASE, 1200.0), (RX_RATE_ID, "wlan0", BASE + 10, 300.0)])
+        self.assertEqual(self.samples(TX_RATE_ID), [(TX_RATE_ID, "eth0", BASE, None)])
+        self.assertEqual(self.recorder.rejected["no_subject"], 1)
+
+    def test_samples_before_aggregation_watermark_are_late(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=1_799_990_000)])
+        self.assertEqual((self.samples(), self.recorder.rejected["late"]), ([], 1))
+
+
+class ChangeContractTest(RecorderTest):
+    def test_each_state_transition_is_one_row_with_baseline(self):
+        sequence = ["INFO", "WARNING", "ERROR", "CRITICAL", "INFO", "UNKNOWN", "INFO", "INFO"]
+        for k, state in enumerate(sequence):
+            value = None if state == "UNKNOWN" else 50.0 + k
+            self.write([result(CPU_TEMP_ID, State(state), value, None if value is None else CELSIUS, ts=BASE + 10 * k)])
+        self.assertEqual([row[1:3] for row in self.changes(CPU_TEMP_ID)],
+                         [(None, "INFO"), ("INFO", "WARNING"), ("WARNING", "ERROR"), ("ERROR", "CRITICAL"),
+                          ("CRITICAL", "INFO"), ("INFO", "UNKNOWN"), ("UNKNOWN", "INFO")])  # poslední INFO beze změny
+        self.assertEqual([row[0] for row in self.changes(CPU_TEMP_ID)], [BASE + 10 * k for k in range(7)])
+
+    def test_link_changes_are_stored_while_state_stays_info(self):
+        for k, link in enumerate(["UP", "DOWN", "DOWN", "UP"]):
+            self.write([result(LINK_ID, State.INFO, ts=BASE + 10 * k, details={INTERFACE: "eth0", LINK: link})])
+        rows = self.changes(LINK_ID)
+        self.assertEqual([(row[0], row[1], row[2], json.loads(row[3])[LINK]) for row in rows],
+                         [(BASE, None, "INFO", "UP"), (BASE + 10, "INFO", "INFO", "DOWN"), (BASE + 30, "INFO", "INFO", "UP")])
+
+    def test_repeated_identical_state_creates_no_rows(self):
+        for k in range(5):  # hodnota i text se mění, stav ne
+            self.write([result(CPU_TEMP_ID, State.INFO, 50.0 + k, CELSIUS, ts=BASE + 10 * k, summary=f"{50 + k} °C")])
+        self.assertEqual(len(self.changes(CPU_TEMP_ID)), 1)
+        self.assertEqual(len(self.samples(CPU_TEMP_ID)), 5)
+
+    def test_same_details_in_other_key_order_are_no_change(self):
+        self.write([result(LINK_ID, State.INFO, details={INTERFACE: "eth0", LINK: "UP"})])
+        self.write([result(LINK_ID, State.INFO, ts=BASE + 10, details={LINK: "UP", INTERFACE: "eth0"})])
+        self.assertEqual(len(self.changes(LINK_ID)), 1)
+
+    def test_info_critical_flapping_keeps_every_transition(self):
+        # Scénář A ze selfcheck_r4 (benchmark M2): 30 min, měření po 5 s, změna každých 10 s.
+        cycles = [[result(CPU_TEMP_ID, State.INFO, 40.0, CELSIUS, ts=BASE)]]
+        for k in range(1, 361):
+            state = State.CRITICAL if ((k + 1) // 2) % 2 else State.INFO
+            cycles.append([result(CPU_TEMP_ID, state, 90.0 if state is State.CRITICAL else 40.0, CELSIUS, ts=BASE + 5 * k)])
+        for start in range(0, len(cycles), 12):  # dávka po minutě
+            self.write(*cycles[start:start + 12])
+        rows = self.changes(CPU_TEMP_ID)
+        entries = [BASE + 5 * k for k in range(1, 361, 4)]
+        exits = [BASE + 5 * k for k in range(3, 361, 4)]
+        self.assertEqual(len(rows), 181)
+        self.assertEqual([row[0] for row in rows if row[1:3] == ("INFO", "CRITICAL")], entries)
+        self.assertEqual([row[0] for row in rows if row[1:3] == ("CRITICAL", "INFO")], exits)
+        episodes = self.query(doc_block("state-episodes"), {"check_id": CPU_TEMP_ID, "state": "CRITICAL",
+                                                             "start": BASE, "end": BASE + 3600})
+        self.assertEqual(episodes, [(start, end, 10, 0) for start, end in zip(entries, exits)])
+        self.assertEqual(self.query(doc_block("transition-rate"), {"check_id": CPU_TEMP_ID, "bucket_s": 600,
+                                                                    "start": BASE, "end": BASE + 3600}),
+                         [(BASE, 60, 60), (BASE + 600, 60, 60), (BASE + 1200, 60, 60)])
+        # Shoda s modelem ChangeRules z benchmarku M2.
+        model = benchmark().ChangeRules()
+        model.submit(BASE, CPU_TEMP_ID, "INFO", value=40.0, unit=CELSIUS)
+        for k in range(1, 361):
+            state = "CRITICAL" if ((k + 1) // 2) % 2 else "INFO"
+            model.submit(BASE + 5 * k, CPU_TEMP_ID, state, value=90.0 if state == "CRITICAL" else 40.0, unit=CELSIUS)
+        stored = self.query("SELECT ts, from_state, to_state, value, unit FROM check_change WHERE check_id = ? ORDER BY id",
+                            (CPU_TEMP_ID,))
+        self.assertEqual(stored, [(row["ts"], row["from_state"], row["to_state"], row["value"], row["unit"])
+                                  for row in model.pending])
+
+    def test_two_changes_in_one_second_keep_order(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE)])
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.CRITICAL, 90.0, CELSIUS, ts=BASE + 10.2, cycle=BASE + 10.2)])
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 10.9, cycle=BASE + 10.9)])
+        self.recorder.write(batch)
+        self.assertEqual([row[:3] for row in self.changes(CPU_TEMP_ID)],
+                         [(BASE, None, "INFO"), (BASE + 10, "INFO", "CRITICAL"), (BASE + 10, "CRITICAL", "INFO")])
+        self.assertEqual(self.query(doc_block("state-episodes"), {"check_id": CPU_TEMP_ID, "state": "CRITICAL",
+                                                                   "start": BASE, "end": BASE + 3600}),
+                         [(BASE + 10, BASE + 10, 0, 0)])
+        self.assertEqual(self.samples(CPU_TEMP_ID), [(CPU_TEMP_ID, "", BASE, 50.0), (CPU_TEMP_ID, "", BASE + 10, 90.0)])
+        self.assertEqual(self.recorder.rejected["same_second"], 1)  # druhé měření v sekundě = ztráta vzorku
+
+    def test_events_are_stored_and_validated(self):
+        self.write(events=[Event(BASE, "synced", "flapping.start", "WARNING", "kmitání", CPU_TEMP_ID, {"recent": 6})])
+        self.assertEqual(self.events("flapping.start"), [(BASE, "WARNING", CPU_TEMP_ID, '{"recent":6}')])
+        self.assertEqual(self.changes(CPU_TEMP_ID), [])  # událost FLAPPING není přechod
+        for arguments in ((BASE, "synced", "x", "FATAL", "zpráva"), (BASE, "guess", "x", "INFO", "zpráva"),
+                          (0, "synced", "x", "INFO", "zpráva"), (BASE, "synced", "", "INFO", "zpráva")):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                Event(*arguments)
+        with self.assertRaises(TypeError):
+            Event(BASE, "synced", "x", "INFO", "zpráva", data={"set": {1, 2}})
+
+
+class BatchSafetyTest(RecorderTest):
+    def test_same_measurement_twice_is_duplicate_not_loss(self):
+        cycle = [result(CPU_TEMP_ID, State.WARNING, 72.0, CELSIUS)]
+        self.write(cycle, cycle)
+        self.assertEqual(len(self.samples(CPU_TEMP_ID)), 1)
+        self.assertEqual(len(self.changes(CPU_TEMP_ID)), 1)
+        self.assertEqual((self.recorder.duplicates, sum(self.recorder.rejected.values())), (1, 0))
+
+    def test_replayed_batch_is_not_written_twice(self):
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        first = self.recorder.write(batch)
+        again = self.recorder.write(batch)
+        self.assertEqual((first.already_written, first.samples, again.already_written, again.samples), (False, 1, True, 0))
+        self.assertEqual((len(self.samples()), len(self.changes(CPU_TEMP_ID))), (1, 1))
+
+    def test_uncertain_commit_then_retry_writes_once(self):
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.CRITICAL, 91.0, CELSIUS)])
+        real = self.database.connection
+        self.database.connection = FlakyCommit(real)
+        try:
+            self.assertRefused("write", self.recorder.write, batch)
+        finally:
+            self.database.connection = real
+        retry = self.recorder.write(batch)
+        self.assertTrue(retry.already_written)
+        self.assertEqual((len(self.samples()), len(self.changes(CPU_TEMP_ID))), (1, 1))
+        self.assertEqual(history.run_info(real, self.run_id).last_batch, 1)
+        self.recorder.begin_batch()  # dávka uzavřená, další jde vytvořit
+
+    def test_skipped_batch_number_is_refused(self):
+        # Ručně vytvořenou dávku (i s vynechaným číslem) zapisovač odmítne ještě před transakcí;
+        # vynechané číslo u řádné dávky hlídá batch-guard (test_guard_refuses_open_batch_out_of_order).
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        skipped = history.Batch(self.recorder.last_batch + 2)
+        skipped.samples.append(PendingSample(CPU_TEMP_ID, "", CELSIUS, BASE + 20, "synced", 51.0))
+        self.assertRefused("batch", self.recorder.write, skipped)
+        self.assertFalse(skipped.sealed)
+        self.assertEqual(len(self.samples()), 1)
+        self.assertEqual(history.run_info(self.database.connection, self.run_id).last_batch, 1)
+        # Odmítnutá dávka mimo pořadí nespotřebuje souhrn ztrát; nese ho až řádná dávka.
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 52.0, CELSIUS, cycle=BASE + 0.5)])  # same_second
+        self.assertRefused("batch", self.recorder.write, history.Batch(batch.number + 1))
+        self.recorder.write(batch)
+        self.assertEqual(len(self.events("history.rejected")), 1)
+
+    def test_conflicting_sample_is_reported_and_not_overwritten(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        batch = self.recorder.begin_batch()  # obejde pravidla přijetí jako chyba programu nebo obnovy
+        batch.samples += [PendingSample(CPU_TEMP_ID, "", CELSIUS, BASE, "synced", 50.0),
+                          PendingSample(CPU_TEMP_ID, "", CELSIUS, BASE, "synced", 99.0)]
+        outcome = self.recorder.write(batch)
+        self.assertEqual((outcome.samples, outcome.duplicates, len(outcome.conflicts)), (0, 1, 1))
+        self.assertEqual(outcome.conflicts[0].stored, 50.0)
+        self.assertEqual(self.samples(CPU_TEMP_ID), [(CPU_TEMP_ID, "", BASE, 50.0)])
+        conflict = self.events("history.sample_conflict")
+        self.assertEqual(len(conflict), 1)
+        self.assertEqual((conflict[0][1], json.loads(conflict[0][3])["rejected"]), ("ERROR", 99.0))
+
+    def test_failure_mid_batch_rolls_back_everything(self):
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.CRITICAL, 90.0, CELSIUS)])
+        self.recorder.add_event(batch, Event(BASE, "synced", "test.event", "INFO", "událost"))
+        with mock.patch.object(history, "INSERT_EVENT_SQL", "INSERT INTO neexistuje VALUES (1)"):
+            self.assertRefused("write", self.recorder.write, batch)  # selže až po vzorcích a změnách
+        self.assertEqual((self.samples(), self.changes(CPU_TEMP_ID), self.events("test.event")), ([], [], []))
+        self.assertEqual(history.run_info(self.database.connection, self.run_id).last_batch, 0)
+        self.assertEqual(self.recorder.last_batch, 0)
+        outcome = self.recorder.write(batch)  # stejná dávka znovu
+        self.assertEqual((outcome.already_written, outcome.samples, outcome.changes), (False, 1, 1))
+
+    def test_sent_batch_is_sealed(self):
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        with mock.patch.object(history, "INSERT_EVENT_SQL", "INSERT INTO neexistuje VALUES (1)"):
+            self.assertRefused("write", self.recorder.write, batch)
+        # Po neúspěchu se dávka jen opakuje beze změny; nové výsledky patří do další dávky.
+        self.assertRefused("batch", self.recorder.add_results, batch, [result(CPU_USAGE_ID, State.INFO, 5.0, PERCENT)])
+        self.assertRefused("batch", self.recorder.add_event, batch, Event(BASE, "synced", "x", "INFO", "zpráva"))
+        self.recorder.write(batch)
+        self.assertRefused("batch", self.recorder.add_results, batch, [])
+
+    def test_foreign_batch_cannot_displace_open_batch(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.CRITICAL, 95.0, CELSIUS, ts=BASE + 10)])
+        # Ručně vytvořená dávka se stejným číslem by jinak otevřenou dávku tiše „nahradila“.
+        self.assertRefused("batch", self.recorder.write, history.Batch(batch.number))
+        outcome = self.recorder.write(batch)
+        self.assertEqual((outcome.already_written, outcome.changes), (False, 1))
+        self.assertEqual([row[2] for row in self.changes(CPU_TEMP_ID)], ["INFO", "CRITICAL"])
+
+    def test_guard_refuses_open_batch_out_of_order(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.WARNING, 75.0, CELSIUS, ts=BASE + 10)])
+        conn = self.database.connection
+        conn.execute("UPDATE run SET last_batch = 0 WHERE id = ?", (self.run_id,))  # cizí zásah do evidence
+        self.assertRefused("batch", self.recorder.write, batch)
+        self.assertEqual((len(self.samples()), len(self.changes(CPU_TEMP_ID))), (1, 1))
+        conn.execute("UPDATE run SET last_batch = 1 WHERE id = ?", (self.run_id,))
+        self.assertEqual(self.recorder.write(batch).samples, 1)  # zapečetěná dávka beze změny projde
+
+    def test_sealed_batch_changed_directly_is_refused(self):
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        real = self.database.connection
+        self.database.connection = FlakyCommit(real)
+        try:
+            self.assertRefused("write", self.recorder.write, batch)  # commit proběhl, volající to neví
+        finally:
+            self.database.connection = real
+        late = PendingSample(CPU_USAGE_ID, "", PERCENT, BASE + 10, "synced", 7.0)
+        batch.samples.append(late)  # obejde add_results: opakování by ho tiše zahodilo jako already_written
+        self.assertRefused("batch", self.recorder.write, batch)
+        batch.samples.remove(late)
+        self.assertTrue(self.recorder.write(batch).already_written)
+
+    def test_uncertain_commit_keeps_counters_of_committed_attempt(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        conn = self.database.connection
+        conn.execute("INSERT INTO sample (metric_id, ts, value) SELECT id, ?, 1.0 FROM metric", (BASE + 10,))
+        conn.execute("INSERT INTO metric (check_id, subject, unit, created_utc) VALUES (?, '', 'K', ?)", (MEMORY_ID, CREATED))
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 2.0, CELSIUS, ts=BASE + 10),
+                                          result(MEMORY_ID, State.INFO, 20.0, PERCENT, ts=BASE + 10)])
+        self.database.connection = FlakyCommit(conn)
+        try:
+            self.assertRefused("write", self.recorder.write, batch)
+        finally:
+            self.database.connection = conn
+        self.assertTrue(self.recorder.write(batch).already_written)
+        self.assertEqual((self.recorder.conflicts, self.recorder.rejected["unit_mismatch"]), (1, 1))
+        self.assertEqual(len(self.events("history.sample_conflict")), 1)
+        self.recorder.finish_run(at(BASE + 20))  # ztráta z potvrzeného pokusu se dostane do souhrnu
+        self.assertEqual(json.loads(self.events("history.rejected")[-1][3])["reasons"],
+                         {"unit_mismatch": {"count": 1, "from": BASE + 10, "to": BASE + 10}})
+
+    def test_unexpected_exception_rolls_back_transaction(self):
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.CRITICAL, 90.0, CELSIUS)])
+        with mock.patch.object(history.Change, "row", side_effect=KeyboardInterrupt):  # např. Ctrl+C uprostřed
+            with self.assertRaises(KeyboardInterrupt):
+                self.recorder.write(batch)
+        self.assertFalse(self.database.connection.in_transaction)  # zámek zápisu uvolněn, nic rozepsaného
+        self.assertEqual((self.samples(), self.changes(CPU_TEMP_ID)), ([], []))
+        self.assertEqual(self.recorder.write(batch).samples, 1)
+
+    def test_unexpected_exception_rolls_back_start_and_finish(self):
+        self.database.close()
+        self.database = history.open_writer(self.db, "test", HOST)
+        recorder = HistoryRecorder(self.database)
+        with mock.patch.object(history.Event, "row", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                recorder.start_run("test", 10, at(BASE + 100))
+        self.assertFalse(self.database.connection.in_transaction)
+        self.assertEqual(self.query("SELECT count(*), count(stopped_utc) FROM run"), [(1, 0)])  # nic nového ani uzavřeného
+        run_id = recorder.start_run("test", 10, at(BASE + 100))
+        with mock.patch.object(history.Event, "row", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                recorder.finish_run(at(BASE + 200))
+        self.assertFalse(self.database.connection.in_transaction)
+        self.assertIsNone(history.run_info(self.database.connection, run_id).stopped_utc)
+        self.assertTrue(recorder.finish_run(at(BASE + 200)))
+
+    def test_pending_batch_blocks_new_batch_and_finish(self):
+        self.recorder.begin_batch()
+        self.assertRefused("batch", self.recorder.begin_batch)
+        self.assertRefused("batch", self.recorder.finish_run, at(BASE))
+
+
+class LossSummaryTest(RecorderTest):
+    def summaries(self):
+        return [(ts, json.loads(data)) for ts, _, _, data in self.events("history.rejected")]
+
+    def test_first_loss_is_summarized_then_at_most_hourly(self):
+        cycle = [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE), result(CPU_USAGE_ID, State.INFO, 5.0, PERCENT,
+                                                                                   ts=BASE)]
+        self.write(cycle, [result(CPU_TEMP_ID, State.INFO, 51.0, CELSIUS, ts=BASE, cycle=BASE + 0.4)])  # same_second
+        self.write([result(CPU_TEMP_ID, State.INFO, 52.0, CELSIUS, ts=BASE + 10)], quality="unsynced")
+        self.assertEqual(self.summaries(), [(BASE, {"total": 1, "reasons": {
+            "same_second": {"count": 1, "from": BASE, "to": BASE}}})])
+        self.write([result(CPU_TEMP_ID, State.INFO, 53.0, CELSIUS, ts=BASE + 3610)])  # hodina od souhrnu
+        self.assertEqual(self.summaries()[1:], [(BASE + 3610, {"total": 1, "reasons": {"time_unsynced": {"count": 1}}})])
+        self.assertEqual(dict(self.recorder.rejected), {"same_second": 1, "time_unsynced": 1})
+
+    def test_remaining_loss_is_written_on_clean_stop(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE)])
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 10, simulated=True)])
+        self.write([result(CPU_TEMP_ID, State.INFO, 49.0, CELSIUS, ts=BASE - 5, cycle=BASE + 20)])  # clock_backward
+        self.assertEqual(len(self.summaries()), 1)  # druhá ztráta čeká na hodinový odstup
+        self.recorder.finish_run(at(BASE + 30))
+        self.assertEqual(self.summaries()[1:], [(BASE + 30, {"total": 1, "reasons": {
+            "clock_backward": {"count": 1, "from": BASE - 5, "to": BASE - 5}}})])
+        self.assertEqual(self.summaries()[0][1], {"total": 1, "reasons": {"simulated": {"count": 1}}})
+
+    def test_resubmitted_measurement_is_not_counted_twice(self):
+        unsynced = [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS), result("custom.metric", State.INFO, 1.0, "x")]
+        simulated = [result(CPU_USAGE_ID, State.INFO, 5.0, PERCENT, ts=BASE + 10, simulated=True)]
+        self.write(unsynced, unsynced, quality="unsynced")  # totéž měření odeslané dvakrát
+        self.write(simulated, simulated)
+        self.assertEqual(dict(self.recorder.rejected), {"time_unsynced": 1, "unknown_series": 1, "simulated": 1})
+        self.assertEqual(self.recorder.duplicates, 3)
+        self.assertEqual(len(self.changes(CPU_TEMP_ID)), 1)
+
+    def test_rollback_keeps_summary_for_retry(self):
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)], "unsynced")
+        with mock.patch.object(history, "INSERT_EVENT_SQL", "INSERT INTO neexistuje VALUES (1)"):
+            self.assertRefused("write", self.recorder.write, batch)
+        self.assertEqual(self.summaries(), [])
+        self.recorder.write(batch)
+        self.assertEqual(self.summaries(), [(BASE, {"total": 1, "reasons": {"time_unsynced": {"count": 1}}})])
+        self.recorder.finish_run(at(BASE + 10))
+        self.assertEqual(len(self.summaries()), 1)  # nic se nezapočetlo dvakrát
+
+    def test_simulated_result_does_not_move_summary_clock(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS),
+                    result(CPU_TEMP_ID, State.INFO, 51.0, CELSIUS, cycle=BASE + 0.4)])  # same_second: první souhrn
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 10, cycle=BASE + 10_000, simulated=True)])
+        self.assertEqual(len(self.summaries()), 1)  # monotónní čas simulace hodinový odstup neurychlí
+
+    def test_summary_survives_failed_write_exactly_once(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=1_799_990_000)])  # late
+        self.assertEqual(len(self.summaries()), 1)
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=1_799_990_010)], quality="derived")
+        batch = self.recorder.begin_batch()
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=1_799_990_020,
+                                                 cycle=BASE + 3600)])
+        real = self.database.connection
+        self.database.connection = FlakyCommit(real)
+        try:
+            self.assertRefused("write", self.recorder.write, batch)
+        finally:
+            self.database.connection = real
+        self.assertTrue(self.recorder.write(batch).already_written)
+        self.assertEqual([data["reasons"]["late"]["count"] for _, data in self.summaries()], [1, 2])
+        self.recorder.finish_run(at(BASE + 3700))
+        self.assertEqual(len(self.summaries()), 2)  # nic dalšího k souhrnu, nic se nezdvojilo
+
+
+class TimeAndRestartTest(RecorderTest):
+    def test_restart_after_unclean_shutdown(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE)])
+        self.database.close()  # konec bez finish_run, jako pád procesu
+        self.database = history.open_writer(self.db, "test", HOST)
+        recorder = HistoryRecorder(self.database)
+        second = recorder.start_run("test", 10, at(BASE + 100))
+        first = history.run_info(self.database.connection, self.run_id)
+        self.assertEqual((first.stopped_utc, first.clean_stop, first.last_batch), (BASE, 0, 1))
+        self.assertEqual(recorder.high_water, BASE)
+        self.assertEqual(json.loads(self.events("process.unclean_stop")[0][3])["run_id"], self.run_id)
+        gap = json.loads(self.events("history.unknown_gap")[0][3])
+        self.assertEqual((gap["after"], gap["until"]), (BASE, BASE + 100))
+        batch = recorder.begin_batch()
+        recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 51.0, CELSIUS, ts=BASE, cycle=900.0)])
+        recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 52.0, CELSIUS, ts=BASE + 110, cycle=910.0)])
+        recorder.write(batch)
+        self.assertEqual(recorder.rejected["before_high_water"], 1)
+        self.assertEqual(self.samples(CPU_TEMP_ID), [(CPU_TEMP_ID, "", BASE, 50.0), (CPU_TEMP_ID, "", BASE + 110, 52.0)])
+        self.assertEqual(self.query("SELECT run_id, from_state FROM check_change ORDER BY id"),
+                         [(self.run_id, None), (second, None)])  # nový běh = nový výchozí řádek
+        self.assertTrue(recorder.finish_run(at(BASE + 120)))
+        self.assertFalse(recorder.finish_run(at(BASE + 130)))  # opakované ukončení nic nezdvojí
+        info = history.run_info(self.database.connection, second)
+        self.assertEqual((info.stopped_utc, info.clean_stop), (BASE + 120, 1))
+        self.assertEqual(len(self.events("process.stop")), 1)
+        self.assertRefused("run", recorder.begin_batch)
+
+    def test_run_without_samples_leaves_gap_from_its_start(self):
+        self.database.close()
+        self.database = history.open_writer(self.db, "test", HOST)
+        HistoryRecorder(self.database).start_run("test", 10, at(BASE + 50))
+        gap = json.loads(self.events("history.unknown_gap")[0][3])
+        self.assertEqual((gap["after"], gap["until"]), (BASE - 60, BASE + 50))
+
+    def test_gap_after_unsynced_start_has_no_utc_start(self):
+        self.database.close()  # setUp: běh bez vzorků se synchronizovaným startem
+        self.database = history.open_writer(self.db, "test", HOST)
+        HistoryRecorder(self.database).start_run("test", 10, at(BASE + 50), ts_quality="unsynced")
+        self.database.close()  # i druhý běh bez vzorků, start s nedůvěryhodným časem
+        self.database = history.open_writer(self.db, "test", HOST)
+        HistoryRecorder(self.database).start_run("test", 10, at(BASE + 500))
+        gaps = [json.loads(row[3]) for row in self.events("history.unknown_gap")]
+        self.assertEqual([(gap["after"], gap["until"]) for gap in gaps], [(BASE - 60, None), (None, BASE + 500)])
+
+    def test_time_before_trusted_bound_is_never_marked_synced(self):
+        self.database.close()
+        self.database = history.open_writer(self.db, "test", HOST)
+        recorder = HistoryRecorder(self.database)
+        recorder.start_run("test", 10, at(1_700_000_000))  # hodiny RPi bez RTC, volající tvrdí synced
+        recorder.finish_run(at(1_700_000_100), ts_quality="derived")
+        self.assertEqual(self.query("SELECT kind, ts_quality FROM event WHERE ts < ? ORDER BY id", (history.MIN_TRUSTED_UTC,)),
+                         [("process.unclean_stop", "unsynced"), ("history.unknown_gap", "unsynced"),
+                          ("process.start", "unsynced"), ("process.stop", "unsynced")])
+        for quality in ("synced", "derived"):
+            with self.subTest(quality=quality), self.assertRaises(ValueError):
+                Event(1_700_000_000, quality, "x", "INFO", "zpráva")
+        Event(1_700_000_000, "unsynced", "x", "INFO", "zpráva")
+
+    def test_unsynced_start_does_not_invent_gap_end(self):
+        self.database.close()
+        self.database = history.open_writer(self.db, "test", HOST)
+        HistoryRecorder(self.database).start_run("test", 10, at(BASE + 50), ts_quality="unsynced")
+        rows = self.query("SELECT ts_quality, data FROM event WHERE kind = 'history.unknown_gap'")
+        self.assertEqual([(quality, json.loads(data)["after"], json.loads(data)["until"]) for quality, data in rows],
+                         [("unsynced", BASE - 60, None)])
+
+    def test_clock_step_back_rejects_older_samples_without_overwrite(self):
+        for k in range(11):
+            self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 10 * k, cycle=1000 + 10 * k)])
+        for k in range(11, 21):  # hodiny o 3605 s zpět, monotónní čas běží dál
+            self.write([result(CPU_TEMP_ID, State.INFO, 60.0, CELSIUS, ts=BASE + 10 * k - 3605, cycle=1000 + 10 * k)])
+        self.assertEqual(self.recorder.rejected["clock_backward"], 10)
+        self.assertEqual([row[3] for row in self.samples(CPU_TEMP_ID)], [50.0] * 11)
+        jumps = self.events("clock.jump")
+        self.assertEqual((len(jumps), json.loads(jumps[0][3])["shift_s"]), (1, -3605.0))
+
+    def test_time_quality_controls_samples_not_changes(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE)], quality="derived")
+        self.write([result(CPU_TEMP_ID, State.WARNING, 75.0, CELSIUS, ts=BASE + 10)], quality="unsynced")
+        self.write([result(CPU_TEMP_ID, State.ERROR, 85.0, CELSIUS, ts=1_700_000_000, cycle=BASE + 20)])  # před 2026: nedůvěryhodné
+        self.assertEqual(self.samples(CPU_TEMP_ID), [(CPU_TEMP_ID, "", BASE, 50.0)])
+        self.assertEqual(self.recorder.rejected["time_unsynced"], 2)
+        self.assertEqual(self.query("SELECT to_state, ts_quality FROM check_change ORDER BY id"),
+                         [("INFO", "derived"), ("WARNING", "unsynced"), ("ERROR", "unsynced")])
+        batch = self.recorder.begin_batch()
+        with self.assertRaises(ValueError):
+            self.recorder.add_results(batch, [], "guess")
+
+    def test_gate_matches_benchmark_time_rules(self):
+        # Shoda s modelem TimeRules z benchmarku M2, rozhodnutí po rozhodnutí (synchronizovaný čas).
+        module = benchmark()
+        base = 1_800_000_000
+
+        def decide(rules, gate, mono, utc):
+            before = (dict(rules.rejected), rules.duplicates, len(rules.accepted))
+            rules.measure("cpu", mono, utc, True)
+            if rules.duplicates != before[1]:
+                expected = "duplicate"
+            elif len(rules.accepted) != before[2]:
+                expected = None
+            else:
+                expected = next(reason for reason, count in rules.rejected.items() if count != before[0].get(reason, 0))
+            return expected, gate.accept("cpu", math.floor(utc), mono)
+
+        steps = [(10.0 * k, base + 10 * k) for k in range(11)]
+        steps += [(10.0 * k, base + 10 * k - 3605) for k in range(11, 391)]  # hodiny zpět, monotonní dál
+        steps += [(3910.35, base + 3900 - 3605 + 0.35),  # jiné měření v téže sekundě
+                  (3900.0, base + 3900 - 3605)]  # totéž měření znovu
+        rules, gate = module.TimeRules(), history.SampleGate(None, 0)
+        pairs = [decide(rules, gate, mono, utc) for mono, utc in steps]
+        rules, gate = module.TimeRules(high_water=base + 50), history.SampleGate(base + 50, 0)
+        pairs += [decide(rules, gate, 10.0 * k, base + 10 * k) for k in range(11)]  # po restartu
+        self.assertEqual([actual for _, actual in pairs], [expected for expected, _ in pairs])
+        seen = {expected for expected, _ in pairs}
+        self.assertEqual(seen, {None, "duplicate", "same_second", "clock_backward", "before_high_water"})
+
+
+class HighWaterTest(TempDirTest):
+    """Horní mez = nejnovější vzorek, který běh skutečně vložil (run.last_write_utc), i po restartu."""
+
+    def cycle(self, recorder, results, quality="synced"):
+        batch = recorder.begin_batch()
+        recorder.add_results(batch, results, quality)
+        return recorder.write(batch)
+
+    def all_valid(self, recorder, conn):
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS), result(CPU_USAGE_ID, State.INFO, 0.0, PERCENT)])
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 51.0, CELSIUS, ts=BASE + 10)])
+
+    def all_rejected(self, recorder, conn):
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE)], quality="unsynced")
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 320.0, "K", ts=BASE + 10)])
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 20, simulated=True)])
+
+    def mixed(self, recorder, conn):
+        batch = recorder.begin_batch()
+        recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 10)])
+        recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 52.0, CELSIUS, ts=BASE + 20)], "unsynced")
+        recorder.add_results(batch, [result(CPU_USAGE_ID, State.INFO, 5.0, "x", ts=BASE + 30)])
+        recorder.write(batch)
+
+    def conflict(self, recorder, conn):
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        # Cizí zápis mimo zapisovač (obnova, ruční zásah): pro BASE + 50 už je jiná hodnota.
+        conn.execute("INSERT INTO sample (metric_id, ts, value) SELECT id, ?, 1.0 FROM metric", (BASE + 50,))
+        outcome = self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 2.0, CELSIUS, ts=BASE + 50)])
+        self.assertEqual(len(outcome.conflicts), 1)
+
+    def same_second(self, recorder, conn):
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 51.0, CELSIUS, cycle=BASE + 0.6)])
+        self.assertEqual(recorder.rejected["same_second"], 1)
+
+    def unit_mismatch(self, recorder, conn):
+        # Řada z jiné verze katalogu (jednotka K) + výsledek s jinou jednotkou než katalog.
+        conn.execute("INSERT INTO metric (check_id, subject, unit, created_utc) VALUES (?, '', 'K', ?)", (CPU_TEMP_ID, CREATED))
+        self.cycle(recorder, [result(CPU_USAGE_ID, State.INFO, 5.0, PERCENT)])
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 50)])
+        self.cycle(recorder, [result(CPU_USAGE_ID, State.INFO, 6.0, "x", ts=BASE + 60)])
+        self.assertEqual(recorder.rejected["unit_mismatch"], 2)
+
+    def untrusted_utc(self, recorder, conn):
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 51.0, CELSIUS, ts=BASE + 10)], quality="unsynced")
+        self.cycle(recorder, [result(CPU_TEMP_ID, State.INFO, 52.0, CELSIUS, ts=1_700_000_000, cycle=BASE + 20)])
+        self.assertEqual(recorder.rejected["time_unsynced"], 2)
+
+    def replayed(self, recorder, conn):
+        batch = recorder.begin_batch()
+        recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS)])
+        recorder.write(batch)
+        self.assertTrue(recorder.write(batch).already_written)
+        batch = recorder.begin_batch()
+        recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 51.0, CELSIUS, ts=BASE + 10)])
+        real = recorder.database.connection
+        recorder.database.connection = FlakyCommit(real)
+        try:
+            self.assertRefused("write", recorder.write, batch)
+        finally:
+            recorder.database.connection = real
+        self.assertTrue(recorder.write(batch).already_written)
+
+    def test_high_water_is_newest_inserted_sample_even_after_restart(self):
+        cases = {"all_valid": BASE + 10, "all_rejected": None, "mixed": BASE + 10, "conflict": BASE,
+                 "same_second": BASE, "unit_mismatch": BASE, "untrusted_utc": BASE, "replayed": BASE + 10}
+        for name, expected in cases.items():
+            with self.subTest(case=name):
+                path = self.create(self.folder / f"{name}.sqlite3")
+                with history.open_writer(path, "test", HOST) as database:
+                    recorder = HistoryRecorder(database)
+                    run_id = recorder.start_run("test", 10, at(BASE - 60))
+                    getattr(self, name)(recorder, database.connection)
+                    self.assertEqual(history.run_info(database.connection, run_id).last_write_utc, expected)
+                # Restart po nečistém ukončení: mez nového běhu a hranice mezery z téhož údaje.
+                with history.open_writer(path, "test", HOST) as database:
+                    recorder = HistoryRecorder(database)
+                    recorder.start_run("test", 10, at(BASE + 1000))
+                    self.assertEqual(recorder.high_water, expected)
+                    stopped = history.run_info(database.connection, run_id).stopped_utc
+                    self.assertEqual(stopped, BASE - 60 if expected is None else expected)
+                    probe = BASE - 30 if expected is None else expected
+                    batch = recorder.begin_batch()
+                    recorder.add_results(batch, [result(MEMORY_ID, State.INFO, 20.0, PERCENT, ts=probe, cycle=10.0)])
+                    recorder.add_results(batch, [result(MEMORY_ID, State.INFO, 21.0, PERCENT, ts=probe + 1, cycle=11.0)])
+                    self.assertEqual(recorder.write(batch).samples, 1 if expected is not None else 2)
+                    self.assertEqual(recorder.rejected["before_high_water"], 0 if expected is None else 1)
 
 
 class HelpersTest(unittest.TestCase):
