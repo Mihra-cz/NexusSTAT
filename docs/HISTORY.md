@@ -591,6 +591,18 @@ WHERE ts - previous_ts > :max_step;
 - Když agregace stojí, surová data se nemažou a rostou. `history.storage` hlásí `WARNING`, jakmile existuje surový vzorek starší než 31 dní; dál chrání limit volného místa (5.3).
 - Smazané stránky SQLite znovu použije; velikost po pravidelné retenci zůstává stejná (10.6).
 
+**Implementace (M3.2b, lokálně, 11.3):**
+
+- **Hranice přesně podle tabulky výše, mazání vždy `<`:** řádek přesně na hranici zůstává. `agg_5m` i `agg_1h` mažou jen celé hodiny (hranice dolů na hodinu), takže se nikdy nesmaže hodina, jejíž část je mladší než doba uchování. „10 let“ = 10 kalendářních let v UTC (29. února → 28. února), tedy aspoň celých 10 let. Doby uchování jsou konstanty kódu; žádný parametr API je nezkrátí.
+- **Autoritou je `done_until`, ne existence řádků:** vzorek se smaže jen pod `done_until '5m'`, 5min okno jen pod `done_until '1h'`. Navíc transakce těsně před mazáním ověří invarianty `retention-check-sample` a `retention-check-5m` (každé mazané okno vzorků má 5min agregaci s aspoň tolika vzorky, každá mazaná hodina oken hodinovou agregaci); při rozporu se tabulka v běhu zastaví (`aggregation_mismatch`) a nesmaže nic. `done_until '1h'` > `done_until '5m'` je porušená evidence (`aggregation_state_invalid`). Retence `aggregation_state` nikdy nemění.
+- **Krok:** jedna transakce smaže nejvýš hodinu historie jedné tabulky (od hodiny nejstaršího řádku); běh má nejvýš 24 mazacích transakcí a tabulky se v něm střídají, takže dluh jedné tabulky nezablokuje ostatní. Dohánění po výpadku je postupné.
+- **Pořadí v transakci:** `BEGIN IMMEDIATE` → kontrola času → `done_until` a hranice → invariant → počet kandidátů → `DELETE` → `rowcount` se musí rovnat počtu (jinak `ROLLBACK`, žádné falešné potvrzení) → trvalá hranice `retained_since.<tabulka>` v `meta` → `COMMIT`. Chyba SQLite i jiná výjimka vrátí celou transakci. Po chybě `COMMIT` se stav ověří (pod hranicí nic nezbylo a hranice je zapsaná), ne slepě opakuje.
+- **`retained_since.<tabulka>`** (klíč `meta`, schváleno 2026-10-21, schéma beze změny) je začátek zachované historie: horní mez posledního mazacího kroku, mění se jen v jeho transakci (při `ROLLBACK` ne) a nikdy neklesá. Řádky s časem před ní retence smazala, od ní nesmazala nic; žádný řádek tabulky pod ní nezůstane. **Neříká, že data od ní jsou souvislá:** chybějící měření, neběžící proces nebo odmítnuté vzorky zůstávají legitimními mezerami (dotaz `gaps`). Hranice může ležet pod skutečnou retenční hranicí, když pod tou už žádné řádky nebyly. Každá tabulka má vlastní hranici.
+- **Plán bez zápisu:** `retention_plan()` počítá hranice, kandidáty, omezení agregací, invariant dalšího kroku a důvod blokace v jedné čtecí transakci ukončené `ROLLBACK`, i nad spojením jen pro čtení. Provedení plánu nevěří: plán je jen horní mez a vše se ověří znovu.
+- **Čas (`ClockState`, kontrakt s M3.3):** maže se jen při `synced` a doložené stabilitě hodin `stable_s` ≥ 24 h (monotónní doba souvislé synchronizace bez skoku; `None` = neznámo) a s časem po 2026-01-01. V transakci se navíc ověří databáze: žádná `clock.jump` za posledních 24 h (i z předchozích běhů a i „z budoucnosti“) a žádná zapsaná data novější než `now`. Jinak se nesmaže nic (`time_unsynced`, `clock_unstable`, `clock_jump_recent`, `clock_behind_data`). Ruční `ClockState` v testech je simulace, ne důkaz synchronizace; skutečný zdroj dodá M3.3.
+- **Objem přechodů:** hodinový krok stačí i pro kmitání. Změřeno na notebooku: hodina se 7 200 přechody (20 kontrol po 10 s) se smaže za 12 ms, teoretické maximum 72 000 přechodů za hodinu (20 kontrol po 1 s) za nejvýš 157 ms s WAL do 4,8 MB; omezení počtu řádků proto není potřeba (ověřit na Raspberry Pi, M7).
+- **Vzorky, WAL a velikost** (notebook, 20 řad po 10 s, 32 dní): transakce s hodinou (7 200 řádků) medián 23 ms, nejvýš 53 ms; WAL nejvýš 4,2 MB; soubor se nezmenší (87 MB), volné stránky (5,1 MB po 2 dnech) další zápis znovu použije, soubor neroste. `VACUUM` ani nové indexy nejsou potřeba.
+
 <!-- sql:oldest-sample -->
 ```sql
 SELECT ts FROM sample ORDER BY ts LIMIT 1;
@@ -613,6 +625,71 @@ DELETE FROM agg_5m
 WHERE metric_id IN (SELECT id FROM metric) AND bucket < :cutoff;
 ```
 
+Doplněno v M3.2b (stejný tvar jako bloky výše):
+
+<!-- sql:oldest-1h -->
+```sql
+SELECT min((SELECT min(bucket) FROM agg_1h WHERE agg_1h.metric_id = metric.id)) FROM metric;
+```
+
+<!-- sql:retention-1h -->
+```sql
+DELETE FROM agg_1h
+WHERE metric_id IN (SELECT id FROM metric) AND bucket < :cutoff;
+```
+
+<!-- sql:oldest-change -->
+```sql
+SELECT ts FROM check_change ORDER BY ts LIMIT 1;
+```
+
+<!-- sql:retention-change -->
+```sql
+DELETE FROM check_change
+WHERE ts < :cutoff;
+```
+
+<!-- sql:oldest-event -->
+```sql
+SELECT ts FROM event ORDER BY ts LIMIT 1;
+```
+
+<!-- sql:retention-event -->
+```sql
+DELETE FROM event
+WHERE ts < :cutoff;
+```
+
+Invarianty, které provedení ověří ve své transakci těsně před mazáním (nespoléhá jen na `done_until`):
+
+<!-- sql:retention-check-sample -->
+```sql
+-- Invariant před mazáním vzorků: okna se vzorky před :cutoff bez 5min agregace, která
+-- zahrnuje aspoň tolik vzorků. Výsledek 0 = vzorky jsou v agregacích, smí se mazat.
+SELECT count(*) FROM (
+    SELECT metric_id, ts - ts % 300 AS bucket, count(*) AS n
+    FROM sample
+    WHERE metric_id IN (SELECT id FROM metric) AND ts < :cutoff
+    GROUP BY metric_id, ts - ts % 300
+) raw
+LEFT JOIN agg_5m a ON a.metric_id = raw.metric_id AND a.bucket = raw.bucket
+WHERE a.n_samples IS NULL OR a.n_samples < raw.n;
+```
+
+<!-- sql:retention-check-5m -->
+```sql
+-- Invariant před mazáním 5min agregací: hodiny s okny před :cutoff bez hodinové agregace,
+-- která zahrnuje aspoň tolik vzorků. Výsledek 0 = okna jsou v agg_1h, smí se mazat.
+SELECT count(*) FROM (
+    SELECT metric_id, bucket - bucket % 3600 AS hour, sum(n_samples) AS n
+    FROM agg_5m
+    WHERE metric_id IN (SELECT id FROM metric) AND bucket < :cutoff
+    GROUP BY metric_id, bucket - bucket % 3600
+) five
+LEFT JOIN agg_1h h ON h.metric_id = five.metric_id AND h.bucket = five.hour
+WHERE h.n_samples IS NULL OR h.n_samples < five.n;
+```
+
 ### 7.1 Změny stavu a provozních údajů (R4, schváleno 2026-10-20)
 
 Do `check_change` se zapíše **každá skutečná změna** a nic se neslučuje:
@@ -623,6 +700,7 @@ Do `check_change` se zapíše **každá skutečná změna** a nic se neslučuje:
 - Pořadí přechodů ve stejné sekundě drží `id` (vložení v pořadí měření), takže se dva různé přechody v jedné sekundě uloží oba. Délka epizody má rozlišení 1 s; epizoda kratší než sekunda má délku 0.
 - `details` smí obsahovat jen provozně významné údaje (3.4). Nepodstatné rychle se měnící údaje do nich ani do porovnání změn nepatří, a proto žádné slučování není potřeba.
 - Duplicitám a přepisu brání dávka (4.1, 5.2): `batch-guard` odmítne opakovanou dávku po nejistém commitu, neúspěšná transakce nezanechá nic a opakovaný zápis po ní uloží každý přechod právě jednou.
+- **Po retenci (M3.2b, princip schválen 2026-10-21):** začátek epizody, kterou retence (nebo začátek rozsahu `:start`) usekla, se nedomýšlí: `state-episodes` i `details-episodes` ji vrátí s `start_ts = NULL`. Poznají to podle prvního zachovaného řádku běhu bez výchozího řádku (`from_state` není `NULL`). U stavu je `from_state` stav až do první zachované změny (`end_ts`; `NULL` = změna nenastala, stav trvá); u provozních údajů je známá jen hodnota na prvním zachovaném řádku a dál, předchozí hodnota ne. Kde stav ani údaje rekonstruovat nejde, přizná to dotaz `retention-unknown` (úsek od hranice do prvního zachovaného řádku běhu, `state_before` = známý stav, nebo `NULL`). Začátek zachované historie říká `retained_since.check_change` v `meta` (ne souvislost dat); počty `transition-rate` a `transitions-window` před ní nejsou úplné.
 - Z historie se dopočítá vznik, konec a délka každé epizody stavu (`state-episodes`) nebo údaje (`details-episodes`), počet a četnost přechodů po oknech (`transition-rate`) a počet přechodů za posledních N sekund v okamžiku každého přechodu (`transitions-window`, vstup budoucího detektoru kmitání, 7.2). Epizoda, kterou přeruší konec běhu procesu, má konec `NULL` (neznámý); epizoda trvající už při startu běhu je označená.
 - Omezení notifikací (RGB, web, zprávy) bude samostatné pravidlo nad aktuálním stavem a historii nikdy neomezuje.
 - Velikost: retence 2 roky beze změny. Trvalé kmitání (přechod při každém měření po 10 s) zabírá podle měření v 10.7 asi 0,85–0,97 MB denně na kontrolu, za 2 roky 0,62–0,71 GB; platí pro předpoklady uvedené v 10.7. `history.storage` hlásí `WARNING`, když jedna kontrola zapíše víc než 1 000 řádků za 24 h; ukládání se tím neomezuje. Při trvalém kmitání se navíc každá dávka zapisuje do 10 s (změny se zapisují v dalším cyklu, 5.2), takže zápis surových vzorků stoupne z 35 na asi 88 MB/den (10.2).
@@ -650,6 +728,9 @@ VALUES (:ts, :ts_quality, :run_id, :check_id, :from_state, :to_state, :value, :u
 -- Epizody stavu :state jedné kontroly: začátek, konec a délka v sekundách.
 -- end_ts NULL = epizoda trvá, nebo ji přerušil konec běhu procesu či rozsahu (konec neznámý).
 -- start_at_run_begin 1 = stav trval už při startu běhu (skutečný začátek neznámý).
+-- start_ts NULL = stav trval už před prvním zachovaným řádkem běhu (bez výchozího řádku): jeho
+-- začátek smazala retence nebo leží před :start (M3.2b). Začátek se nedomýšlí; end_ts je první
+-- zachovaná změna stavu, nebo NULL, když žádná nenastala (stav trvá, konec neznámý).
 WITH state_rows AS (
     SELECT id, ts, run_id, from_state, to_state
     FROM check_change
@@ -657,30 +738,68 @@ WITH state_rows AS (
 ), ordered AS (
     SELECT ts, from_state, to_state, lead(ts) OVER (PARTITION BY run_id ORDER BY ts, id) AS next_ts
     FROM state_rows
+), first_rows AS (
+    SELECT run_id, ts, from_state, row_number() OVER (PARTITION BY run_id ORDER BY ts, id) AS position
+    FROM check_change
+    WHERE check_id = :check_id AND ts >= :start AND ts < :end
 )
-SELECT ts AS start_ts, next_ts AS end_ts, next_ts - ts AS duration_s, from_state IS NULL AS start_at_run_begin
-FROM ordered
-WHERE to_state = :state
-ORDER BY ts;
+SELECT start_ts, end_ts, duration_s, start_at_run_begin FROM (
+    SELECT ts AS start_ts, next_ts AS end_ts, next_ts - ts AS duration_s,
+           from_state IS NULL AS start_at_run_begin, ts AS sort_ts
+    FROM ordered
+    WHERE to_state = :state
+    UNION ALL
+    SELECT NULL, (SELECT min(ts) FROM state_rows WHERE state_rows.run_id = first_rows.run_id), NULL, 0, ts
+    FROM first_rows
+    WHERE position = 1 AND from_state = :state
+)
+ORDER BY sort_ts, start_ts IS NOT NULL;
 ```
 
 <!-- sql:details-episodes -->
 ```sql
 -- Epizody hodnoty údaje :key = :value (např. link = DOWN) jedné kontroly; sloupce jako state-episodes.
+-- start_ts NULL = hodnota platila už na prvním zachovaném řádku běhu bez výchozího řádku:
+-- její začátek smazala retence nebo leží před :start (M3.2b). Začátek se nedomýšlí.
 WITH marked AS (
     SELECT id, ts, run_id, from_state, json_extract(details, '$.' || :key) AS current,
-           lag(json_extract(details, '$.' || :key)) OVER (PARTITION BY run_id ORDER BY ts, id) AS previous
+           lag(json_extract(details, '$.' || :key)) OVER (PARTITION BY run_id ORDER BY ts, id) AS previous,
+           row_number() OVER (PARTITION BY run_id ORDER BY ts, id) AS position
     FROM check_change
     WHERE check_id = :check_id AND ts >= :start AND ts < :end
 ), ordered AS (
-    SELECT ts, from_state, current, lead(ts) OVER (PARTITION BY run_id ORDER BY ts, id) AS next_ts
+    SELECT ts, from_state, current, position = 1 AND from_state IS NOT NULL AS cut,
+           lead(ts) OVER (PARTITION BY run_id ORDER BY ts, id) AS next_ts
     FROM marked
-    WHERE from_state IS NULL OR current IS NOT previous
+    WHERE from_state IS NULL OR position = 1 OR current IS NOT previous
 )
-SELECT ts AS start_ts, next_ts AS end_ts, next_ts - ts AS duration_s, from_state IS NULL AS start_at_run_begin
+SELECT CASE WHEN cut THEN NULL ELSE ts END AS start_ts, next_ts AS end_ts,
+       CASE WHEN cut THEN NULL ELSE next_ts - ts END AS duration_s, from_state IS NULL AS start_at_run_begin
 FROM ordered
 WHERE current = :value
 ORDER BY ts;
+```
+
+Po retenci (M3.2b) přizná neúplnou historii samostatný dotaz. Pro běhy, které trvaly přes hranici `:retained` (hodnota `retained_since.check_change` z `meta`), vrátí úsek od hranice do prvního zachovaného řádku kontroly v běhu (`unknown_until`; `NULL` = žádný řádek, úsek trvá do konce běhu nebo dosud). `state_before` je stav na úseku, je-li znám (`from_state` prvního zachovaného řádku: mezi hranicí a ním žádná změna nenastala); `NULL` = stav neznámý. Provozní údaje (`details`) na úseku známé nejsou nikdy, protože řádek nenese jejich předchozí hodnotu. Běh, jehož první zachovaný řádek je výchozí (kontrola začala hlásit až po hranici), úsek nemá.
+
+<!-- sql:retention-unknown -->
+```sql
+-- Úseky běhů s neúplnou historií kontroly po retenci (viz text výše).
+WITH spanning AS (
+    SELECT id, stopped_utc FROM run
+    WHERE started_utc < :retained AND (stopped_utc IS NULL OR stopped_utc > :retained) AND started_utc < :end
+), first_rows AS (
+    SELECT run_id, ts, from_state, row_number() OVER (PARTITION BY run_id ORDER BY ts, id) AS position
+    FROM check_change
+    WHERE check_id = :check_id AND ts >= :retained AND run_id IN (SELECT id FROM spanning)
+)
+SELECT spanning.id AS run_id, :retained AS unknown_from,
+       coalesce(first_rows.ts, CASE WHEN spanning.stopped_utc < :end THEN spanning.stopped_utc END) AS unknown_until,
+       first_rows.from_state AS state_before
+FROM spanning
+LEFT JOIN first_rows ON first_rows.run_id = spanning.id AND first_rows.position = 1
+WHERE first_rows.run_id IS NULL OR first_rows.from_state IS NOT NULL
+ORDER BY spanning.id;
 ```
 
 <!-- sql:transition-rate -->
@@ -947,11 +1066,11 @@ Vše jen na notebooku, nad dočasnými databázemi v testech; žádná cesta Nex
 | M3.1a Základ databáze (**implementováno lokálně 2026-10-20**) | `history.py`: vytvoření nové databáze `test`/`development` na výslovné cestě (bez vytváření adresáře, bez přepsání souboru a jeho `-wal`/`-shm`/`-journal`, stavba v dočasném souboru a zveřejnění `os.link`), otevření pro zápis (kontrola hlavičky bez SQLite, zámek `flock` na `<jméno>.lock`, `mode=rw`, ověření `application_id`, `user_version`, otisku schématu, role a stroje, nastavení spojení podle 5.7, `quick_check`), otevření jen pro čtení (`mode=ro`, `query_only`, `NO_CKPT_ON_CLOSE`), kontrola verze SQLite ≥ 3.38 | `src/nexusstat/history.py`, `tests/test_history.py` | 51 testů: shoda `SCHEMA_SQL` a nastavení s dokumentací, pády v odděleném procesu (uprostřed inicializace, po zveřejnění, nečisté ukončení zapisovače s daty ve WAL, novější schéma jen ve WAL), pořadí `fsync`, samostatná použitelnost souboru, schéma vytvořené souboru = schéma z DDL dokumentace, cizí, prázdný, novější, starší a upravený soubor, role, stroj, chybějící adresář, přepis, zbylé `-wal`, nepovedené vytvoření, druhý zapisovač v témže i jiném procesu, čtenář bez zápisu a checkpointu, poškozená kopie; 14 kontrolních mutací odhaleno |
 | M3.1b Zápis (**implementováno lokálně 2026-10-20**, 11.1) | katalog řad, pravidla přijetí (4.1) včetně rozlišení duplicity, kolize a konfliktu, kvalita času (4.3) jako vstup API, dávka s `batch-guard`, změny stavu a provozních údajů podle R4 (7.1), horní mez, uzavření nečistých běhů s `history.unknown_gap`, odmítnutí simulovaných dat, záznam ztrát (5.4) | `src/nexusstat/history.py`, `tests/test_history.py` | 49 nových testů (100 v modulu): nula vs. `UNKNOWN` vs. chybějící měření vs. `N/A`; simulovaná data; neznámá řada a jednotka i jednotka uložené řady; neplatné číslo; RX/TX podle rozhraní; každý přechod včetně `UNKNOWN` a linky při `INFO`; kmitání INFO ↔ CRITICAL (scénář A, 181 řádků, 90 epizod přes `state-episodes`) shodné s `ChangeRules`; dvě změny v jedné sekundě; opakovaná dávka, nejistý commit, vynechané číslo, konflikt, rollback uprostřed; restart, nečisté ukončení, horní mez, posun času zpět, kvalita času; pravidla přijetí shodná s `TimeRules` rozhodnutí po rozhodnutí; horní mez po restartu pro platnou, odmítnutou, smíšenou a opakovanou dávku, konflikt, `same_second`, jednotku a nedůvěryhodný čas; 49 kontrolních mutací odhaleno |
 | M3.2a Agregace (**implementováno lokálně 2026-10-21**, 11.2) | uzavření okna (6.1) s kontraktem fronty `QueueState`, agregace s `progress-*` bez přepisu, konflikt s dokladem a zastavením, pozdní vzorky a posun `SampleGate` | `src/nexusstat/history.py`, `tests/test_history.py` | 35 nových testů (135 v modulu): jedno okno, sousední okna, hodina z 12 oken, nula, `UNKNOWN`, okno jen s `UNKNOWN`, prázdné a neúplné okno, hranice na sekundě, rezerva 120 s i 119 s, neznámá fronta, čekající vzorek, otevřená dávka, nesynchronizovaný čas, posun hodin zpět i dopředu, opakování, konflikt 5 min i 1 h, pád před `COMMIT` v odděleném procesu, selhání uprostřed vkládání, přerušení, restart, `SampleGate`, pozdní vzorek; shoda s přímým výpočtem i se smyčkou zapisovače benchmarku M2; podmínka 4 při posledním vzorku uprostřed i na hranici okna, zastaveném měření, obnově po hodině i po dnech, restartu během výpadku, skoku hodin dopředu a návratu, frontě a hodině bez nových dat; doklad konfliktu i jeho selhání; kontrolní mutace v 13.6 |
-| M3.2b Retence (**neimplementováno**, samostatné schválení) | retence po dávkách s hranicí podle hotové agregace a limitem dne za běh (7), pozastavení po `clock.jump` | `history.py`, `tests/test_history.py` | retence nesmaže neagregovaná data; hranice přesně na sekundě; limit transakcí za běh |
+| M3.2b Retence (**implementováno lokálně 2026-10-21**, 11.3) | plán bez zápisu a provedení po hodinových transakcích (nejvýš 24 za běh) s hranicí podle potvrzené agregace a invarianty, kontrakt času `ClockState` a pauza po `clock.jump`, trvalá hranice `retained_since.*`, epizody s neznámým začátkem po retenci | `src/nexusstat/history.py`, `tests/test_history.py`, `docs/HISTORY.md` (7, 7.1) | 47 nových testů (182 v modulu): hranice tabulek přesně na sekundě, přestupný rok, prázdná a dlouhá databáze, neagregované a otevřené okno, opožděná a selhaná agregace, řádky za `done_until`, 5min okna před hodinovou agregací, invarianty, idempotence, M3.2a a `SampleGate` po retenci, limit hodiny a 24 transakcí, střídání tabulek, rychlé přechody, čas (neznámý, nestabilní, skok, data z budoucnosti, opakovaná kontrola v transakci), 90 epizod CRITICAL, UNKNOWN a linka přes hranici, pád v odděleném procesu, výjimka uprostřed DELETE, Ctrl+C, `SQLITE_BUSY`, plný disk, nejistý commit, neúplné DELETE, restart, souběžný čtenář; finální kontrola: `retained_since` po každém kroku (bez přeskočení, nikdy neklesá, vlastní u každé tabulky, mezery zůstávají), epizody skutečným SQL (začátek před hranicí s koncem i bez dalšího přechodu, začátek přesně na hranici, stejná sekunda, UNKNOWN, linka, shoda s úplnou historií), 10 let a 29. února, data z budoucnosti ve všech tabulkách, dry-run nad souborem otevřeným jen pro čtení |
 | M3.3 Vlákno a napojení | fronty a dávka (5.2), chyby zápisu (5.3), stav `history.storage`, nová sekce `[history]` (výchozí `enabled = false`, cesta bez výchozí hodnoty), volání ze smyčky `run.py`, obsluha SIGTERM s dopsáním front a limitem 10 s, strukturovaný údaj o selhání kolektoru v `run.Collectors`; otevřené požadavky času z 11.1 (fronta před synchronizací a `derived`, monotónní rozsah ztrát v `event.data`, `history.gap`, `clock.synced`/`sync_lost`/`sync_restored`); volání `aggregate()` po zapsané dávce se stavem fronty `QueueState` a stav `history.storage` při konfliktu agregace (11.2) | `history.py`, `config.py`, `run.py`, `oled_text.py` (názvy `HISTORY`, `HIST SNAPSHOT`), `config/config.example.toml`, testy | plný disk (`max_page_count`), jen pro čtení, poškozený soubor, zámek, nejistý commit, zaplněné fronty a `history.gap`, přetečení před synchronizací bez času UTC, `history.unknown_gap` po restartu, měření a alarmy běží beze změny i při chybách historie, čisté ukončení bez ztráty |
 | M3.4 Snímek a obnova | snímek (9.2) jen při synchronizovaném čase, se záznamem a stavem `history.snapshot` z paměti (9.3), zkouška obnovy na notebooku (9.5), rozpoznání obnoveného snímku (9.6), read-only výpis stavu (`python3 -m nexusstat.history info <soubor>`) a převzetí souboru na náhradním stroji (`adopt`) | `history.py`, testy, `OPERATIONS.md` | snímek během zápisu je konzistentní a bez `-wal`; poškozený snímek se nezveřejní; stáří snímku; obnovený soubor projde kontrolami a čtecími dotazy |
 
-- Kroky M3.1 a M3.2 nemění chování aplikace (nový modul bez napojení). M3.1a, M3.1b a M3.2a jsou hotové jen lokálně na notebooku: aplikace zatím nic nezapisuje, `run.py` modul nepoužívá a produkční role se nevytváří ani neotevírá. M3.3 mění `run.py` a `config.py`, proto až po samostatném schválení; se `[history] enabled = false` zůstává chování dnešní v0.6.
+- Kroky M3.1 a M3.2 nemění chování aplikace (nový modul bez napojení). M3.1a, M3.1b, M3.2a a M3.2b jsou hotové jen lokálně na notebooku: aplikace zatím nic nezapisuje, `run.py` modul nepoužívá a produkční role se nevytváří ani neotevírá. M3.3 mění `run.py` a `config.py`, proto až po samostatném schválení; se `[history] enabled = false` zůstává chování dnešní v0.6.
 - Ruční zkouška na notebooku jen s cestou mimo repozitář v lokálním `config/config.toml` (ignorováno Gitem), např. v `~/.local/state/`; DB soubory chrání i `.gitignore` (`*.sqlite3`, `*.db`).
 - Test veřejných souborů (`PublicDataTest`) od review prochází i `tools/`.
 - Mimo M3: Nexus, Restic, systemd, produkční data, web (M6), nasazení (M7).
@@ -1003,6 +1122,19 @@ Agregace je metoda jediného zapisovače `HistoryRecorder`: používá jeho zapi
 - **Doklad konfliktu:** výjimka i zastavení uvádějí, zda byl doklad `history.aggregation_conflict` potvrzeně zapsán („doklad … zapsán“), nebo ne („… se nepodařilo potvrdit“, i při nejistém commitu). Nepodaří-li se konflikt ověřit (chyba dotazu na existující okna), je to obecná chyba zápisu (`HistoryError("write")`) a agregace se nezastaví.
 - **Co musí `QueueState` v M3.3 vědět:** čas UTC nejstaršího měření, které ještě neprošlo `add_results` (čeká ve frontě nebo na opakování zápisu); zda nějaké měření čeká na synchronizaci hodin (pak `unknown()`); měření ve stavu sběru (kolektor ještě běží) pokrývá rezerva 120 s jen tehdy, když časový limit kolektoru je kratší, jinak ho musí fronta hlásit od začátku cyklu. Vzorky otevřené dávky zapisovač započítá sám (i zapečetěné po nejistém commitu a i přidané mimo `add_results`).
 - **Neimplementováno:** retence a mazání (M3.2b), vlákno, fronta, `history.storage`, napojení na `run.py` a sekce `[history]` (M3.3), produkční nasazení (M7).
+
+### 11.3 Retence M3.2b (synchronní, součást zapisovače)
+
+| Volání | Co dělá |
+| --- | --- |
+| `ClockState.synced_for(stable_s)`, `ClockState.unknown()` | kontrakt času s M3.3: synchronizovaný čas s doloženou dobou stability, nebo neznámý stav; povinný parametr, `None` se nepřijímá |
+| `retention_plan(connection, now_utc, clock)`, `recorder.retention_plan(now_utc, clock)` → `RetentionPlan` | dry-run: pro každou tabulku časová hranice, hranice z agregace, výsledná hranice, `limited_by_aggregation`, nejstarší řádek, počet kandidátů, invariant dalšího kroku; `blocked` (čas) a `done_until` obou úrovní. Nic nezapíše |
+| `recorder.retain(now_utc, clock, plan=None, max_transactions=24)` → `RetentionResult` | jeden běh údržby: mazací transakce po hodině, tabulky se střídají; výsledek nese ověřené počty smazaných řádků, `stopped` (tabulka a důvod), `retained_since`, počet kroků ověřených po nejistém commitu, `blocked` a `more` (zbývá práce) |
+| `retained_since(connection)` | trvalé hranice retence z `meta`: začátek zachované historie každé tabulky (ne záruka souvislých dat) |
+| SQL `retention-unknown` (7.1) | úseky běhů s neúplnou historií kontroly po retenci a stav na nich, je-li znám |
+
+- Pořadí tabulek v běhu: `sample`, `agg_5m`, `agg_1h`, `check_change`, `event`; `run`, `metric`, `meta` a `schema_migration` se nemažou nikdy.
+- **Neimplementováno:** volání retence na celou hodinu z vlákna, skutečný zdroj `ClockState` a stav `history.storage` (M3.3), `VACUUM` (není potřeba), produkční nasazení (M7).
 
 ## 12. Rozhodnutí ke schválení
 
@@ -1111,6 +1243,14 @@ Opravené chyby a rozpory v předchozí verzi návrhu:
 1. **Podmínka 4** ověřena deterministickými testy (poslední vzorek uprostřed i na hranici okna, zastavené měření, obnova po hodině a po 3 dnech, restart během výpadku, skok hodin dopředu s daty i bez nich a návrat, prázdná, neznámá a čekající fronta, hodina bez nových dat). Nekonečná smyčka přes `more` ani trvalé zablokování nevzniká; poslední interval zůstává nedokončený do dalšího vzorku (6.1). Pravidlo ponecháno beze změny.
 2. **Obsluha konfliktu:** selhání zápisu dokladu `history.aggregation_conflict` propustilo z `aggregate()` holou výjimku SQLite místo `HistoryError("conflict")` a selhání dotazu na existující okna holou výjimku místo `HistoryError("write")`. Data ohrožená nebyla (rollback, `done_until` i `SampleGate` beze změny, nic přepsáno). Opraveno; zpráva rozlišuje potvrzený a nepotvrzený doklad.
 3. **Testy a mutace:** 13 nových testů (135 v modulu); kontrolní mutace agregace 26 z 27 odhaleno (zbylá je ekvivalentní, 11.2), mutace M3.1b 49 z 49.
+
+### 13.7 Implementace M3.2b 2026-10-21 (ke schválení)
+
+1. **Úprava schválených dotazů 7.1:** `details-episodes` by po retenci ohlásila u prvního zachovaného řádku běhu začátek epizody, který neznáme (domyšlený čas); `state-episodes` useknutou epizodu tiše vynechala. Obě nyní vracejí epizodu s neznámým začátkem jako `start_ts = NULL`; pro úplné rozsahy se výsledky (včetně benchmarku R4) nemění. Testy s původním zněním dotazů selžou. Při finální kontrole doplněno: `state-episodes` bere stav před prvním zachovaným řádkem z řádku libovolného typu (dřív se ztratila trvající epizoda, když po hranici zůstaly jen změny údajů) a nový dotaz `retention-unknown` přizná úseky, kde stav nebo údaje rekonstruovat nejde.
+2. **Nový klíč `meta`:** `retained_since.<tabulka>` (trvalá hranice retence, nikdy neklesá); schéma v1 beze změny, ověření souboru dovoluje další klíče.
+3. **Výklad hranic:** `agg_1h` dolů na celou hodinu a 10 kalendářních let (konzervativně, aby se nesmazala hodina zčásti mladší než 10 let).
+4. **Čas:** `ClockState` s doloženou dobou stability ≥ 24 h a kontrolou uložených `clock.jump`; po startu procesu, který stabilitu doložit neumí, se 24 h nemaže (prodlouží jen uchování).
+5. **Nalezeno při vývoji:** dotazy `oldest-*` ve tvaru `ORDER BY … LIMIT 1` nevracejí nad prázdnou tabulkou žádný řádek (opraveno čtení); pauza po skoku končila až sekundu po 24 h (opraveno na přesně 24 h); `more` hlásil práci i po přesném dokončení (opraveno).
 
 ## 14. Zamítnuté varianty
 

@@ -1,4 +1,4 @@
-"""Testy SQLite historie: vytvoření, otevření, ověření a zámek (M3.1a), zápis (M3.1b) a agregace (M3.2a).
+"""Testy SQLite historie: vytvoření, otevření, ověření a zámek (M3.1a), zápis (M3.1b), agregace (M3.2a) a retence (M3.2b).
 
 Vše jen v tempfile.TemporaryDirectory. Simulace chyb upravují výhradně kopie
 databáze vytvořené testem; žádná produkční cesta, žádné skutečné čekání ani
@@ -27,7 +27,7 @@ from unittest import mock
 
 from nexusstat import history
 from nexusstat.core import CheckResult, Measurement, State
-from nexusstat.history import Event, HistoryError, HistoryRecorder, PendingSample, QueueState
+from nexusstat.history import ClockState, Event, HistoryError, HistoryRecorder, PendingSample, QueueState
 from nexusstat.network_monitor import BYTES_PER_SECOND, INTERFACE, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
 from nexusstat.system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
 
@@ -489,6 +489,24 @@ elif point == "aggregate":
     recorder.start_run("test", 10, now)
     recorder.aggregate(now, "synced", history.QueueState.empty())
     os._exit(75)  # sem se nesmí dostat
+elif point == "retain":
+    from datetime import datetime, timezone
+    deletes = {sql for _, sql, _ in history.RETENTION_SQL.values()}
+    class Crashing(sqlite3.Connection):
+        armed = False
+        def execute(self, sql, *args):
+            if sql in deletes:
+                Crashing.armed = True
+            elif sql == "COMMIT" and Crashing.armed:
+                os._exit(76)  # pád po DELETE, před COMMIT
+            return super().execute(sql, *args)
+    real_connect = sqlite3.connect
+    sqlite3.connect = lambda *a, **k: real_connect(*a, factory=Crashing, **k)
+    now = datetime.fromtimestamp(int(sys.argv[4]), timezone.utc)
+    recorder = history.HistoryRecorder(history.open_writer(db, "test", host))
+    recorder.start_run("test", 10, now)
+    recorder.retain(now, history.ClockState.synced_for(86400))
+    os._exit(77)  # sem se nesmí dostat
 """
 
 
@@ -742,7 +760,14 @@ class WriterContractTest(RecorderTest):
                             ("close-unclean-runs", history.CLOSE_UNCLEAN_RUNS_SQL),
                             ("high-water", history.HIGH_WATER_SQL), ("insert-change", history.INSERT_CHANGE_SQL),
                             ("progress-5m", history.PROGRESS_5M_SQL), ("aggregate-5m", history.AGGREGATE_5M_SQL),
-                            ("progress-1h", history.PROGRESS_1H_SQL), ("rollup-1h", history.ROLLUP_1H_SQL)):
+                            ("progress-1h", history.PROGRESS_1H_SQL), ("rollup-1h", history.ROLLUP_1H_SQL),
+                            ("oldest-sample", history.OLDEST_SAMPLE_SQL), ("retention-sample", history.RETENTION_SAMPLE_SQL),
+                            ("oldest-5m", history.OLDEST_5M_SQL), ("retention-5m", history.RETENTION_5M_SQL),
+                            ("oldest-1h", history.OLDEST_1H_SQL), ("retention-1h", history.RETENTION_1H_SQL),
+                            ("oldest-change", history.OLDEST_CHANGE_SQL), ("retention-change", history.RETENTION_CHANGE_SQL),
+                            ("oldest-event", history.OLDEST_EVENT_SQL), ("retention-event", history.RETENTION_EVENT_SQL),
+                            ("retention-check-sample", history.RETENTION_CHECK_SAMPLE_SQL),
+                            ("retention-check-5m", history.RETENTION_CHECK_5M_SQL)):
             with self.subTest(block=name):
                 self.assertEqual(value, doc_block(name))
 
@@ -1968,6 +1993,777 @@ class AggregationGateTest(AggregationTest):
         self.assertEqual(self.recorder.rejected["late"], 1)
         self.assertEqual(self.stored(), rows)
         self.assertEqual(self.query("SELECT count(*) FROM sample WHERE ts >= ? AND ts < ?", (BASE, BASE + 300)), [(60,)])
+
+
+# --- M3.2b: retence -----------------------------------------------------------------
+
+DAY = 86_400
+STABLE = ClockState.synced_for(DAY)  # simulace kontraktu M3.3, ne důkaz synchronizace
+TABLES = ("sample", "agg_5m", "agg_1h", "check_change", "event")
+
+
+class RetentionTest(AggregationTest):
+    """Retence nad dočasnou databází se simulovaným časem (HISTORY.md 7)."""
+
+    def retain(self, now, clock=STABLE, **options):
+        return self.recorder.retain(at(now), clock, **options)
+
+    def plan(self, now, clock=STABLE):
+        return self.recorder.retention_plan(at(now), clock)
+
+    def drain(self, now, clock=STABLE):
+        """Běhy retence, dokud zbývá práce; vrací součty smazaných řádků a počet běhů."""
+        total, runs = Counter(), 0
+        while True:
+            outcome = self.retain(now, clock)
+            runs += 1
+            total.update(outcome.deleted)
+            if not outcome.more:
+                return total, runs, outcome
+            self.assertLess(runs, 100)
+
+    def counts(self):
+        return {table: self.query(f"SELECT count(*) FROM {table}")[0][0] for table in TABLES}
+
+    def metric(self, check_id, subject=""):
+        conn = self.database.connection
+        conn.execute("INSERT INTO metric (check_id, subject, unit, created_utc) VALUES (?, ?, ?, ?) "
+                     "ON CONFLICT (check_id, subject) DO NOTHING", (check_id, subject, history.SERIES[check_id].unit, CREATED))
+        return conn.execute("SELECT id FROM metric WHERE check_id = ? AND subject = ?", (check_id, subject)).fetchone()[0]
+
+    def seed_samples(self, start, end, step=600, checks=(CPU_TEMP_ID, CPU_USAGE_ID)):
+        """Syntetické vzorky přímo v SQL (rychlá dlouhá historie) a horní mez běhu podle nich."""
+        conn = self.database.connection
+        ids = [self.metric(check_id) for check_id in checks]
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany("INSERT INTO sample (metric_id, ts, value) VALUES (?, ?, ?)",
+                         [(metric, ts, float(ts // step % 7)) for ts in range(start, end, step) for metric in ids])
+        conn.execute("UPDATE run SET last_write_utc = max(coalesce(last_write_utc, 0), ?) WHERE id = ?",
+                     (end - step, self.run_id))
+        conn.execute("COMMIT")
+
+    def aggregate_until(self, end_5m, end_1h=None, now=None):
+        """Fixture: schválené kroky agregace (progress + INSERT) přes celý rozsah najednou."""
+        done = lambda level: lambda conn: (conn.execute(history.DONE_UNTIL_SQL, (level,)).fetchone()[0],
+                                           end_5m if level == "5m" else end_1h)
+        now = now or end_5m + 600
+        self.recorder._aggregation_step("5m", done("5m"), now)
+        if end_1h is not None:
+            self.recorder._aggregation_step("1h", done("1h"), now)
+
+    def raw_in(self, start, end):
+        return self.query("SELECT count(*) FROM sample WHERE ts >= ? AND ts < ?", (start, end))[0][0]
+
+
+class RetentionPlanTest(RetentionTest):
+    def test_plan_reports_bounds_and_writes_nothing(self):
+        self.seed_samples(BASE, BASE + 2 * DAY)
+        self.aggregate_until(BASE + DAY, BASE + DAY)
+        now = BASE + 32 * DAY
+        conn = self.database.connection
+        before, changes = self.counts(), conn.total_changes
+        plan = self.plan(now)
+        with history.open_reader(self.db) as reader:  # i nad spojením jen pro čtení
+            self.assertEqual(history.retention_plan(reader.connection, at(now), STABLE), plan)
+        self.assertEqual((self.counts(), conn.total_changes), (before, changes))  # dry-run nic nezměnil
+        self.assertEqual((plan.blocked, plan.done_5m, plan.done_1h), (None, BASE + DAY, BASE + DAY))
+        sample = plan.table("sample")
+        self.assertEqual((sample.time_cutoff, sample.aggregation_until, sample.cutoff, sample.limited_by_aggregation),
+                         (now - 30 * DAY, BASE + DAY, BASE + DAY, True))
+        self.assertEqual((sample.oldest, sample.candidates, sample.invariant_ok), (BASE, 2 * 144, True))
+        five = plan.table("agg_5m")
+        self.assertEqual((five.time_cutoff, five.aggregation_until, five.candidates),
+                         ((now - 365 * DAY) // 3600 * 3600, BASE + DAY, 0))
+        self.assertEqual(plan.table("agg_1h").time_cutoff, history._years_before(now, 10) // 3600 * 3600)
+        self.assertEqual(datetime.fromtimestamp(plan.table("agg_1h").time_cutoff, timezone.utc).year,
+                         datetime.fromtimestamp(now, timezone.utc).year - 10)
+        for table in ("check_change", "event"):
+            self.assertEqual(plan.table(table).time_cutoff, now - 730 * DAY)
+        outcome = self.retain(now)
+        self.assertEqual(outcome.deleted["sample"], sample.candidates)  # skutečný počet až po provedení
+        self.assertEqual(outcome.retained_since["sample"], BASE + DAY)
+
+    def test_years_before_handles_leap_day(self):
+        leap = math.floor(datetime(2036, 2, 29, 12, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(history._years_before(leap, 10), math.floor(datetime(2026, 2, 28, 12, tzinfo=timezone.utc).timestamp()))
+
+    def test_empty_database(self):
+        plan = self.plan(BASE + 800 * DAY)
+        self.assertEqual([(entry.oldest, entry.candidates) for entry in plan.tables][:3], [(None, 0)] * 3)
+        outcome = self.retain(BASE + 800 * DAY)
+        self.assertEqual((outcome.transactions, outcome.more, outcome.blocked), (1, False, None))  # jen staré process.start
+        self.assertEqual(outcome.deleted["event"], 1)
+        again = self.retain(BASE + 800 * DAY)
+        self.assertEqual((again.transactions, sum(again.deleted.values()), again.more), (0, 0, False))
+
+    def test_parameters_cannot_shorten_retention(self):
+        self.seed_samples(BASE, BASE + 2 * DAY)
+        self.aggregate_until(BASE + 2 * DAY - 600, BASE + DAY)
+        now = BASE + 31 * DAY
+        for bad in (0, 25, True, 1.5):
+            with self.subTest(max_transactions=bad), self.assertRaises(ValueError):
+                self.retain(now, max_transactions=bad)
+        with self.assertRaises(TypeError):
+            self.retain(now, plan={"sample": now})
+        forged = self.plan(now)
+        forged = history.RetentionPlan(forged.now, None, forged.done_5m, forged.done_1h, tuple(
+            history.RetentionTable(entry.table, now, None, now, False, entry.oldest, entry.candidates, True)
+            for entry in forged.tables))  # podvržený plán „smaž vše do teď“
+        self.retain(now, plan=forged)
+        self.assertEqual(self.query("SELECT min(ts) FROM sample")[0][0], now - 30 * DAY)  # jen schválených 30 dní
+        self.assertEqual(self.raw_in(now - 30 * DAY, now), self.raw_in(BASE + DAY, BASE + 2 * DAY))
+
+    def test_older_plan_caps_execution(self):
+        self.seed_samples(BASE, BASE + 3 * DAY)
+        self.aggregate_until(BASE + 3 * DAY - 600, BASE + 2 * DAY)
+        plan = self.plan(BASE + 31 * DAY)  # schválený plán: hranice BASE + 1 den
+        for _ in range(3):  # pozdější běhy by smazaly víc (BASE + 2 dny), plán je omezí
+            outcome = self.retain(BASE + 32 * DAY, plan=plan)
+        self.assertEqual((outcome.more, self.query("SELECT min(ts) FROM sample")[0][0]), (False, BASE + DAY))
+
+
+class RetentionSafetyTest(RetentionTest):
+    def test_unaggregated_samples_are_never_deleted(self):
+        written = self.fill(BASE, BASE + 3 * 3600 + 10, step=60, per_batch=120)
+        self.drive_catch_up(BASE + 2 * 3600 + 120)  # agregace jen do BASE + 2 h
+        aggregated = sum(n for (_, _, bucket, n, *_rest) in self.stored() if bucket < BASE + 2 * 3600)
+        now = BASE + 400 * DAY  # všechno je starší než 30 dní
+        total, _, outcome = self.drain(now)
+        self.assertEqual(outcome.retained_since["sample"], BASE + 2 * 3600)
+        self.assertEqual(self.query("SELECT min(ts), count(*) FROM sample")[0],
+                         (BASE + 2 * 3600, self.raw_in(BASE + 2 * 3600, BASE + 4 * 3600)))
+        self.assertEqual(total["sample"], aggregated)  # smazané = přesně to, co je v agregacích
+        self.assertEqual(sum(len([p for p in points if p[0] < BASE + 2 * 3600]) for points in written.values()), aggregated)
+
+    def drive_catch_up(self, now):
+        for _ in range(50):
+            if not self.aggregate(now).more:
+                return
+        self.fail("agregace nedoběhla")
+
+    def test_lagging_aggregation_keeps_source_data(self):
+        self.seed_samples(BASE, BASE + 10 * DAY)
+        self.aggregate_until(BASE + 2 * DAY, BASE + 2 * DAY)  # agregace stojí několik dní
+        now = BASE + 45 * DAY
+        sample = self.plan(now).table("sample")
+        self.assertEqual((sample.cutoff, sample.limited_by_aggregation), (BASE + 2 * DAY, True))
+        self.drain(now)
+        self.assertEqual(self.query("SELECT min(ts) FROM sample")[0][0], BASE + 2 * DAY)
+        self.aggregate_until(BASE + 10 * DAY - 600, BASE + 9 * DAY)  # agregace dohnala
+        self.drain(now)
+        self.assertEqual(self.query("SELECT min(ts) FROM sample")[0][0], BASE + 10 * DAY - 600)  # now − 30 d je později
+
+    def test_aggregated_rows_beyond_done_until_prove_nothing(self):
+        self.seed_samples(BASE, BASE + 2 * DAY)
+        self.aggregate_until(BASE + DAY)
+        conn = self.database.connection  # cizí agregovaný řádek za done_until (částečný, nepotvrzený interval)
+        conn.execute("INSERT INTO agg_5m SELECT metric_id, ts - ts % 300, count(*), count(value), min(value), max(value), "
+                     "sum(value) FROM sample WHERE ts >= ? AND ts < ? GROUP BY metric_id, ts - ts % 300", (BASE + DAY, BASE + DAY + 3600))
+        self.drain(BASE + 60 * DAY)
+        self.assertEqual(self.query("SELECT min(ts) FROM sample")[0][0], BASE + DAY)  # autoritativní je done_until
+
+    def test_failed_aggregation_does_not_open_retention(self):
+        self.seed_samples(BASE, BASE + 3600 + 600)
+        self.aggregate(BASE + 200)  # prázdná hodina před daty
+        conn = self.database.connection
+        conn.create_function("boom", 0, lambda: 1 / 0)
+        conn.execute("CREATE TEMP TRIGGER boom_agg BEFORE INSERT ON main.agg_5m BEGIN SELECT boom(); END")
+        try:
+            self.assertRefused("write", self.aggregate, BASE + 3600 + 900)  # krok agregace selže a vrátí se
+        finally:
+            conn.execute("DROP TRIGGER temp.boom_agg")
+        self.assertEqual(self.done()["5m"], BASE)
+        self.drain(BASE + 60 * DAY)
+        self.assertEqual(self.query("SELECT min(ts) FROM sample")[0][0], BASE)  # nic smazáno
+
+    def test_five_minute_rows_wait_for_hourly_rollup(self):
+        self.seed_samples(BASE, BASE + 3 * 3600)
+        self.aggregate_until(BASE + 3 * 3600 - 600, BASE + 3600)  # 5 min hotové, hodina jen první
+        now = BASE + 400 * DAY
+        five = self.plan(now).table("agg_5m")
+        self.assertEqual((five.cutoff, five.limited_by_aggregation), (BASE + 3600, True))
+        self.drain(now)
+        self.assertEqual(self.query("SELECT min(bucket) FROM agg_5m")[0][0], BASE + 3600)
+        self.assertEqual(self.query("SELECT count(*) FROM agg_1h WHERE bucket = ?", (BASE,))[0][0], 2)  # hodina zůstala
+
+    def test_last_open_window_stays_protected(self):
+        written = self.fill(BASE, BASE + 160)  # poslední okno s posledním vzorkem se neuzavře (podmínka 4)
+        self.drive_catch_up(BASE + 86_400)
+        self.drain(BASE + 400 * DAY)
+        self.assertEqual(self.query("SELECT count(*) FROM sample")[0][0], sum(len(points) for points in written.values()))
+
+    def test_exact_cutoffs_follow_sql_rule(self):
+        cpu = self.metric(CPU_TEMP_ID)
+        now = BASE + 3 * 365 * DAY + 3600 * 5 + 1234
+        sample_cut = now - 30 * DAY
+        five_cut = (now - 365 * DAY) // 3600 * 3600
+        hour_cut = history._years_before(now, 10) // 3600 * 3600
+        conn = self.database.connection
+        conn.executemany("INSERT INTO sample VALUES (?, ?, 1.0)", [(cpu, sample_cut - 1), (cpu, sample_cut)])
+        conn.executemany("INSERT INTO agg_5m VALUES (?, ?, 1, 1, 1.0, 1.0, 1.0)", [(cpu, five_cut - 300), (cpu, five_cut)])
+        conn.executemany("INSERT INTO agg_1h VALUES (?, ?, 1, 1, 1.0, 1.0, 1.0)",
+                         [(cpu, five_cut - 3600), (cpu, five_cut), (cpu, hour_cut - 3600), (cpu, hour_cut)])
+        conn.execute("UPDATE aggregation_state SET done_until = ?", (sample_cut + 300 - sample_cut % 300,))
+        conn.execute("INSERT INTO agg_5m VALUES (?, ?, 2, 2, 1.0, 1.0, 2.0)", (cpu, sample_cut - sample_cut % 300))
+        conn.execute("INSERT INTO event (ts, ts_quality, kind, severity, message) VALUES (?, 'synced', 'x', 'INFO', 'a'), "
+                     "(?, 'synced', 'x', 'INFO', 'b')", (now - 730 * DAY - 1, now - 730 * DAY))
+        conn.execute("UPDATE run SET last_write_utc = ?", (sample_cut,))
+        self.drain(now)
+        self.assertEqual(self.query("SELECT ts FROM sample ORDER BY ts"), [(sample_cut,)])  # přesně na hranici zůstává
+        self.assertEqual(self.query("SELECT min(bucket) FROM agg_5m")[0][0], five_cut)
+        self.assertEqual(self.query("SELECT min(bucket) FROM agg_1h")[0][0], hour_cut)
+        self.assertEqual(self.query("SELECT message FROM event WHERE kind = 'x'"), [("b",)])
+
+    def test_invariant_mismatch_stops_only_that_table(self):
+        self.seed_samples(BASE, BASE + 2 * DAY)
+        self.aggregate_until(BASE + DAY, BASE + DAY)
+        conn = self.database.connection
+        conn.execute("UPDATE aggregation_state SET done_until = ? WHERE level = '5m'", (BASE + 2 * DAY,))  # bez agregace
+        conn.execute("INSERT INTO event (ts, ts_quality, kind, severity, message) VALUES (?, 'synced', 'x', 'INFO', 'staré')",
+                     (BASE,))
+        conn.execute("DELETE FROM agg_5m WHERE bucket = ?", (BASE,))  # chybí agregace pro nejstarší vzorky
+        now = BASE + 800 * DAY
+        self.assertFalse(self.plan(now).table("sample").invariant_ok)
+        before = self.query("SELECT count(*) FROM sample")[0][0]
+        outcome = self.retain(now)
+        self.assertEqual(outcome.stopped, {"sample": "aggregation_mismatch"})
+        self.assertEqual(self.query("SELECT count(*) FROM sample")[0][0], before)  # vzorky bez agregace zůstaly
+        self.assertGreater(outcome.deleted["event"], 0)  # ostatní tabulky pokračují
+        conn.execute("UPDATE aggregation_state SET done_until = ? WHERE level = '1h'", (BASE + 3 * DAY,))  # 1h > 5m
+        second = self.retain(now)
+        self.assertEqual(second.stopped, {"sample": "aggregation_state_invalid", "agg_5m": "aggregation_state_invalid"})
+
+    def test_repeated_retention_is_idempotent_and_keeps_aggregation_state(self):
+        self.seed_samples(BASE, BASE + 3 * DAY)
+        self.aggregate_until(BASE + 2 * DAY, BASE + 2 * DAY)
+        state = self.done()
+        self.drain(BASE + 40 * DAY)
+        snapshot = self.counts()
+        again = self.retain(BASE + 40 * DAY)
+        self.assertEqual((again.transactions, sum(again.deleted.values())), (0, 0))
+        self.assertEqual((self.counts(), self.done()), (snapshot, state))  # retence aggregation_state nemění
+
+    def test_aggregation_and_gate_work_after_retention(self):
+        self.fill(BASE, BASE + 3 * 3600 + 10, step=60, per_batch=200)
+        self.drive_catch_up(BASE + 3 * 3600 + 120)
+        self.drain(BASE + 3 * 3600 + 31 * DAY)
+        self.assertEqual(self.query("SELECT count(*) FROM sample WHERE ts < ?", (BASE + 3 * 3600,))[0][0], 0)
+        self.write([result(MEMORY_ID, State.INFO, 1.0, PERCENT, ts=BASE + 100)])  # do hotového okna: late
+        self.assertEqual(self.recorder.rejected["late"], 1)
+        self.fill(BASE + 3 * 3600 + 60, BASE + 3 * 3600 + 700, step=60)
+        self.assertEqual(self.aggregate(BASE + 3 * 3600 + 900).done_5m, BASE + 3 * 3600 + 600)
+
+
+class RetentionLimitTest(RetentionTest):
+    def test_one_hour_per_transaction_and_24_per_run(self):
+        self.seed_samples(BASE, BASE + 40 * 3600, step=300)
+        self.aggregate_until(BASE + 40 * 3600 - 300, BASE + 39 * 3600)
+        now = BASE + 40 * 3600 + 31 * DAY
+        first = self.retain(now, max_transactions=1)
+        self.assertEqual((first.transactions, first.retained_since["sample"], first.more), (1, BASE + 3600, True))
+        self.assertEqual(first.deleted["sample"], 2 * 12)  # jedna hodina historie
+        full = self.retain(now)
+        self.assertEqual((full.transactions, full.more), (24, True))  # limit běhu
+        self.assertEqual(full.retained_since["sample"], BASE + 25 * 3600)
+        rest = self.retain(now)
+        self.assertEqual((rest.more, rest.retained_since["sample"]), (False, BASE + 40 * 3600 - 300))
+
+    def test_more_is_false_when_limit_exactly_finishes_work(self):
+        self.seed_samples(BASE, BASE + 24 * 3600 + 600, step=600)
+        self.aggregate_until(BASE + 24 * 3600)
+        outcome = self.retain(BASE + 24 * 3600 + 31 * DAY)
+        self.assertEqual((outcome.transactions, outcome.more, outcome.retained_since["sample"]), (24, False, BASE + 24 * 3600))
+
+    def test_tables_take_turns_within_run_limit(self):
+        self.seed_samples(BASE, BASE + 30 * 3600, step=600)
+        self.aggregate_until(BASE + 30 * 3600 - 600)
+        conn = self.database.connection
+        conn.executemany("INSERT INTO event (ts, ts_quality, kind, severity, message) VALUES (?, 'synced', 'x', 'INFO', 'e')",
+                         [(BASE + 3600 * h,) for h in range(30)])
+        outcome = self.retain(BASE + 800 * DAY)
+        self.assertEqual(outcome.transactions, 24)
+        self.assertGreater(outcome.deleted["event"], 0)  # dluh vzorků nezablokuje ostatní tabulky
+        self.assertGreater(outcome.deleted["sample"], 0)
+
+    def test_many_rapid_transitions_are_deleted_hour_by_hour(self):
+        conn = self.database.connection
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany("INSERT INTO check_change (ts, ts_quality, run_id, check_id, from_state, to_state) "
+                         "VALUES (?, 'synced', ?, ?, ?, ?)",
+                         [(BASE + second, self.run_id, f"check.{n}", "INFO" if second % 2 else "CRITICAL",
+                           "CRITICAL" if second % 2 else "INFO") for second in range(2 * 3600) for n in range(5)])
+        conn.execute("COMMIT")
+        now = BASE + 730 * DAY + 3 * 3600
+        first = self.retain(now, max_transactions=1)
+        self.assertEqual((first.deleted["check_change"], first.retained_since["check_change"]), (5 * 3600, BASE + 3600))
+        self.assertEqual(self.query("SELECT count(*), min(ts) FROM check_change")[0], (5 * 3600, BASE + 3600))
+        self.drain(now)
+        self.assertEqual(self.query("SELECT count(*) FROM check_change")[0][0], 0)
+
+    def test_long_history_is_trimmed_to_bounds(self):
+        cpu = self.metric(CPU_TEMP_ID)
+        now = BASE + 11 * 365 * DAY
+        conn = self.database.connection
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany("INSERT INTO agg_1h VALUES (?, ?, 12, 12, 1.0, 1.0, 12.0)",
+                         [(cpu, BASE + h * 3600) for h in range(0, 11 * 365 * 24, 24)])  # 11 let, jeden řádek denně
+        conn.executemany("INSERT INTO event (ts, ts_quality, kind, severity, message) VALUES (?, 'synced', 'x', 'INFO', 'e')",
+                         [(now - day * DAY,) for day in range(0, 800, 7)])
+        conn.execute("COMMIT")
+        for _ in range(30):
+            if not self.retain(now).more:
+                break
+        hour_cut = history._years_before(now, 10) // 3600 * 3600
+        self.assertGreaterEqual(self.query("SELECT min(bucket) FROM agg_1h")[0][0], hour_cut)
+        self.assertEqual(self.query("SELECT count(*) FROM agg_1h WHERE bucket < ?", (hour_cut,))[0][0], 0)
+        self.assertEqual(self.query("SELECT count(*) FROM event WHERE kind = 'x' AND ts < ?", (now - 730 * DAY,))[0][0], 0)
+        self.assertEqual(self.query("SELECT count(*) FROM event WHERE kind = 'x'")[0][0], len(range(0, 731, 7)))
+
+
+class RetentionClockTest(RetentionTest):
+    def setUp(self):
+        super().setUp()
+        self.seed_samples(BASE, BASE + 2 * DAY)
+        self.aggregate_until(BASE + 2 * DAY - 600, BASE + DAY)
+        self.now = BASE + 40 * DAY
+
+    def assertBlocked(self, reason, now=None, clock=STABLE):
+        before = self.counts()
+        self.assertEqual(self.plan(now or self.now, clock).blocked, reason)
+        outcome = self.retain(now or self.now, clock)
+        self.assertEqual((outcome.blocked, outcome.transactions, self.counts()), (reason, 0, before))
+
+    def test_clock_state_contract(self):
+        with self.assertRaises(TypeError):
+            self.recorder.retain(at(self.now), None)  # chybějící informace není „čas je v pořádku“
+        with self.assertRaises(TypeError):
+            ClockState("ano", None)
+        for build in (lambda: ClockState.synced_for(None), lambda: ClockState(False, 100), lambda: ClockState(True, -1),
+                      lambda: ClockState(True, True)):
+            with self.subTest(build=build), self.assertRaises(ValueError):
+                build()
+
+    def test_untrusted_or_unstable_time_deletes_nothing(self):
+        self.assertBlocked("time_unsynced", clock=ClockState.unknown())
+        self.assertBlocked("clock_unstable", clock=ClockState(True, None))  # synchronizovaný, stabilita nedoložena
+        self.assertBlocked("clock_unstable", clock=ClockState.synced_for(DAY - 1))
+        self.assertBlocked("time_unsynced", now=1_700_000_000)  # čas před 2026
+
+    def test_recent_clock_jump_pauses_for_a_day(self):
+        self.write(events=[Event(self.now - 3600, "synced", "clock.jump", "WARNING", "skok")])
+        self.assertBlocked("clock_jump_recent")
+        self.assertBlocked("clock_jump_recent", now=self.now - 3600 + DAY - 1)
+        self.assertIsNone(self.retain(self.now - 3600 + DAY).blocked)  # po 24 h znovu
+
+    def test_data_newer_than_now_blocks(self):
+        self.write(events=[Event(self.now + 60, "synced", "test.future", "INFO", "z budoucnosti")])
+        self.assertBlocked("clock_behind_data")
+
+    def test_execution_rechecks_time_inside_transaction(self):
+        plan = self.plan(self.now)
+        self.assertIsNone(plan.blocked)
+        self.write(events=[Event(self.now - 10, "synced", "clock.jump", "WARNING", "skok po plánu")])
+        before = self.counts()
+        outcome = self.retain(self.now, plan=plan)  # plán bez blokace se neuplatní slepě
+        self.assertEqual((outcome.blocked, self.counts()), ("clock_jump_recent", before))
+
+
+class RetentionHistoryTest(RetentionTest):
+    """R4 po retenci: přechody po hranici zůstávají přesné, začátek před hranicí se nedomýšlí."""
+
+    def episodes(self, check_id, state):
+        return self.query(doc_block("state-episodes"), {"check_id": check_id, "state": state,
+                                                         "start": 0, "end": BASE + 2000 * DAY})
+
+    def test_critical_episodes_across_cutoff(self):
+        cycles = [[result(CPU_TEMP_ID, State.INFO, 40.0, CELSIUS, ts=BASE)]]
+        for k in range(1, 361):  # scénář A: změna každých 10 s
+            state = State.CRITICAL if ((k + 1) // 2) % 2 else State.INFO
+            cycles.append([result(CPU_TEMP_ID, state, 90.0 if state is State.CRITICAL else 40.0, CELSIUS, ts=BASE + 5 * k)])
+        for first in range(0, len(cycles), 60):
+            self.write(*cycles[first:first + 60])
+        entries = [BASE + 5 + 20 * j for j in range(90)]
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "CRITICAL"), [(e, e + 10, 10, 0) for e in entries])
+        self.retain(BASE + 730 * DAY + 885)  # hranice přesně na vzniku 45. epizody: zůstává
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "CRITICAL"), [(e, e + 10, 10, 0) for e in entries[44:]])
+        self.retain(BASE + 730 * DAY + 890)  # hranice uprostřed epizody: začátek smazán
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "CRITICAL"),
+                         [(None, entries[44] + 10, None, 0)] + [(e, e + 10, 10, 0) for e in entries[45:]])
+        self.assertEqual(history.retained_since(self.database.connection)["check_change"], BASE + 890)
+
+    def test_unknown_episode_across_cutoff(self):
+        for ts, state in ((BASE, State.INFO), (BASE + 20, State.UNKNOWN), (BASE + 40, State.UNKNOWN), (BASE + 60, State.INFO)):
+            value = None if state is State.UNKNOWN else 50.0
+            self.write([result(CPU_TEMP_ID, state, value, None if value is None else CELSIUS, ts=ts)])
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "UNKNOWN"), [(BASE + 20, BASE + 60, 40, 0)])
+        self.retain(BASE + 730 * DAY + 30)
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "UNKNOWN"), [(None, BASE + 60, None, 0)])  # obnova zůstala, vznik ne
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "INFO"), [(BASE + 60, None, None, 0)])
+
+    def test_link_episodes_do_not_invent_start(self):
+        sequence = [(0, State.INFO, "UP"), (10, State.INFO, "DOWN"), (20, State.INFO, "UP"), (30, State.WARNING, "UP"),
+                    (40, State.INFO, "UP"), (50, State.INFO, "DOWN"), (60, State.INFO, "UP")]
+        for offset, state, link in sequence:
+            self.write([result(LINK_ID, state, ts=BASE + offset, details={INTERFACE: "eth0", LINK: link})])
+        query = lambda value: self.query(doc_block("details-episodes"), {"check_id": LINK_ID, "key": "link", "value": value,
+                                                                         "start": 0, "end": BASE + 2000 * DAY})
+        self.assertEqual(query("UP"), [(BASE, BASE + 10, 10, 1), (BASE + 20, BASE + 50, 30, 0), (BASE + 60, None, None, 0)])
+        self.retain(BASE + 730 * DAY + 25)  # první zachovaný řádek (WARNING) linku nemění
+        self.assertEqual(query("UP"), [(None, BASE + 50, None, 0), (BASE + 60, None, None, 0)])  # začátek neznámý
+        self.assertEqual(query("DOWN"), [(BASE + 50, BASE + 60, 10, 0)])
+
+
+class RetentionFailureTest(RetentionTest):
+    def setUp(self):
+        super().setUp()
+        self.seed_samples(BASE, BASE + 3 * 3600, step=300)
+        self.aggregate_until(BASE + 3 * 3600 - 300, BASE + 2 * 3600)
+        self.now = BASE + 3 * 3600 + 31 * DAY
+
+    def unchanged(self, before, meta=None):
+        self.assertEqual(self.counts(), before)
+        self.assertEqual(history.retained_since(self.database.connection), meta or dict.fromkeys(TABLES))
+        self.assertFalse(self.database.connection.in_transaction)
+
+    def intercept(self, raiser):
+        real = self.database.connection
+
+        class Failing(Passthrough):
+            def execute(self, sql, *args):
+                if sql == history.RETENTION_SAMPLE_SQL:
+                    raise raiser()
+                return super().execute(sql, *args)
+
+        self.database.connection = Failing(real)
+        return real
+
+    def test_crash_before_commit_in_child_process(self):
+        before, state = self.counts(), self.done()
+        self.database.close()
+        env = dict(os.environ, PYTHONPATH=str(REPO / "src"))
+        code = subprocess.run([sys.executable, "-c", CHILD, "retain", str(self.db), HOST, str(self.now)],
+                              env=env, capture_output=True, text=True, timeout=60).returncode
+        self.assertEqual(code, 76)
+        self.reopen(self.now + 60)
+        after = self.counts()
+        self.assertEqual({table: after[table] for table in ("sample", "agg_5m", "agg_1h", "check_change")},
+                         {table: before[table] for table in ("sample", "agg_5m", "agg_1h", "check_change")})
+        self.assertEqual((history.retained_since(self.database.connection), self.done()), (dict.fromkeys(TABLES), state))
+        self.assertGreater(self.retain(self.now + 60).deleted["sample"], 0)
+
+    def test_exception_mid_delete_rolls_back(self):
+        conn = self.database.connection
+        calls = []
+
+        def fail_second():
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("selhání uprostřed DELETE")
+            return 0
+
+        conn.create_function("fail_second", 0, fail_second)
+        conn.execute("CREATE TEMP TRIGGER fail_mid BEFORE DELETE ON main.sample BEGIN SELECT fail_second(); END")
+        before = self.counts()
+        try:
+            self.assertRefused("write", self.retain, self.now)
+        finally:
+            conn.execute("DROP TRIGGER temp.fail_mid")
+        self.assertEqual(len(calls), 2)  # první řádek už byl smazaný, druhý selhal
+        self.unchanged(before)
+        self.assertEqual(self.retain(self.now, max_transactions=1).deleted["sample"], 2 * 12)
+
+    def test_ctrl_c_and_disk_full_roll_back(self):
+        before = self.counts()
+        for raiser, expected in ((KeyboardInterrupt, KeyboardInterrupt),
+                                 (lambda: sqlite3.OperationalError("database or disk is full"), HistoryError)):
+            with self.subTest(raiser=raiser):
+                real = self.intercept(raiser)
+                try:
+                    with self.assertRaises(expected):
+                        self.retain(self.now)
+                finally:
+                    self.database.connection = real
+                self.unchanged(before)
+
+    def test_incomplete_delete_is_never_reported_as_success(self):
+        conn = self.database.connection
+        conn.execute("CREATE TEMP TRIGGER keep_one BEFORE DELETE ON main.sample WHEN OLD.ts = ? "
+                     "BEGIN SELECT RAISE(IGNORE); END".replace("?", str(BASE + 600)))  # řádek „nesmazatelný“
+        before = self.counts()
+        try:
+            self.assertRefused("write", self.retain, self.now, max_transactions=1)  # rowcount ≠ spočítané kandidáty
+        finally:
+            conn.execute("DROP TRIGGER temp.keep_one")
+        self.unchanged(before)  # nic smazáno, hranice nezapsána
+
+    def test_sqlite_busy_deletes_nothing(self):
+        conn = self.database.connection
+        conn.execute("PRAGMA busy_timeout = 0")  # bez skutečného čekání v testu
+        other = raw(self.db)
+        try:
+            other.execute("BEGIN IMMEDIATE")  # zámek zápisu drží jiné spojení (ruční sqlite3)
+            before = self.counts()
+            error = self.assertRefused("write", self.retain, self.now)
+            self.assertIn("locked", str(error))
+            other.execute("ROLLBACK")
+        finally:
+            other.close()
+            conn.execute("PRAGMA busy_timeout = 5000")
+        self.unchanged(before)
+        self.assertGreater(self.retain(self.now).deleted["sample"], 0)
+
+    def test_uncertain_commit_is_verified_not_repeated(self):
+        real = self.database.connection
+        self.database.connection = FlakyCommit(real)  # COMMIT proběhne, volající dostane chybu
+        try:
+            outcome = self.retain(self.now, max_transactions=1)
+        finally:
+            self.database.connection = real
+        self.assertEqual((outcome.transactions, outcome.verified_after_uncertain_commit, outcome.deleted["sample"]),
+                         (1, 1, 2 * 12))
+        self.assertEqual(self.query("SELECT min(ts) FROM sample")[0][0], BASE + 3600)
+
+        class LostCommit(Passthrough):
+            def execute(self, sql, *args):
+                if sql == "COMMIT":
+                    raise sqlite3.OperationalError("disk I/O error (COMMIT neproběhl)")
+                return super().execute(sql, *args)
+
+        before = self.counts()
+        self.database.connection = LostCommit(real)
+        try:
+            self.assertRefused("write", self.retain, self.now, max_transactions=1)  # stav ověřen: nic nesmazáno
+        finally:
+            self.database.connection = real
+        self.assertEqual(self.counts(), before)
+        self.assertFalse(real.in_transaction)
+
+    def test_restart_between_steps_continues(self):
+        self.retain(self.now, max_transactions=1)
+        self.reopen(self.now + 60)
+        self.drain(self.now + 60)
+        self.assertEqual(self.query("SELECT min(ts) FROM sample")[0][0], BASE + 3 * 3600 - 300)
+        self.assertEqual(history.retained_since(self.database.connection)["sample"], BASE + 3 * 3600 - 300)
+
+    def test_reader_keeps_its_snapshot_during_retention(self):
+        with history.open_reader(self.db) as reader:
+            reader.connection.execute("BEGIN")
+            seen = reader.connection.execute("SELECT count(*) FROM sample").fetchone()[0]
+            outcome = self.retain(self.now)
+            self.assertGreater(outcome.deleted["sample"], 0)
+            self.assertEqual(reader.connection.execute("SELECT count(*) FROM sample").fetchone()[0], seen)
+            reader.connection.execute("COMMIT")
+            self.assertEqual(reader.connection.execute("SELECT count(*) FROM sample").fetchone()[0],
+                             seen - outcome.deleted["sample"])
+
+
+class RetentionMarkTest(RetentionTest):
+    """retained_since.*: začátek zachované historie po retenci, ne záruka souvislé řady."""
+
+    def old_rows_everywhere(self, now):
+        cpu = self.metric(CPU_TEMP_ID)
+        conn = self.database.connection
+        self.seed_samples(BASE, BASE + 6 * 3600, step=600)
+        self.aggregate_until(BASE + 6 * 3600 - 600, BASE + 5 * 3600)
+        conn.execute("BEGIN IMMEDIATE")
+        hour_cut = history._years_before(now, 10) // 3600 * 3600
+        conn.executemany("INSERT INTO agg_1h VALUES (?, ?, 1, 1, 1.0, 1.0, 1.0)", [(cpu, hour_cut - 3600 * h) for h in range(1, 4)])
+        conn.executemany("INSERT INTO check_change (ts, ts_quality, run_id, check_id, from_state, to_state) "
+                         "VALUES (?, 'synced', ?, 'x.check', 'INFO', 'WARNING')",
+                         [(now - 730 * DAY - 600 * k, self.run_id) for k in range(1, 9)])
+        conn.executemany("INSERT INTO event (ts, ts_quality, kind, severity, message) VALUES (?, 'synced', 'x', 'INFO', 'e')",
+                         [(now - 730 * DAY - 900 * k,) for k in range(1, 9)])
+        conn.execute("COMMIT")
+
+    def assertMarksConsistent(self):
+        marks = history.retained_since(self.database.connection)
+        column = {"sample": "ts", "agg_5m": "bucket", "agg_1h": "bucket", "check_change": "ts", "event": "ts"}
+        for table, mark in marks.items():
+            if mark is not None:  # pod hranicí nezbyl žádný řádek: hranice nepřeskočila nesmazaná data
+                self.assertEqual(self.query(f"SELECT count(*) FROM {table} WHERE {column[table]} < ?", (mark,))[0][0], 0, table)
+        return marks
+
+    def test_marks_follow_each_step_per_table_without_skipping(self):
+        now = BASE + 3 * 365 * DAY
+        self.old_rows_everywhere(now)
+        cutoffs = {entry.table: entry.cutoff for entry in self.plan(now).tables}
+        previous = dict.fromkeys(TABLES)
+        while True:
+            oldest = {entry.table: entry.oldest for entry in self.plan(now).tables}
+            outcome = self.retain(now, max_transactions=1)
+            marks = self.assertMarksConsistent()
+            changed = [table for table in TABLES if marks[table] != previous[table]]
+            self.assertLessEqual(len(changed), 1)  # jedna transakce = jedna tabulka
+            for table in changed:
+                self.assertLessEqual(marks[table] - oldest[table] // 3600 * 3600, 3600, table)  # nejvýš hodina dat
+                self.assertGreater(marks[table], previous[table] or 0)  # nikdy neklesá
+                self.assertLessEqual(marks[table], cutoffs[table])  # nikdy za vlastní hranicí tabulky
+            previous = marks
+            if not outcome.more:
+                break
+        self.assertTrue(all(previous[table] is not None for table in TABLES))  # každá tabulka má vlastní hranici
+        self.assertEqual({table: self.plan(now).table(table).candidates for table in TABLES}, dict.fromkeys(TABLES, 0))
+
+    def test_mark_is_start_of_retained_history_not_continuity(self):
+        self.seed_samples(BASE, BASE + 3 * 3600, step=600)
+        self.seed_samples(BASE + 5 * 3600, BASE + 8 * 3600, step=600)  # mezera 2 h v zápisu
+        self.aggregate_until(BASE + 8 * 3600 - 600, BASE + 7 * 3600)
+        self.drain(BASE + 2 * 3600 + 30 * DAY)
+        mark = history.retained_since(self.database.connection)["sample"]
+        self.assertEqual(mark, BASE + 2 * 3600)
+        metric = self.query("SELECT id FROM metric WHERE check_id = ?", (CPU_TEMP_ID,))[0][0]
+        gaps = self.query(doc_block("gaps"), {"metric_id": metric, "start": mark, "end": BASE + 8 * 3600, "max_step": 1200})
+        self.assertEqual(gaps, [(BASE + 3 * 3600 - 600, BASE + 5 * 3600)])  # mezera po hranici zůstává mezerou
+
+    def test_mark_never_decreases(self):
+        self.seed_samples(BASE, BASE + 3 * 3600, step=600)
+        self.aggregate_until(BASE + 3 * 3600 - 600, BASE + 2 * 3600)
+        now = BASE + 2 * 3600 + 30 * DAY
+        self.drain(now)
+        mark = history.retained_since(self.database.connection)["sample"]
+        older_plan = self.plan(now - 3600)
+        for outcome in (self.retain(now - 5 * DAY), self.retain(now, plan=older_plan)):  # dřívější čas, starší plán
+            self.assertEqual((outcome.transactions, outcome.retained_since["sample"]), (0, mark))
+
+
+class RetentionEpisodeTest(RetentionTest):
+    """Epizody po retenci skutečným SQL z dokumentace: žádný vymyšlený začátek, konec ani délka."""
+
+    def episodes(self, check_id, state):
+        return self.query(doc_block("state-episodes"), {"check_id": check_id, "state": state, "start": 0, "end": BASE + 2000 * DAY})
+
+    def links(self, value):
+        return self.query(doc_block("details-episodes"), {"check_id": LINK_ID, "key": "link", "value": value,
+                                                          "start": 0, "end": BASE + 2000 * DAY})
+
+    def unknown(self, check_id):
+        mark = history.retained_since(self.database.connection)["check_change"]
+        return self.query(doc_block("retention-unknown"), {"check_id": check_id, "retained": mark, "end": BASE + 2000 * DAY})
+
+    def assertCompatible(self, before, after):
+        """Po retenci jen podmnožina úplné historie: známý začátek = stejná epizoda, neznámý = stejný konec."""
+        for start, end, duration, flag in after:
+            if start is None:
+                self.assertIsNone(duration)
+                self.assertIn(end, [row[1] for row in before])
+            else:
+                self.assertIn((start, end, duration, flag), before)
+
+    def write_states(self, check_id, sequence):
+        for ts, state in sequence:
+            value = None if state is State.UNKNOWN else 50.0
+            self.write([result(check_id, state, value, None if value is None else CELSIUS, ts=ts)])
+
+    def test_episode_started_before_cutoff_without_further_transition(self):
+        self.write_states(CPU_TEMP_ID, [(BASE, State.INFO), (BASE + 10, State.CRITICAL)])
+        self.write([result(LINK_ID, State.INFO, ts=BASE, details={INTERFACE: "eth0", LINK: "UP"})])
+        for k in range(1, 4):  # po hranici se mění jen linka, stav INFO trvá
+            self.write([result(LINK_ID, State.INFO, ts=BASE + 100 * k, details={INTERFACE: "eth0", LINK: ("DOWN", "UP")[k % 2]})])
+        self.retain(BASE + 730 * DAY + 50)
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "CRITICAL"), [])  # stav po hranici neznáme...
+        self.assertEqual(self.unknown(CPU_TEMP_ID), [(self.run_id, BASE + 50, None, None)])  # ...a výsledek to přizná
+        self.assertEqual(self.episodes(LINK_ID, "INFO"), [(None, None, None, 0)])  # trvá, začátek i konec neznámé
+        self.assertEqual(self.unknown(LINK_ID), [(self.run_id, BASE + 50, BASE + 200, "INFO")])  # stav znám, údaje ne
+        # (BASE + 100 hlásí UP jako výchozí řádek: beze změny žádný řádek, první zachovaný je BASE + 200)
+
+    def test_episode_starting_exactly_on_cutoff_keeps_its_start(self):
+        self.write_states(CPU_TEMP_ID, [(BASE, State.INFO), (BASE + 40, State.CRITICAL), (BASE + 70, State.INFO)])
+        before = self.episodes(CPU_TEMP_ID, "CRITICAL")
+        self.retain(BASE + 730 * DAY + 40)
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "CRITICAL"), before)  # (BASE + 40, BASE + 70, 30, 0)
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "INFO"), [(None, BASE + 40, None, 0), (BASE + 70, None, None, 0)])
+
+    def test_same_second_transitions_on_the_cutoff(self):
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE)])
+        batch = self.recorder.begin_batch()  # dva přechody v jedné sekundě BASE + 20
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.CRITICAL, 90.0, CELSIUS, ts=BASE + 20.1, cycle=BASE + 20.1)])
+        self.recorder.add_results(batch, [result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS, ts=BASE + 20.6, cycle=BASE + 20.6)])
+        self.recorder.write(batch)
+        self.write_states(CPU_TEMP_ID, [(BASE + 50, State.WARNING)])
+        full = self.episodes(CPU_TEMP_ID, "CRITICAL")
+        self.assertEqual(full, [(BASE + 20, BASE + 20, 0, 0)])
+        self.retain(BASE + 730 * DAY + 20)  # hranice přesně na sekundě obou přechodů: zůstanou oba
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "CRITICAL"), full)
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "INFO"), [(None, BASE + 20, None, 0), (BASE + 20, BASE + 50, 30, 0)])
+        self.retain(BASE + 730 * DAY + 21)  # o sekundu dál: zmizí oba, nikdy jen jeden
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "CRITICAL"), [])
+        self.assertEqual(self.episodes(CPU_TEMP_ID, "INFO"), [(None, BASE + 50, None, 0)])
+
+    def test_unknown_before_first_retained_row(self):
+        self.write_states(CPU_TEMP_ID, [(BASE, State.INFO), (BASE + 20, State.UNKNOWN), (BASE + 60, State.INFO),
+                                        (BASE + 90, State.CRITICAL), (BASE + 95, State.INFO)])
+        before = {state: self.episodes(CPU_TEMP_ID, state) for state in ("UNKNOWN", "INFO", "CRITICAL")}
+        self.retain(BASE + 730 * DAY + 30)
+        after = {state: self.episodes(CPU_TEMP_ID, state) for state in ("UNKNOWN", "INFO", "CRITICAL")}
+        self.assertEqual(after["UNKNOWN"], [(None, BASE + 60, None, 0)])
+        self.assertEqual(after["CRITICAL"], before["CRITICAL"])
+        for state in after:
+            self.assertCompatible(before[state], after[state])
+
+    def test_link_up_down_start_and_end(self):
+        sequence = [(0, "UP"), (10, "DOWN"), (20, "UP"), (40, "DOWN"), (70, "UP")]
+        for offset, link in sequence:
+            self.write([result(LINK_ID, State.INFO, ts=BASE + offset, details={INTERFACE: "eth0", LINK: link})])
+        before = {value: self.links(value) for value in ("UP", "DOWN")}
+        self.retain(BASE + 730 * DAY + 15)  # uprostřed DOWN: hodnota před prvním řádkem (BASE + 20) není známá
+        self.assertEqual(self.links("DOWN"), [(BASE + 40, BASE + 70, 30, 0)])  # starší DOWN se nedomýšlí...
+        self.assertEqual(self.links("UP"), [(None, BASE + 40, None, 0), (BASE + 70, None, None, 0)])
+        self.assertEqual(self.unknown(LINK_ID), [(self.run_id, BASE + 15, BASE + 20, "INFO")])  # ...výsledek to přizná
+        for value in before:
+            self.assertCompatible(before[value], self.links(value))
+        self.retain(BASE + 730 * DAY + 45)  # zůstane jediný řádek: UP trvá, začátek ani konec neznámé
+        self.assertEqual((self.links("UP"), self.links("DOWN")), ([(None, None, None, 0)], []))
+        self.assertEqual(self.unknown(LINK_ID), [(self.run_id, BASE + 45, BASE + 70, "INFO")])
+
+
+class RetentionBoundaryTest(RetentionTest):
+    def test_ten_years_handles_leap_days_conservatively(self):
+        for moment in (datetime(2036, 2, 29, 12, 34, 56, tzinfo=timezone.utc), datetime(2036, 3, 1, tzinfo=timezone.utc),
+                       datetime(2037, 2, 28, 23, 59, 59, tzinfo=timezone.utc), datetime(2040, 2, 29, 0, 30, tzinfo=timezone.utc),
+                       datetime(2036, 12, 31, 23, 59, 59, tzinfo=timezone.utc)):
+            with self.subTest(now=moment.isoformat()):
+                now = math.floor(moment.timestamp())
+                cutoff = self.plan(now).table("agg_1h").time_cutoff
+                self.assertEqual(cutoff % 3600, 0)  # celé hodinové okno
+                if moment.month == 2 and moment.day == 29:
+                    later = moment.replace(year=moment.year - 10, month=3, day=1)  # „10 let“ může znamenat i 1. března
+                    earlier = moment.replace(year=moment.year - 10, day=28)
+                    self.assertLessEqual(cutoff, earlier.timestamp())
+                    self.assertLess(cutoff, later.timestamp())
+                else:
+                    self.assertLessEqual(cutoff, moment.replace(year=moment.year - 10).timestamp())
+                self.assertLessEqual(cutoff, now - 3650 * DAY - 2 * DAY)  # 10 kalendářních let má aspoň 2 přestupné dny
+
+    def test_data_newer_than_now_in_any_table_blocks(self):
+        self.seed_samples(BASE, BASE + 2 * DAY)
+        self.aggregate_until(BASE + 2 * DAY - 600, BASE + DAY)
+        now = BASE + 40 * DAY
+        conn = self.database.connection
+        high = conn.execute("SELECT last_write_utc FROM run WHERE id = ?", (self.run_id,)).fetchone()[0]
+        sources = (("run", "UPDATE run SET last_write_utc = ? WHERE id = %d" % self.run_id,
+                    "UPDATE run SET last_write_utc = %d WHERE id = %d" % (high, self.run_id)),
+                   ("check_change", "INSERT INTO check_change (ts, ts_quality, run_id, check_id, to_state) "
+                    "VALUES (?, 'synced', %d, 'x', 'INFO')" % self.run_id, "DELETE FROM check_change WHERE check_id = 'x'"),
+                   ("event", "INSERT INTO event (ts, ts_quality, kind, severity, message) VALUES (?, 'synced', 'x', 'INFO', 'z')",
+                    "DELETE FROM event WHERE kind = 'x'"))
+        for source, apply, revert in sources:
+            with self.subTest(source=source):
+                conn.execute(apply, (now + 1,))  # záznam z budoucnosti
+                before = self.counts()
+                self.assertEqual((self.retain(now).blocked, self.counts()), ("clock_behind_data", before))
+                conn.execute(revert)
+        self.assertIsNone(self.retain(now).blocked)
+
+    def test_dry_run_on_read_only_open_changes_no_user_data(self):
+        self.seed_samples(BASE, BASE + 2 * DAY)
+        self.aggregate_until(BASE + DAY, BASE + DAY)
+        self.database.close()  # bez zapisovače a po checkpointu
+        main = digest(self.db)
+        with history.open_reader(self.db) as reader:
+            plan = history.retention_plan(reader.connection, at(BASE + 40 * DAY), STABLE)
+        self.assertGreater(plan.table("sample").candidates, 0)
+        self.assertEqual(digest(self.db), main)  # hlavní soubor beze změny; -wal/-shm jsou pomocné soubory SQLite
+        self.database = history.open_writer(self.db, "test", HOST)
 
 
 class HelpersTest(unittest.TestCase):

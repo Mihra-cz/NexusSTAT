@@ -4,11 +4,12 @@ Podle docs/HISTORY.md (sekce 3–7.1):
 - vytvoření nové testovací nebo vývojové databáze na výslovně zadané cestě,
 - otevření pro zápis s ověřením identity a zámkem jediného zapisovače,
 - otevření jen pro čtení, které nic nezapíše ani neprovede checkpoint,
-- HistoryRecorder: běh, transakční dávky vzorků, změn stavu a událostí
-  a agregace uzavřených oken do agg_5m a agg_1h (M3.2a).
+- HistoryRecorder: běh, transakční dávky vzorků, změn stavu a událostí,
+  agregace uzavřených oken do agg_5m a agg_1h (M3.2a) a retence s plánem
+  bez zápisu (M3.2b).
 
-Zápis i agregace jsou synchronní a zatím je nic nevolá: vlákno, fronty a
-napojení na run.py jsou M3.3, retence (M3.2b) a snímky přijdou později. Modul nemá
+Zápis, agregace i retence jsou synchronní a zatím je nic nevolá: vlákno,
+fronty a napojení na run.py jsou M3.3, snímky přijdou později. Modul nemá
 žádnou výchozí cestu, nikdy nevytváří adresář a nikdy nepřepíše ani nesmaže
 existující soubor; maže jen vlastní dočasné soubory z nepovedeného vytvoření.
 Produkční databáze se zatím nevytváří ani neotevírá. Nečte docs/HISTORY.md:
@@ -30,7 +31,7 @@ import time
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .core import CheckResult, State, is_finite_number
@@ -644,7 +645,8 @@ class HistoryDatabase:
 
 # SQL z docs/HISTORY.md: doslovné kopie bloků insert-sample, sample-conflict,
 # batch-guard, run-last-write, close-unclean-runs, high-water, insert-change,
-# progress-5m, aggregate-5m, progress-1h a rollup-1h; shodu hlídá test.
+# progress-5m, aggregate-5m, progress-1h, rollup-1h a bloky retence (oldest-*,
+# retention-*, retention-check-*); shodu hlídá test.
 INSERT_SAMPLE_SQL = """\
 INSERT INTO sample (metric_id, ts, value) VALUES (:metric_id, :ts, :value)
 ON CONFLICT DO NOTHING;
@@ -719,6 +721,84 @@ DONE_UNTIL_SQL = "SELECT done_until FROM aggregation_state WHERE level = ?"
 # Úroveň agregace -> (posun done_until, vložení oken, tabulka).
 AGGREGATION_SQL = {"5m": (PROGRESS_5M_SQL, AGGREGATE_5M_SQL, "agg_5m"), "1h": (PROGRESS_1H_SQL, ROLLUP_1H_SQL, "agg_1h")}
 
+OLDEST_SAMPLE_SQL = """\
+SELECT ts FROM sample ORDER BY ts LIMIT 1;
+"""
+RETENTION_SAMPLE_SQL = """\
+DELETE FROM sample
+WHERE metric_id IN (SELECT id FROM metric) AND ts < :cutoff;
+"""
+OLDEST_5M_SQL = """\
+SELECT min((SELECT min(bucket) FROM agg_5m WHERE agg_5m.metric_id = metric.id)) FROM metric;
+"""
+RETENTION_5M_SQL = """\
+DELETE FROM agg_5m
+WHERE metric_id IN (SELECT id FROM metric) AND bucket < :cutoff;
+"""
+OLDEST_1H_SQL = """\
+SELECT min((SELECT min(bucket) FROM agg_1h WHERE agg_1h.metric_id = metric.id)) FROM metric;
+"""
+RETENTION_1H_SQL = """\
+DELETE FROM agg_1h
+WHERE metric_id IN (SELECT id FROM metric) AND bucket < :cutoff;
+"""
+OLDEST_CHANGE_SQL = """\
+SELECT ts FROM check_change ORDER BY ts LIMIT 1;
+"""
+RETENTION_CHANGE_SQL = """\
+DELETE FROM check_change
+WHERE ts < :cutoff;
+"""
+OLDEST_EVENT_SQL = """\
+SELECT ts FROM event ORDER BY ts LIMIT 1;
+"""
+RETENTION_EVENT_SQL = """\
+DELETE FROM event
+WHERE ts < :cutoff;
+"""
+RETENTION_CHECK_SAMPLE_SQL = """\
+-- Invariant před mazáním vzorků: okna se vzorky před :cutoff bez 5min agregace, která
+-- zahrnuje aspoň tolik vzorků. Výsledek 0 = vzorky jsou v agregacích, smí se mazat.
+SELECT count(*) FROM (
+    SELECT metric_id, ts - ts % 300 AS bucket, count(*) AS n
+    FROM sample
+    WHERE metric_id IN (SELECT id FROM metric) AND ts < :cutoff
+    GROUP BY metric_id, ts - ts % 300
+) raw
+LEFT JOIN agg_5m a ON a.metric_id = raw.metric_id AND a.bucket = raw.bucket
+WHERE a.n_samples IS NULL OR a.n_samples < raw.n;
+"""
+RETENTION_CHECK_5M_SQL = """\
+-- Invariant před mazáním 5min agregací: hodiny s okny před :cutoff bez hodinové agregace,
+-- která zahrnuje aspoň tolik vzorků. Výsledek 0 = okna jsou v agg_1h, smí se mazat.
+SELECT count(*) FROM (
+    SELECT metric_id, bucket - bucket % 3600 AS hour, sum(n_samples) AS n
+    FROM agg_5m
+    WHERE metric_id IN (SELECT id FROM metric) AND bucket < :cutoff
+    GROUP BY metric_id, bucket - bucket % 3600
+) five
+LEFT JOIN agg_1h h ON h.metric_id = five.metric_id AND h.bucket = five.hour
+WHERE h.n_samples IS NULL OR h.n_samples < five.n;
+"""
+# Tabulka -> (nejstarší řádek, mazání, invariant agregace nebo None). Počet ke kontrole
+# rowcount má stejnou podmínku WHERE jako mazání (odvozený přímo z jeho textu).
+RETENTION_SQL = {
+    "sample": (OLDEST_SAMPLE_SQL, RETENTION_SAMPLE_SQL, RETENTION_CHECK_SAMPLE_SQL),
+    "agg_5m": (OLDEST_5M_SQL, RETENTION_5M_SQL, RETENTION_CHECK_5M_SQL),
+    "agg_1h": (OLDEST_1H_SQL, RETENTION_1H_SQL, None),
+    "check_change": (OLDEST_CHANGE_SQL, RETENTION_CHANGE_SQL, None),
+    "event": (OLDEST_EVENT_SQL, RETENTION_EVENT_SQL, None),
+}
+RETENTION_COUNT_SQL = {table: "SELECT count(*) FROM" + sql[len("DELETE FROM"):] for table, (_, sql, _) in RETENTION_SQL.items()}
+RETENTION_TABLES = tuple(RETENTION_SQL)
+# Začátek zachované historie (trvale v meta, nikdy neklesá): řádky před ním retence smazala,
+# od něj nesmazala nic. Není to záruka souvislé řady: mezery v zápisu zůstávají mezerami.
+RETAINED_SINCE_KEY = "retained_since.{table}"
+# Skok v posledních 24 h (i událost „z budoucnosti“ po skoku zpět); po přesně 24 h pauza končí.
+CLOCK_JUMP_SINCE_SQL = "SELECT count(*) FROM event WHERE ts > ? AND kind = 'clock.jump'"
+NEWEST_DATA_SQL = ("SELECT max(coalesce((SELECT max(last_write_utc) FROM run), 0), "
+                   "coalesce((SELECT max(ts) FROM check_change), 0), coalesce((SELECT max(ts) FROM event), 0))")
+
 TIME_QUALITIES = ("synced", "derived", "unsynced")
 SEVERITIES = ("INFO", "WARNING", "ERROR", "CRITICAL")
 # Čas před 2026-01-01 UTC se nikdy nepovažuje za synchronizovaný (HISTORY.md 4.3).
@@ -731,6 +811,15 @@ LOSS_SUMMARY_SECONDS = 3600
 WINDOW_SECONDS = 300
 HOUR_SECONDS = 3600
 AGGREGATION_GRACE_SECONDS = 120
+# Retence (HISTORY.md 7): schválené nejkratší doby uchování; parametry API je nemění.
+DAY_SECONDS = 86400
+SAMPLE_KEEP_DAYS = 30
+AGG_5M_KEEP_DAYS = 365
+AGG_1H_KEEP_YEARS = 10
+CHANGE_KEEP_DAYS = 730  # check_change a event (R4)
+RETENTION_MAX_TRANSACTIONS = 24  # nejvýš den dat (po hodině) za jeden běh údržby
+RETENTION_STEP_SECONDS = 3600  # jedna transakce smaže nejvýš hodinu historie
+RETENTION_STABLE_CLOCK_SECONDS = 86400  # po skoku hodin (nebo bez doložení) se nemaže 24 h
 
 
 @dataclass(frozen=True)
@@ -940,6 +1029,76 @@ class AggregationResult:
 
 
 @dataclass(frozen=True)
+class ClockState:
+    """Kontrakt s M3.3 o čase pro nevratné mazání (HISTORY.md 7); zapisovač ho sám nezjišťuje.
+
+    synced = zdroj synchronizace potvrzuje správný UTC čas právě teď. stable_s =
+    doložená doba (sekundy monotónního času) souvislé synchronizace bez zjištěného
+    skoku hodin; None = neznámo. Retence maže jen při synced a stable_s ≥ 24 h.
+    Testy ho vytvářejí ručně: to je simulace, ne důkaz skutečné synchronizace.
+    """
+
+    synced: bool
+    stable_s: int | None
+
+    def __post_init__(self):
+        if not isinstance(self.synced, bool):
+            raise TypeError("synced musí být bool")
+        if self.stable_s is not None:
+            if isinstance(self.stable_s, bool) or not isinstance(self.stable_s, int) or self.stable_s < 0:
+                raise ValueError("stable_s musí být nezáporné celé číslo nebo None")
+            if not self.synced:
+                raise ValueError("nesynchronizovaný čas nemá dobu stability")
+
+    @classmethod
+    def unknown(cls):
+        return cls(False, None)
+
+    @classmethod
+    def synced_for(cls, stable_s):
+        if stable_s is None:
+            raise ValueError("neznámá doba stability je ClockState.unknown()")
+        return cls(True, stable_s)
+
+
+@dataclass(frozen=True)
+class RetentionTable:
+    """Plán retence jedné tabulky (výpočet bez zápisu)."""
+
+    table: str
+    time_cutoff: int  # now − schválená doba uchování (zarovnáno podle HISTORY.md 7)
+    aggregation_until: int | None  # done_until potřebné úrovně (sample: 5m, agg_5m: 1h), jinak None
+    cutoff: int  # mazalo by se jen ts/bucket < cutoff
+    limited_by_aggregation: bool  # hranici drží nedokončená agregace, ne čas
+    oldest: int | None  # nejstarší řádek tabulky
+    candidates: int  # řádky pod hranicí
+    invariant_ok: bool | None  # další krok má data v agregacích (None = bez kandidátů nebo bez invariantu)
+
+
+@dataclass(frozen=True)
+class RetentionPlan:
+    now: int
+    blocked: str | None  # time_unsynced, clock_unstable, clock_jump_recent, clock_behind_data
+    done_5m: int
+    done_1h: int
+    tables: tuple  # RetentionTable v pořadí RETENTION_TABLES
+
+    def table(self, name):
+        return next(entry for entry in self.tables if entry.table == name)
+
+
+@dataclass(frozen=True)
+class RetentionResult:
+    blocked: str | None  # proč se nesmazalo nic (čas); jinak None
+    transactions: int  # potvrzené mazací transakce v tomto běhu
+    deleted: Mapping  # tabulka -> skutečně smazané řádky (ověřený rowcount)
+    stopped: Mapping  # tabulka -> důvod zastavení (aggregation_mismatch, aggregation_state_invalid)
+    retained_since: Mapping  # tabulka -> trvalá hranice v meta po běhu (None = nic nesmazáno)
+    verified_after_uncertain_commit: int = 0  # kroky potvrzené kontrolou stavu po chybě COMMIT
+    more: bool = False  # limit transakcí došel dřív, než byla práce hotová
+
+
+@dataclass(frozen=True)
 class RunInfo:
     id: int
     started_utc: int
@@ -959,6 +1118,93 @@ def run_info(connection, run_id):
 def high_water(connection):
     """Horní časová mez: nejnovější zapsaný vzorek všech běhů (HISTORY.md 4.2), nebo None."""
     return connection.execute(HIGH_WATER_SQL).fetchone()[0]
+
+
+def _years_before(ts, years):
+    """Kalendářní roky zpět v UTC; 29. února → 28. února (uchová se aspoň celých `years` let)."""
+    moment = datetime.fromtimestamp(ts, timezone.utc)
+    try:
+        earlier = moment.replace(year=moment.year - years)
+    except ValueError:
+        earlier = moment.replace(year=moment.year - years, day=28)
+    return math.floor(earlier.timestamp())
+
+
+def _retention_bounds(table, now, done_5m, done_1h):
+    """(časová hranice, hranice z agregace nebo None) podle HISTORY.md 7."""
+    if table == "sample":
+        return now - SAMPLE_KEEP_DAYS * DAY_SECONDS, done_5m
+    if table == "agg_5m":
+        return (now - AGG_5M_KEEP_DAYS * DAY_SECONDS) // HOUR_SECONDS * HOUR_SECONDS, done_1h
+    if table == "agg_1h":
+        # Celé hodiny: bucket před hranicí je celý starší než 10 let.
+        return _years_before(now, AGG_1H_KEEP_YEARS) // HOUR_SECONDS * HOUR_SECONDS, None
+    return now - CHANGE_KEEP_DAYS * DAY_SECONDS, None
+
+
+def _retention_guard(conn, now, clock):
+    """Důvod, proč se nesmí mazat (čas), nebo None. Při jakékoli nejistotě se nemaže."""
+    if now < MIN_TRUSTED_UTC or not clock.synced:
+        return "time_unsynced"
+    if clock.stable_s is None or clock.stable_s < RETENTION_STABLE_CLOCK_SECONDS:
+        return "clock_unstable"
+    if conn.execute(CLOCK_JUMP_SINCE_SQL, (now - RETENTION_STABLE_CLOCK_SECONDS,)).fetchone()[0]:
+        return "clock_jump_recent"  # i skok zjištěný zapisovačem v předchozím běhu
+    if conn.execute(NEWEST_DATA_SQL).fetchone()[0] > now:
+        return "clock_behind_data"  # zapsaná data jsou novější než „teď“: čas není jistý
+    return None
+
+
+def _oldest(conn, sql):
+    # oldest-sample/-change/-event (ORDER BY … LIMIT 1) nad prázdnou tabulkou nevrátí žádný řádek.
+    row = conn.execute(sql).fetchone()
+    return None if row is None else row[0]
+
+
+def _check_clock_state(now_utc, clock):
+    if not isinstance(clock, ClockState):
+        raise TypeError("stav hodin musí být ClockState (synced_for nebo unknown)")
+    return _utc_seconds(now_utc)
+
+
+def retained_since(connection):
+    """Trvalé hranice retence z meta: tabulka -> začátek zachované historie, nebo None (nic nesmazáno)."""
+    rows = dict(connection.execute("SELECT key, value FROM meta WHERE key LIKE 'retained_since.%'"))
+    return {table: None if RETAINED_SINCE_KEY.format(table=table) not in rows
+            else int(rows[RETAINED_SINCE_KEY.format(table=table)]) for table in RETENTION_TABLES}
+
+
+def retention_plan(connection, now_utc, clock):
+    """Plán retence bez zápisu (dry-run); funguje i nad spojením jen pro čtení.
+
+    Vše se čte v jedné čtecí transakci ukončené ROLLBACK. Plán je jen informace a
+    horní mez pro retain(): provedení každou podmínku ověří znovu ve své transakci.
+    """
+    now = _check_clock_state(now_utc, clock)
+    started = not connection.in_transaction
+    if started:
+        connection.execute("BEGIN")
+    try:
+        blocked = _retention_guard(connection, now, clock)
+        done_5m = connection.execute(DONE_UNTIL_SQL, ("5m",)).fetchone()[0]
+        done_1h = connection.execute(DONE_UNTIL_SQL, ("1h",)).fetchone()[0]
+        tables = []
+        for table in RETENTION_TABLES:
+            oldest_sql, _, check_sql = RETENTION_SQL[table]
+            time_cutoff, bound = _retention_bounds(table, now, done_5m, done_1h)
+            cutoff = time_cutoff if bound is None else min(time_cutoff, bound)
+            oldest = _oldest(connection, oldest_sql)
+            candidates = connection.execute(RETENTION_COUNT_SQL[table], {"cutoff": cutoff}).fetchone()[0]
+            invariant = None
+            if candidates and check_sql is not None:
+                step_end = min(cutoff, oldest // RETENTION_STEP_SECONDS * RETENTION_STEP_SECONDS + RETENTION_STEP_SECONDS)
+                invariant = connection.execute(check_sql, {"cutoff": step_end}).fetchone()[0] == 0
+            tables.append(RetentionTable(table, time_cutoff, bound, cutoff, bound is not None and bound < time_cutoff,
+                                         oldest, candidates, invariant))
+    finally:
+        if started:
+            connection.execute("ROLLBACK")  # plán nikdy nic nezapíše
+    return RetentionPlan(now, blocked, done_5m, done_1h, tuple(tables))
 
 
 class ChangeTracker:
@@ -1387,6 +1633,127 @@ class HistoryRecorder:
             reachable = done_5m if newest is None else min(limit, newest // WINDOW_SECONDS * WINDOW_SECONDS)
             more = reachable > done_5m or done_1h + HOUR_SECONDS <= done_5m
         return AggregationResult(done_5m, done_1h, windows_5m, windows_1h, blocked, more)
+
+    def retention_plan(self, now_utc, clock):
+        """Plán retence nad spojením zapisovače, bez zápisu (viz retention_plan())."""
+        self._require_run()
+        return retention_plan(self.database.connection, now_utc, clock)
+
+    def retain(self, now_utc, clock, plan=None, max_transactions=RETENTION_MAX_TRANSACTIONS):
+        """Jeden běh retence (HISTORY.md 7); vrací RetentionResult.
+
+        Každý krok je jedna transakce, která smaže nejvýš hodinu historie jedné tabulky:
+        BEGIN IMMEDIATE → znovu čas, done_until a invariant agregací → počet → DELETE →
+        kontrola rowcount → hranice v meta → COMMIT. Tabulky se střídají; nejvýš
+        `max_transactions` (≤ 24) mazacích transakcí za běh. `plan` je jen horní mez.
+        Při nejistém COMMIT se nejdřív ověří stav databáze. Nic jiného se nemění.
+        """
+        self._require_run()
+        now = _check_clock_state(now_utc, clock)
+        if isinstance(max_transactions, bool) or not isinstance(max_transactions, int) \
+                or not 1 <= max_transactions <= RETENTION_MAX_TRANSACTIONS:
+            raise ValueError(f"max_transactions musí být 1–{RETENTION_MAX_TRANSACTIONS}")
+        caps = {}
+        if plan is not None:
+            if not isinstance(plan, RetentionPlan):
+                raise TypeError("plan musí být RetentionPlan z retention_plan()")
+            caps = {entry.table: entry.cutoff for entry in plan.tables}
+        conn = self.database.connection
+        deleted, stopped = Counter(), {}
+        transactions = verified = 0
+        blocked = None  # čas se ověřuje jen uvnitř každé mazací transakce (autoritativně)
+        active = list(RETENTION_TABLES)
+        while active and transactions < max_transactions:
+            for table in list(active):
+                if transactions >= max_transactions:
+                    break
+                status, value, confirmed = self._retention_step(table, now, clock, caps.get(table))
+                if status == "deleted":
+                    transactions += 1
+                    deleted[table] += value
+                    verified += confirmed
+                elif status == "done":
+                    active.remove(table)
+                elif status == "stopped":
+                    stopped[table] = value
+                    active.remove(table)
+                else:  # čas není bezpečný: v tomto běhu se nemaže nic dalšího
+                    blocked, active = value, []
+                    break
+        # Limit běhu došel: zbývá práce jen tam, kde ještě je řádek pod hranicí (jen čtení).
+        more = any(self._retention_pending(table, now, caps.get(table)) for table in active)
+        return RetentionResult(blocked, transactions, {table: deleted[table] for table in RETENTION_TABLES},
+                               stopped, retained_since(conn), verified, more)
+
+    def _retention_pending(self, table, now, cap):
+        conn = self.database.connection
+        done_5m = conn.execute(DONE_UNTIL_SQL, ("5m",)).fetchone()[0]
+        done_1h = conn.execute(DONE_UNTIL_SQL, ("1h",)).fetchone()[0]
+        time_cutoff, bound = _retention_bounds(table, now, done_5m, done_1h)
+        cutoff = min(value for value in (time_cutoff, bound, cap) if value is not None)
+        oldest = _oldest(conn, RETENTION_SQL[table][0])
+        return oldest is not None and oldest < cutoff
+
+    def _retention_step(self, table, now, clock, cap):
+        """Jedna mazací transakce; vrací (stav, hodnota, potvrzeno až kontrolou po COMMIT)."""
+        oldest_sql, delete_sql, check_sql = RETENTION_SQL[table]
+        conn = self.database.connection
+        end = expected = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            reason = _retention_guard(conn, now, clock)
+            if reason is not None:
+                conn.execute("ROLLBACK")
+                return "blocked", reason, 0
+            done_5m = conn.execute(DONE_UNTIL_SQL, ("5m",)).fetchone()[0]
+            done_1h = conn.execute(DONE_UNTIL_SQL, ("1h",)).fetchone()[0]
+            if check_sql is not None and done_1h > done_5m:
+                conn.execute("ROLLBACK")  # porušená evidence agregací: nemazat nic, co na ní závisí
+                return "stopped", "aggregation_state_invalid", 0
+            time_cutoff, bound = _retention_bounds(table, now, done_5m, done_1h)
+            cutoff = min(value for value in (time_cutoff, bound, cap) if value is not None)
+            oldest = _oldest(conn, oldest_sql)
+            if oldest is None or oldest >= cutoff:
+                conn.execute("ROLLBACK")
+                return "done", None, 0
+            end = min(cutoff, oldest // RETENTION_STEP_SECONDS * RETENTION_STEP_SECONDS + RETENTION_STEP_SECONDS)
+            params = {"cutoff": end}
+            if check_sql is not None and conn.execute(check_sql, params).fetchone()[0]:
+                conn.execute("ROLLBACK")  # data pod hranicí nejsou celá v agregacích: nemazat
+                return "stopped", "aggregation_mismatch", 0
+            expected = conn.execute(RETENTION_COUNT_SQL[table], params).fetchone()[0]
+            removed = conn.execute(delete_sql, params).rowcount
+            if removed != expected:
+                raise sqlite3.DatabaseError(f"smazáno {removed} řádků místo {expected}")
+            self._mark_retained(conn, table, end)
+            conn.execute("COMMIT")
+        except sqlite3.Error as error:
+            _rollback(conn)
+            if expected is not None and self._retention_committed(table, end):
+                return "deleted", expected, 1  # COMMIT proběhl, jen volající dostal chybu
+            raise HistoryError("write", f"retenci {table} pod {end} nelze provést, vrácena: {error}") from None
+        except BaseException:
+            _rollback(conn)  # i Ctrl+C nebo chyba programu: nic smazaného, zámek zápisu uvolněn
+            raise
+        return "deleted", removed, 0
+
+    def _mark_retained(self, conn, table, end):
+        key = RETAINED_SINCE_KEY.format(table=table)
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (key, str(end)))
+        elif int(row[0]) < end:
+            conn.execute("UPDATE meta SET value = ? WHERE key = ?", (str(end), key))
+
+    def _retention_committed(self, table, end):
+        """Po chybě COMMIT: je krok v databázi? (pod hranicí nic nezbylo a hranice je zapsaná)."""
+        conn = self.database.connection
+        try:
+            remaining = conn.execute(RETENTION_COUNT_SQL[table], {"cutoff": end}).fetchone()[0]
+            mark = retained_since(conn)[table]
+        except sqlite3.Error:
+            return False  # stav nelze ověřit: hlásí se jako neprovedené
+        return remaining == 0 and mark is not None and mark >= end
 
     def _check_open(self, batch):
         if not isinstance(batch, Batch):
