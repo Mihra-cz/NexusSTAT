@@ -268,7 +268,7 @@ Raspberry Pi bez baterie RTC startuje s časem posledního vypnutí a NTP ho až
 | `unsynced` (nelze spolehlivě určit) | synchronizace v tomto bootu nenastala dřív, než bylo nutné data zapsat nebo zahodit (ukončení, přetečení fronty); čas je systémový a může být chybný | jen `check_change` a `event`, **nikdy `sample`**; jejich `data` neobsahují žádný rozsah UTC, jen počet a monotónní rozsah |
 
 - Tabulka `sample` sloupec kvality nemá (1 B na řádek navíc pro vzácný případ). Odvozené vzorky označuje událost `clock.synced` s jejich rozsahem a počtem.
-- Stav implementace (M3.1b, 11.1): zapisovač bere kvalitu času jako vstup a nikdy neukládá vzorek s `unsynced`; fronta před synchronizací, dopočet `derived` a monotónní rozsah ztrát jsou otevřené požadavky M3.3.
+- Stav implementace (M3.3a, 11.4): vlákno zapisovače drží měření i změny před první synchronizací ve frontě s monotónním časem měření a po první synchronizované dávce jim dopočte `derived` čas (posun `UTC − monotonic` z prvního synchronizovaného měření) a zapíše `clock.synced`. Ztráty před synchronizací nesou počet a monotónní rozsah (s `boot_id`) a dostanou odvozený rozsah UTC; při ukončení bez synchronizace se vzorky nezapíšou (`history.gap`, důvod `time_unsynced`, jen monotónní rozsah) a změny se zapíšou s `unsynced`. Skutečný zdroj stavu synchronizace dodá M3.3b; v M3.3a ho nese každé předání (`time_synced`), neznámý stav se nikdy nepovažuje za synchronizovaný.
 - Před první synchronizací v bootu čekají měření ve frontě s monotónním časem. Přetečení fronty (déle než 1 h bez synchronizace) zahodí nejstarší; záznam o ztrátě drží jen počet a monotónní rozsah. Po synchronizaci dostane rozsah ztráty odvozený čas stejně jako čekající vzorky (`history.gap`, `derived`). Při ukončení bez synchronizace se vzorky nezapíšou (`history.rejected`, důvod `time_unsynced`) a změny, události i záznam o ztrátě se zapíšou s `unsynced` a bez rozsahu UTC. **Vymyšlená časová značka tak nevznikne nikdy.**
 - Restart procesu před synchronizací frontu ztratí; v historii zůstane neznámá mezera (5.4).
 - Ztráta synchronizace po předchozí synchronizaci je jen událost (`clock.sync_lost`, `clock.sync_restored`); hodiny běží dál s naposledy nastavenou korekcí, data se zapisují. Skok o víc než 2 s (posun `UTC − monotonic` mezi měřeními; běžné doladění NTP je řádově milisekundy za sekundu) je `clock.jump` se směrem a velikostí.
@@ -333,6 +333,7 @@ HistoryWriter (vlastní vlákno, vlastní spojení sqlite3, jediný zapisovatel)
 - **Fronta změn a událostí:** nejvýš 2 000 položek (změny stavu a vlastní události zapisovače). Změny se počítají už při `submit()`, takže zahození vzorků neposune čas ani neztratí přechod alarmu. Při zaplnění se zahodí nejstarší a započítá (`history.changes_dropped`). Trvale kmitající kontrola přidá až 360 položek za hodinu (přechod při každém měření, 7.1); hodinový výpadek zápisu tak fronta vydrží nejvýš s pěti takovými kontrolami najednou, při víc se nejstarší změny zahodí se záznamem ztráty (5.4).
 - **Dávka:** zapisovač se probouzí při každém `submit()` a nejméně každých 10 s. Transakci zahájí, když (a) nejstarší nezapsané měření je staré 60 s (monotónní čas), (b) čeká změna stavu nebo událost, nebo (c) proces končí. **Interval dávkování 60 s je tedy nejvyšší stáří nezapsaného měření v bezchybném provozu**, ne pevný takt.
 - Pořadí v transakci: `BEGIN IMMEDIATE` (zámek zápisu hned na začátku), `batch-guard` (číslo dávky = `last_batch + 1`), vzorky (4.1), `check_change`, `event`, evidence běhu (`run-last-write`), `COMMIT`. Teprve po úspěšném commitu se položky z front odeberou.
+- **Implementace (M3.3a, 11.4), změřené kapacity:** fronta měření = `ceil(3600 / interval_s)` měření; skutečně změřeno 3,6 MB za hodinu při 20 výsledcích po 10 s (odhad „pod 1 MB“ výše byl nízký), při 1 s asi 36 MB. Změna stavu zabere asi 470 B. Původních **2 000 změn** vydrží hodinový výpadek zápisu jen při 5 trvale kmitajících kontrolách (10 kontrol = 3 600, 20 = 7 200 změn za hodinu po 10 s). **Schváleno 2026-10-21:** fronta změn = hodina trvalého kmitání 20 kontrol, `ceil(3600 / interval_s) × 20` (7 200 změn ≈ 3,4 MB po 10 s, 72 000 ≈ 33 MB po 1 s); ověřeno 1, 5, 10 a 20 kmitajícími kontrolami bez ztráty, 21 kontrol ztrácí. Důležité události mají vlastní frontu (500), aby je záplava změn nevytlačila. **Pevný paměťový strop:** fronta měření drží nejvýš 72 000 hodnot (výsledků) bez ohledu na počet kontrol; s víc než 20 výsledky na měření pokryje proto kratší dobu než hodinu (zahazuje nejstarší se záznamem ztráty). Změřeno v nejhorším případě (interval 1 s, 20 výsledků, všechny kontroly kmitají, obě fronty plné): **55,7 MB**; při výchozích 10 s asi 5,6 MB. Povolený interval je celé číslo 1–3600 s (ověřuje konfigurace, `HistoryWorker`, `start_run` i `CHECK` v `run`), takže fronta změn má nejvýš 72 000 položek. Fronta událostí drží 500 událostí po nejvýš `MAX_EVENT_BYTES` = 16 KiB textu a údajů (≈ 8 MB); větší událost `submit_event()` nepřijme a započte jako ztrátu `event_too_large` (`history.events_dropped`), nikdy nevyhodí chybu do sledování. Horní mez všech tří front je tak asi 64 MB. Odhad počítá s krátkými texty výsledků (`summary`, `details` podle 3.4); jejich délku zatím nic nevynucuje (11.4). Bezeztrátový provoz při neomezeném výpadku databáze slíbit nejde: po zaplnění se zahazují nejstarší položky se záznamem ztráty.
 - `run.last_write_utc` (horní mez, 4.2) posune jen vzorek, který dávka skutečně vložila (`rowcount` 1). Proto se zapisuje až po vzorcích: vzorek odmítnutý databází (konflikt, jiná jednotka uložené řady) ani duplicita horní mez neposunou (oprava při review M3.1b; dřív `batch-guard` zapisoval nejnovější čas dávky ještě před zápisem).
 
 <!-- sql:batch-guard -->
@@ -378,9 +379,10 @@ V každém případě: když je spojení v transakci, zapisovač ji zruší (`RO
 | `SQLITE_IOERR`, `SQLITE_READONLY`, `SQLITE_CANTOPEN` | spojení se zavře | znovu otevřít s odstupem 60 s až 10 min |
 | chyba při `COMMIT` (nejisté, zda proběhl) | spojení se zavře a znovu otevře, přečte `run.last_batch`: ≥ číslo dávky = zapsáno, položky se odeberou; jinak zůstávají | ihned po zjištění |
 | `SQLITE_CORRUPT`, `SQLITE_NOTADB`, `quick_check` ≠ `ok` | historie zastavena, soubor se nemění | jen po zásahu správce (9.6) |
-| neočekávaná `IntegrityError` (chyba programu) | dávka se rozdělí: vzorky po jednom s `sample-conflict`, ostatní položky se zaznamenají jako `history.write_rejected` `ERROR`; zbytek se zapíše | — |
+| neočekávaná `IntegrityError` (chyba programu) | zapisovač přejde do `FAILED` a dál nezapisuje; data zůstanou ve frontách, monitoring běží (rozhodnuto 2026-10-21; automatické rozdělení dávky odloženo) | jen po zásahu správce |
 
 - Chyba zápisu nikdy nezahodí data okamžitě: zahazuje jen přetečení fronty (5.4).
+- **Implementace (M3.3a, 11.4):** druh chyby určuje jméno chyby SQLite (`HistoryError.sqlite_error`): `SQLITE_BUSY`/`LOCKED` opakování po 5 s až 60 s; `SQLITE_FULL` po 60 s až 10 min; `SQLITE_IOERR`, `SQLITE_READONLY`, `SQLITE_CANTOPEN`, `SQLITE_PERM` a nečekané chyby zavřou spojení a znovu ho otevřou po 60 s až 10 min (stejný běh, `HistoryRecorder.rebind`), stejně uzamčená nebo chybějící databáze při otevření (nikdy se nevytváří). Nejistý `COMMIT` vyřeší opakování zapečetěné dávky (`batch-guard`). `SQLITE_CORRUPT`, `SQLITE_NOTADB`, `quick_check` ≠ `ok`, cizí soubor a **nečekaná `IntegrityError`** zapisovač zastaví (`FAILED`), data zůstanou ve frontách a monitoring běží; obnova jen zásahem správce. Automatické rozdělení dávky po `IntegrityError` je odložené (zapečetěnou dávku nelze měnit, 13.8). Po ztrátě práva zápisu je potřeba vrátit práva i `-wal` a `-shm`: SQLite je mezitím může vytvořit s právy hlavního souboru jen pro čtení.
 - Zaseknuté I/O (visící `fsync`) blokuje jen vlákno zapisovače; fronty se plní a pak zahazují nejstarší.
 
 ### 5.4 Záznam skutečné ztráty dat
@@ -393,7 +395,7 @@ V každém případě: když je spojení v transakci, zapisovač ji zruší (`RO
 | konflikt vzorku | řada, čas, obě hodnoty | `history.sample_conflict` (`ERROR`) |
 
 - Počitadla jsou v paměti od okamžiku ztráty a hned se promítnou do `history.storage` (`ERROR` = data se zahazují). Do databáze se dostanou s prvním úspěšným zápisem. Při ukončení se vypíšou i do journalu.
-- Stav implementace (M3.1b, 11.1): `history.rejected`, `history.sample_conflict` a `history.unknown_gap` zapisuje zapisovač; `history.gap`, `history.changes_dropped`, `history.storage` a výpis do journalu vzniknou až s frontami a vláknem M3.3.
+- Stav implementace: `history.rejected`, `history.sample_conflict` a `history.unknown_gap` zapisuje zapisovač (M3.1b); `history.gap`, `history.changes_dropped` a `history.events_dropped` vlákno zapisovače (M3.3a) z počitadel v paměti, jedna událost za druh a dávku (záznam ztráty sám frontu neplní). Stav `history.storage` a výpis do journalu jsou M3.3b.
 
 **Druhy mezer v historii:**
 
@@ -425,7 +427,9 @@ Zaručit nelze: horní mez ztráty při pádu (běžně ≤ 60 s, ale po předch
 | výpadek napájení, `synchronous=FULL` | jako pád procesu, pokud úložiště dodržuje `fsync` |
 | výpadek napájení, `synchronous=NORMAL` | navíc potvrzené transakce od poslední synchronizace WAL (ta probíhá při checkpointu); hranice není pevná |
 
-Dnešní `run.py` SIGTERM neobsluhuje; obsluha s dopsáním front je součástí M3.
+Dnešní `run.py` SIGTERM neobsluhuje; obsluha s dopsáním front je součástí M3.3b.
+
+**Ukončení vlákna zapisovače (M3.3a):** `stop(timeout=10)` přestane přijímat data (pozdější předání se jen započtou), zkusí poslední zápis nejvýš dvakrát bez čekání na odstup, zapíše čisté ukončení (`finish_run`) a zavře databázi ve vlákně zapisovače. Zaručeno: data jsou buď potvrzená commitem, nebo jsou v `StopReport` započtená jako nezapsaná; čisté ukončení se hlásí jen po potvrzeném `finish_run`. **Nezaručeno:** Python neumí přerušit vlákno zaseknuté v systémovém I/O (visící `fsync`). Pak `stop()` po limitu vrátí `completed = False`, vlákno (démonické) dál drží zámek databáze a uvolní ho až konec procesu; nepotvrzená dávka se ztratí a příští start ji označí neznámou mezerou.
 
 ### 5.6 Proč výpadek databáze nezastaví měření ani alarmy
 
@@ -736,15 +740,19 @@ WITH state_rows AS (
     FROM check_change
     WHERE check_id = :check_id AND from_state IS NOT to_state AND ts >= :start AND ts < :end
 ), ordered AS (
-    SELECT ts, from_state, to_state, lead(ts) OVER (PARTITION BY run_id ORDER BY ts, id) AS next_ts
+    SELECT ts, from_state, to_state, lead(ts) OVER w AS next_ts, lead(from_state) OVER w AS next_from,
+           lag(to_state) OVER w AS previous_to, row_number() OVER w AS state_position
     FROM state_rows
+    WINDOW w AS (PARTITION BY run_id ORDER BY ts, id)
 ), first_rows AS (
     SELECT run_id, ts, from_state, row_number() OVER (PARTITION BY run_id ORDER BY ts, id) AS position
     FROM check_change
     WHERE check_id = :check_id AND ts >= :start AND ts < :end
 )
 SELECT start_ts, end_ts, duration_s, start_at_run_begin FROM (
-    SELECT ts AS start_ts, next_ts AS end_ts, next_ts - ts AS duration_s,
+    -- Konec jen tehdy, když další změna začíná tímto stavem; jinak chybí změny (M3.3a): konec neznámý.
+    SELECT ts AS start_ts, CASE WHEN next_from IS to_state THEN next_ts END AS end_ts,
+           CASE WHEN next_from IS to_state THEN next_ts - ts END AS duration_s,
            from_state IS NULL AS start_at_run_begin, ts AS sort_ts
     FROM ordered
     WHERE to_state = :state
@@ -752,6 +760,11 @@ SELECT start_ts, end_ts, duration_s, start_at_run_begin FROM (
     SELECT NULL, (SELECT min(ts) FROM state_rows WHERE state_rows.run_id = first_rows.run_id), NULL, 0, ts
     FROM first_rows
     WHERE position = 1 AND from_state = :state
+    UNION ALL
+    -- Nespojitost uvnitř běhu: stav před řádkem začal v chybějících změnách (začátek neznámý).
+    SELECT NULL, ts, NULL, 0, ts
+    FROM ordered
+    WHERE state_position > 1 AND previous_to IS NOT from_state AND from_state = :state
 )
 ORDER BY sort_ts, start_ts IS NOT NULL;
 ```
@@ -778,6 +791,37 @@ SELECT CASE WHEN cut THEN NULL ELSE ts END AS start_ts, next_ts AS end_ts,
 FROM ordered
 WHERE current = :value
 ORDER BY ts;
+```
+
+**Zahozené změny (M3.3a):** při přetečení fronty změn zapíše vlákno zapisovače `history.changes_dropped` s počty a hranicemi i po kontrolách (`data.checks`). `state-episodes` nespojitost, kterou řádky ukazují (další změna nezačíná stavem, kterým epizoda skončila), přizná koncem `NULL` a epizodou s neznámým začátkem. Nespojitost, kterou řádky neukážou (zahozený celý cyklus, např. CRITICAL → INFO → CRITICAL, nebo změny údajů), přizná jen dotaz `changes-dropped`. Aktuální stav kontroly (poslední zapsaná změna) zůstává pravdivý.
+
+**Kontrakt čtení epizod (M3.3a):** návaznost `from_state` sama nedokazuje úplnou historii. Čtenář (web, export, výpis) proto vyhodnocuje `state-episodes` i `details-episodes` vždy spolu se zahozenými změnami: pro každou epizodu spustí `episode-dropped-changes` (`:start_ts` a `:end_ts` z epizody, `NULL` = neomezeno). Vrátí-li dotaz řádek, nepřerušenost epizody není doložená. Pak je konec i délka neznámá (zobrazí se jako neúplná historie s úsekem ztráty) a chybějící přechody ani jejich časy se nedomýšlejí. Úsek ztráty bez rozsahu UTC (ztráta před synchronizací hodin, kterou proces už nestihl odvodit) zasahuje do každé epizody kontroly, dokud ho retence nesmaže.
+
+<!-- sql:changes-dropped -->
+```sql
+-- Úseky, v nichž zapisovač zahodil změny kontroly (přetečení fronty): historie tam není úplná,
+-- i když navazující řádky vypadají spojitě. dropped_from a dropped_to jsou UTC (u ztráty před
+-- synchronizací odvozené); NULL = jen monotónní rozsah v data (mono_from, mono_to, boot_id).
+SELECT event.ts, json_extract(item.value, '$.count') AS dropped,
+       json_extract(item.value, '$.from') AS dropped_from, json_extract(item.value, '$.to') AS dropped_to
+FROM event, json_each(event.data, '$.checks') AS item
+WHERE event.kind = 'history.changes_dropped' AND item.key = :check_id
+ORDER BY event.id;
+```
+
+<!-- sql:episode-dropped-changes -->
+```sql
+-- Zahozené změny kontroly, které zasahují do epizody [:start_ts, :end_ts] ze state-episodes
+-- nebo details-episodes (NULL = začátek či konec neznámý, tedy neomezeno). Řádek = nepřerušenost
+-- epizody není doložená, konec a délka jsou neznámé. Úsek bez rozsahu UTC zasahuje vždy.
+SELECT event.ts, json_extract(item.value, '$.count') AS dropped,
+       json_extract(item.value, '$.from') AS dropped_from, json_extract(item.value, '$.to') AS dropped_to
+FROM event, json_each(event.data, '$.checks') AS item
+WHERE event.kind = 'history.changes_dropped' AND item.key = :check_id
+  AND (json_extract(item.value, '$.from') IS NULL
+       OR ((:start_ts IS NULL OR json_extract(item.value, '$.to') >= :start_ts)
+           AND (:end_ts IS NULL OR json_extract(item.value, '$.from') <= :end_ts)))
+ORDER BY event.id;
 ```
 
 Po retenci (M3.2b) přizná neúplnou historii samostatný dotaz. Pro běhy, které trvaly přes hranici `:retained` (hodnota `retained_since.check_change` z `meta`), vrátí úsek od hranice do prvního zachovaného řádku kontroly v běhu (`unknown_until`; `NULL` = žádný řádek, úsek trvá do konce běhu nebo dosud). `state_before` je stav na úseku, je-li znám (`from_state` prvního zachovaného řádku: mezi hranicí a ním žádná změna nenastala); `NULL` = stav neznámý. Provozní údaje (`details`) na úseku známé nejsou nikdy, protože řádek nenese jejich předchozí hodnotu. Běh, jehož první zachovaný řádek je výchozí (kontrola začala hlásit až po hranici), úsek nemá.
@@ -1067,10 +1111,11 @@ Vše jen na notebooku, nad dočasnými databázemi v testech; žádná cesta Nex
 | M3.1b Zápis (**implementováno lokálně 2026-10-20**, 11.1) | katalog řad, pravidla přijetí (4.1) včetně rozlišení duplicity, kolize a konfliktu, kvalita času (4.3) jako vstup API, dávka s `batch-guard`, změny stavu a provozních údajů podle R4 (7.1), horní mez, uzavření nečistých běhů s `history.unknown_gap`, odmítnutí simulovaných dat, záznam ztrát (5.4) | `src/nexusstat/history.py`, `tests/test_history.py` | 49 nových testů (100 v modulu): nula vs. `UNKNOWN` vs. chybějící měření vs. `N/A`; simulovaná data; neznámá řada a jednotka i jednotka uložené řady; neplatné číslo; RX/TX podle rozhraní; každý přechod včetně `UNKNOWN` a linky při `INFO`; kmitání INFO ↔ CRITICAL (scénář A, 181 řádků, 90 epizod přes `state-episodes`) shodné s `ChangeRules`; dvě změny v jedné sekundě; opakovaná dávka, nejistý commit, vynechané číslo, konflikt, rollback uprostřed; restart, nečisté ukončení, horní mez, posun času zpět, kvalita času; pravidla přijetí shodná s `TimeRules` rozhodnutí po rozhodnutí; horní mez po restartu pro platnou, odmítnutou, smíšenou a opakovanou dávku, konflikt, `same_second`, jednotku a nedůvěryhodný čas; 49 kontrolních mutací odhaleno |
 | M3.2a Agregace (**implementováno lokálně 2026-10-21**, 11.2) | uzavření okna (6.1) s kontraktem fronty `QueueState`, agregace s `progress-*` bez přepisu, konflikt s dokladem a zastavením, pozdní vzorky a posun `SampleGate` | `src/nexusstat/history.py`, `tests/test_history.py` | 35 nových testů (135 v modulu): jedno okno, sousední okna, hodina z 12 oken, nula, `UNKNOWN`, okno jen s `UNKNOWN`, prázdné a neúplné okno, hranice na sekundě, rezerva 120 s i 119 s, neznámá fronta, čekající vzorek, otevřená dávka, nesynchronizovaný čas, posun hodin zpět i dopředu, opakování, konflikt 5 min i 1 h, pád před `COMMIT` v odděleném procesu, selhání uprostřed vkládání, přerušení, restart, `SampleGate`, pozdní vzorek; shoda s přímým výpočtem i se smyčkou zapisovače benchmarku M2; podmínka 4 při posledním vzorku uprostřed i na hranici okna, zastaveném měření, obnově po hodině i po dnech, restartu během výpadku, skoku hodin dopředu a návratu, frontě a hodině bez nových dat; doklad konfliktu i jeho selhání; kontrolní mutace v 13.6 |
 | M3.2b Retence (**implementováno lokálně 2026-10-21**, 11.3) | plán bez zápisu a provedení po hodinových transakcích (nejvýš 24 za běh) s hranicí podle potvrzené agregace a invarianty, kontrakt času `ClockState` a pauza po `clock.jump`, trvalá hranice `retained_since.*`, epizody s neznámým začátkem po retenci | `src/nexusstat/history.py`, `tests/test_history.py`, `docs/HISTORY.md` (7, 7.1) | 47 nových testů (182 v modulu): hranice tabulek přesně na sekundě, přestupný rok, prázdná a dlouhá databáze, neagregované a otevřené okno, opožděná a selhaná agregace, řádky za `done_until`, 5min okna před hodinovou agregací, invarianty, idempotence, M3.2a a `SampleGate` po retenci, limit hodiny a 24 transakcí, střídání tabulek, rychlé přechody, čas (neznámý, nestabilní, skok, data z budoucnosti, opakovaná kontrola v transakci), 90 epizod CRITICAL, UNKNOWN a linka přes hranici, pád v odděleném procesu, výjimka uprostřed DELETE, Ctrl+C, `SQLITE_BUSY`, plný disk, nejistý commit, neúplné DELETE, restart, souběžný čtenář; finální kontrola: `retained_since` po každém kroku (bez přeskočení, nikdy neklesá, vlastní u každé tabulky, mezery zůstávají), epizody skutečným SQL (začátek před hranicí s koncem i bez dalšího přechodu, začátek přesně na hranici, stejná sekunda, UNKNOWN, linka, shoda s úplnou historií), 10 let a 29. února, data z budoucnosti ve všech tabulkách, dry-run nad souborem otevřeným jen pro čtení |
-| M3.3 Vlákno a napojení | fronty a dávka (5.2), chyby zápisu (5.3), stav `history.storage`, nová sekce `[history]` (výchozí `enabled = false`, cesta bez výchozí hodnoty), volání ze smyčky `run.py`, obsluha SIGTERM s dopsáním front a limitem 10 s, strukturovaný údaj o selhání kolektoru v `run.Collectors`; otevřené požadavky času z 11.1 (fronta před synchronizací a `derived`, monotónní rozsah ztrát v `event.data`, `history.gap`, `clock.synced`/`sync_lost`/`sync_restored`); volání `aggregate()` po zapsané dávce se stavem fronty `QueueState` a stav `history.storage` při konfliktu agregace (11.2) | `history.py`, `config.py`, `run.py`, `oled_text.py` (názvy `HISTORY`, `HIST SNAPSHOT`), `config/config.example.toml`, testy | plný disk (`max_page_count`), jen pro čtení, poškozený soubor, zámek, nejistý commit, zaplněné fronty a `history.gap`, přetečení před synchronizací bez času UTC, `history.unknown_gap` po restartu, měření a alarmy běží beze změny i při chybách historie, čisté ukončení bez ztráty |
+| M3.3a Vlákno zapisovače (**implementováno lokálně 2026-10-21**, 11.4) | samostatné vlákno s jediným spojením, omezené fronty měření, změn a událostí, dávky po 60 s a okamžitý zápis změn a událostí, opakování s odstupem podle druhu chyby, znovuotevření, nevratné chyby, snímek stavu, fronta před synchronizací a `derived`, záznamy ztrát, ukončení s limitem | `src/nexusstat/history_worker.py`, `src/nexusstat/history.py` (`sqlite_error`, `add_change`, `track_changes`, `rebind`), `tests/test_history_worker.py` | 49 testů: jediný zapisovač, spojení ve vlákně i jeho zavření, pořadí s bariérami (předání během `COMMIT`, opakování zapečetěné dávky, nejistý commit bez dvojího započtení), shoda `add_change` se zapisovačem M3.1b, nespojitost po zahozených změnách včetně ztraceného celého cyklu a kontraktu `episode-dropped-changes`, pevný paměťový strop, mezní intervaly a strop velikosti události, neblokující předání, pořadí a hranice dávky (59 a 60 s), všechny přechody a kmitání, přetečení všech tří front a kapacita pro 1–21 kmitajících kontrol, `SQLITE_BUSY` (skutečný zámek), skutečný `SQLITE_FULL`, `SQLITE_IOERR`, nejistý commit, skutečná ztráta práva zápisu, `IntegrityError`, poškození, chybějící soubor, zaseknuté I/O, nesynchronizovaný a neznámý čas, ztráta synchronizace, čisté a neúspěšné ukončení, restart a pád procesu |
+| M3.3b Napojení (neimplementováno) | stav `history.storage`, nová sekce `[history]` (výchozí `enabled = false`, cesta bez výchozí hodnoty), volání `HistoryWorker` ze smyčky `run.py`, obsluha SIGTERM přes `stop()` s limitem 10 s a výpisem nezapsaných dat do journalu, strukturovaný údaj o selhání kolektoru v `run.Collectors`, skutečný zdroj synchronizace hodin a `boot_id` (gate 12.4); volání `aggregate()` po zapsané dávce se stavem fronty `QueueState` z vlákna, retence na celou hodinu s `ClockState` a stav `history.storage` z `WorkerStatus` (i při konfliktu agregace, 11.2) | `history.py`, `config.py`, `run.py`, `oled_text.py` (názvy `HISTORY`, `HIST SNAPSHOT`), `config/config.example.toml`, testy | plný disk (`max_page_count`), jen pro čtení, poškozený soubor, zámek, nejistý commit, zaplněné fronty a `history.gap`, přetečení před synchronizací bez času UTC, `history.unknown_gap` po restartu, měření a alarmy běží beze změny i při chybách historie, čisté ukončení bez ztráty |
 | M3.4 Snímek a obnova | snímek (9.2) jen při synchronizovaném čase, se záznamem a stavem `history.snapshot` z paměti (9.3), zkouška obnovy na notebooku (9.5), rozpoznání obnoveného snímku (9.6), read-only výpis stavu (`python3 -m nexusstat.history info <soubor>`) a převzetí souboru na náhradním stroji (`adopt`) | `history.py`, testy, `OPERATIONS.md` | snímek během zápisu je konzistentní a bez `-wal`; poškozený snímek se nezveřejní; stáří snímku; obnovený soubor projde kontrolami a čtecími dotazy |
 
-- Kroky M3.1 a M3.2 nemění chování aplikace (nový modul bez napojení). M3.1a, M3.1b, M3.2a a M3.2b jsou hotové jen lokálně na notebooku: aplikace zatím nic nezapisuje, `run.py` modul nepoužívá a produkční role se nevytváří ani neotevírá. M3.3 mění `run.py` a `config.py`, proto až po samostatném schválení; se `[history] enabled = false` zůstává chování dnešní v0.6.
+- Kroky M3.1, M3.2 a M3.3a nemění chování aplikace (nové moduly bez napojení). M3.1a, M3.1b, M3.2a, M3.2b a M3.3a jsou hotové jen lokálně na notebooku: aplikace zatím nic nezapisuje, `run.py` moduly nepoužívá a produkční role se nevytváří ani neotevírá. M3.3b mění `run.py` a `config.py`, proto až po samostatném schválení; se `[history] enabled = false` zůstává chování dnešní v0.6.
 - Ruční zkouška na notebooku jen s cestou mimo repozitář v lokálním `config/config.toml` (ignorováno Gitem), např. v `~/.local/state/`; DB soubory chrání i `.gitignore` (`*.sqlite3`, `*.db`).
 - Test veřejných souborů (`PublicDataTest`) od review prochází i `tools/`.
 - Mimo M3: Nexus, Restic, systemd, produkční data, web (M6), nasazení (M7).
@@ -1096,14 +1141,14 @@ Rozhraní pro budoucí jediný zapisovač z M3.3; schéma v1 se nezměnilo.
 - **Kvalita času** je vstup volajícího (zdroj synchronizace Raspberry Pi se tu nezjišťuje): `synced` a `derived` dovolí vzorky, `unsynced` ne. Čas před 2026-01-01 je vždy `unsynced`, i u startu, ukončení a událostí; `Event` s takovým časem a jinou kvalitou se odmítne. Změny a události se zapíšou vždy se svou kvalitou. Zapisovač žádný čas neodhaduje ani nedopočítává. `clock.jump` se pozná ze změny `observed_utc − expires_monotonic` o víc než 2 s.
 - **Čas běhu:** tabulka `run` kvalitu času nemá (schéma v1); kvalitu startu a ukončení nese `process.start` a `process.stop`. `close-unclean-runs` dá běhu bez vzorku `stopped_utc = started_utc` i při nedůvěryhodném startu; zapisovač takový čas jako hranici mezery nepoužije.
 - **Souhrn ztrát** `history.rejected` (`WARNING`): `data = {"total": n, "reasons": {důvod: {"count", "from", "to"}}}`; rozsah UTC jen z důvěryhodného času, u `time_unsynced` a `simulated` jen počet. První souhrn jde s nejbližší dávkou, další nejvýš jednou za hodinu monotónního času (simulace ho neposouvá), zbytek při `finish_run`. Souhrn jede se zapečetěnou dávkou: první pokus o zápis dávku zapečetí včetně obsahu (`add_results`, `add_event` i přímá změna seznamů se pak odmítnou), takže se po chybě zapíše jejím opakováním právě jednou. Totéž měření odeslané znovu (stejný `CheckResult`) je duplicita, ztráta se nezapočte podruhé. Po nejistém commitu se počitadla potvrzeného pokusu (konflikty, duplicity, jednotka uložené řady) promítnou při opakování právě jednou.
-- **Omezení:** rozdělení dávky po neočekávané `IntegrityError` a znovuotevření spojení po nejistém commitu jsou úkolem vlákna M3.3. Detektor kmitání neexistuje (7.2).
+- **Omezení:** znovuotevření spojení po nejistém commitu řeší vlákno M3.3a (11.4); po neočekávané `IntegrityError` zapisovač přejde do `FAILED` a čeká na zásah správce, automatické rozdělení dávky je odložené. Detektor kmitání neexistuje (7.2).
 
-**Otevřené požadavky M3.3 z 4.3 (vědomě odloženo, v M3.1b neimplementováno):**
+**Otevřené požadavky M3.3 z 4.3:**
 
-1. Fronta měření před první synchronizací s monotónním časem měření a dopočtem `derived` času po synchronizaci (`ts = monotonic_měření + (UTC − monotonic)`); M3.1b jen přijme `derived` od volajícího.
-2. Monotónní rozsah ztracených měření bez důvěryhodného času (přetečení fronty, ukončení bez synchronizace): dnes souhrn nese u `time_unsynced` jen počet. Doplnění **nevyžaduje změnu schématu**: rozsah patří do JSON `event.data` (např. klíče `mono_from`, `mono_to` spolu s `boot_id`, protože monotónní čas platí jen v rámci bootu). Zdrojem musí být monotónní čas měření z fronty, ne odhad z `expires_monotonic` (ten obsahuje platnost výsledku).
-3. `history.gap` při přetečení fronty (rozsah v UTC, po synchronizaci `derived`), `clock.synced` s rozsahem odvozených vzorků, `clock.sync_lost` a `clock.sync_restored`.
-4. Zdroj stavu synchronizace na Raspberry Pi zůstává neověřený (gate 12.4, M7).
+1. Fronta měření před první synchronizací s monotónním časem měření a dopočtem `derived` času po synchronizaci (`ts = monotonic_měření + (UTC − monotonic)`). **Hotovo v M3.3a** (vlákno zapisovače, 11.4).
+2. Monotónní rozsah ztracených měření bez důvěryhodného času (přetečení fronty, ukončení bez synchronizace) v JSON `event.data` (`mono_from`, `mono_to`, `boot_id`), ze skutečného monotónního času měření z fronty. **Hotovo v M3.3a** pro záznamy ztrát vlákna (`history.gap`); souhrn `history.rejected` zapisovače (M3.1b) nese dál jen počty. `boot_id` dodá M3.3b.
+3. `history.gap` při přetečení fronty (rozsah v UTC, po synchronizaci `derived`), `clock.synced` s rozsahem odvozených vzorků, `clock.sync_lost` a `clock.sync_restored`. **Hotovo v M3.3a.**
+4. Zdroj stavu synchronizace na Raspberry Pi zůstává neověřený (gate 12.4, M7); napojení zdroje je M3.3b.
 
 ### 11.2 Agregace M3.2a (synchronní, součást zapisovače)
 
@@ -1135,6 +1180,25 @@ Agregace je metoda jediného zapisovače `HistoryRecorder`: používá jeho zapi
 
 - Pořadí tabulek v běhu: `sample`, `agg_5m`, `agg_1h`, `check_change`, `event`; `run`, `metric`, `meta` a `schema_migration` se nemažou nikdy.
 - **Neimplementováno:** volání retence na celou hodinu z vlákna, skutečný zdroj `ClockState` a stav `history.storage` (M3.3), `VACUUM` (není potřeba), produkční nasazení (M7).
+
+### 11.4 Vlákno zapisovače M3.3a (`history_worker.py`, nenapojeno)
+
+| Volání (hlavní vlákno, bez SQLite) | Co dělá |
+| --- | --- |
+| `HistoryWorker(path, role, host_id, app_version=…, interval_s=…, boot_id=None, monotonic=…, utc_now=…, opener=…)` | připraví fronty; databázi ještě neotevírá. Hodiny a otevírání jsou vyměnitelné (testy) |
+| `start(time_synced=None)` | spustí jediné vlákno zapisovače; to otevře databázi (`open_writer`, zámek `flock`), zahájí běh a databázi později samo zavře |
+| `submit(results, measured_monotonic, time_synced)` | neblokující předání jednoho měření: n-tice zmrazených `CheckResult`, monotónní čas měření a stav synchronizace (`True`, `False`, `None` = neznámý). Změny stavu (R4) se spočítají hned, simulace změny nevytváří |
+| `submit_event(event)` | důležitá událost do vlastní fronty; probudí zapisovač hned. Událost větší než 16 KiB (`MAX_EVENT_BYTES`) nepřijme a započte jako ztrátu `event_too_large` |
+| `status()` → `WorkerStatus` | snímek pro budoucí `history.storage`: `STARTING`/`RUNNING`/`DEGRADED`/`STOPPED`/`FAILED`, potvrzené dávky a čas posledního commitu, čekající měření, hodnoty, změny a události, nepotvrzená dávka, data čekající na synchronizaci, časová základna (`unsynced`, `synced`, `sync_lost`), ztráty od startu a ještě nezapsané, poslední chyba a její druh, počet neúspěchů a čas do dalšího pokusu |
+| `flush(timeout)` | okamžitý zápis všeho zapisovatelného; `True` jen po potvrzení |
+| `stop(timeout=10)` → `StopReport` | čisté ukončení (5.5): `completed` (vlákno skončilo v limitu), `clean_stop` (potvrzený `finish_run`, jen když vlákno skončilo), jistě nezapsané položky (fronty a dávka vrácená před `COMMIT`) a `in_doubt` (dávka, jejíž `COMMIT` probíhá nebo nemá známý výsledek); potvrzené položky jsou v `status.confirmed_*` |
+
+- **Vlastnictví:** spojení SQLite vzniká, používá se a zavírá jen ve vlákně zapisovače (`check_same_thread` zůstává zapnuté, jiné vlákno ho použít nemůže). `HistoryRecorder` i zapečetěnou dávku má jen to vlákno; hlavní vlákno sdílí jen fronty a stav pod zámkem, který se nikdy nedrží během I/O.
+- **Dávka:** nová vznikne jen bez nepotvrzené předchozí; neúspěšná zůstane zapečetěná a opakuje se beze změny. Zápis spustí nejstarší zapisovatelné měření staré 60 s (monotónní čas), čekající změna, událost nebo zapisovatelný záznam ztráty, `flush` a ukončení. Čekání je `Condition.wait` s limitem nejvýš 10 s, bez aktivního dotazování.
+- **Pořadí:** novější data nikdy nepředběhnou nepotvrzenou dávku (nová vznikne až po potvrzení předchozí, zapečetěná se opakuje beze změny); předání během `COMMIT` jdou do další dávky. Změny přidané přes `add_change()` jsou řádek po řádku shodné se změnami, které by spočítal zapisovač M3.1b (test).
+- **Přetečení:** zahodí se nejstarší položka; počty a dostupné hranice (UTC jen z důvěryhodného času, jinak monotónní) zapíše další úspěšná dávka jako `history.gap` (`WARNING`, nad hodinu `ERROR`), `history.changes_dropped` nebo `history.events_dropped` (`ERROR`). Ztráta změn ponechá nejnovější změny: poslední zapsaný stav je skutečný a první zachovaná změna nese předchozí stav (`from_state`), takže CRITICAL se nikdy nezobrazí jako falešné OK. `history.changes_dropped` nese i počty a hranice po kontrolách (`data.checks`, dotaz `changes-dropped`); `state-episodes` nespojitost přizná (konec a začátek `NULL`) místo vymyšlené délky závady a zahozený celý cyklus přizná kontrakt čtení epizod s dotazem `episode-dropped-changes` (7.1).
+- **Nezapojeno (M3.3b):** `run.py`, sekce `[history]`, SIGTERM, skutečný zdroj synchronizace a `boot_id`, kontrola `history.storage`, volání agregace a retence.
+- **Známá omezení:** paměťový strop fronty měření počítá výsledky, ne bajty; délku `summary` a `details` vlastních kontrol zatím nic nevynucuje (odhad 500 B na výsledek). Čtenář epizod musí dodržet kontrakt 7.1 (`episode-dropped-changes`); webový čtenář zatím neexistuje.
 
 ## 12. Rozhodnutí ke schválení
 
@@ -1251,6 +1315,15 @@ Opravené chyby a rozpory v předchozí verzi návrhu:
 3. **Výklad hranic:** `agg_1h` dolů na celou hodinu a 10 kalendářních let (konzervativně, aby se nesmazala hodina zčásti mladší než 10 let).
 4. **Čas:** `ClockState` s doloženou dobou stability ≥ 24 h a kontrolou uložených `clock.jump`; po startu procesu, který stabilitu doložit neumí, se 24 h nemaže (prodlouží jen uchování).
 5. **Nalezeno při vývoji:** dotazy `oldest-*` ve tvaru `ORDER BY … LIMIT 1` nevracejí nad prázdnou tabulkou žádný řádek (opraveno čtení); pauza po skoku končila až sekundu po 24 h (opraveno na přesně 24 h); `more` hlásil práci i po přesném dokončení (opraveno).
+
+### 13.8 Implementace M3.3a 2026-10-21 (ke schválení)
+
+1. **Kapacita fronty změn (schváleno):** hodina trvalého kmitání 20 kontrol (`ceil(3600 / interval_s) × 20`, 7 200 po 10 s, ≈ 3,4 MB); fronta měření navíc s pevným stropem 72 000 hodnot (nejhorší případ obou front 55,7 MB).
+2. **Nečekaná `IntegrityError` (schváleno):** `FAILED` a zásah správce; automatické rozdělení dávky odloženo.
+3. **Úpravy `HistoryRecorder` bez změny datového modelu:** `HistoryError.sqlite_error` (rozlišení chyb), `add_results(..., track_changes=False)` a `add_change()` (změny se počítají při předání, 5.2), `rebind()` (znovuotevření téhož souboru ve stejném běhu).
+4. **Záznam ztráty před synchronizací** čeká na synchronizaci (odvozený rozsah UTC), při ukončení bez ní se zapíše jen s monotónním rozsahem (4.3).
+5. **Finální revize:** `state-episodes` při zahozených prostředních změnách natahovala epizodu až k další zachované změně (vymyšlená délka závady, doloženo testem na původním znění); nyní konec `NULL` a epizoda s neznámým začátkem, dotaz `changes-dropped` a `data.checks` přiznají i nespojitost, kterou řádky neukážou. `StopReport` rozlišuje jistě nezapsaná a nejistá data (`in_doubt`), stav nese počty potvrzených položek.
+6. **Kontrola před uzavřením:** zahozený celý cyklus CRITICAL → INFO → CRITICAL nechá řádky navenek spojité; samotná `state-episodes` by epizodu CRITICAL vykázala jako nepřerušenou. Doplněn kontrakt čtení epizod s dotazem `episode-dropped-changes` (7.1) a test na přesný scénář. Fronta událostí má nově i strop velikosti jedné události (`MAX_EVENT_BYTES` 16 KiB, ztráta `event_too_large`), takže je paměť všech front omezená pro každý povolený interval 1–3600 s.
 
 ## 14. Zamítnuté varianty
 

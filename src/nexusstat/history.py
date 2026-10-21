@@ -30,7 +30,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -216,11 +216,20 @@ class HistoryError(Exception):
     pořadí nebo nezapsaná předchozí), "write" (transakce zápisu selhala a byla
     vrácena) a "conflict" (hotová agregace už existuje; nic se nepřepsalo a
     agregace je do konce běhu zastavená).
+
+    `sqlite_error` je jméno chyby SQLite (např. "SQLITE_BUSY", "SQLITE_FULL"),
+    pokud ji způsobila knihovna; vlákno zapisovače podle něj rozliší přechodnou
+    chybu od ztráty důvěryhodnosti databáze (docs/HISTORY.md 5.3).
     """
 
-    def __init__(self, reason, message):
+    def __init__(self, reason, message, sqlite_error=None):
         super().__init__(message)
         self.reason = reason
+        self.sqlite_error = sqlite_error
+
+
+def _sqlite_name(error):
+    return getattr(error, "sqlite_errorname", None)
 
 
 def check_sqlite(version=sqlite3.sqlite_version_info):
@@ -521,7 +530,8 @@ def open_writer(path, role, host_id, quick_check=True):
         try:
             conn = sqlite3.connect(_uri(path, "rw"), uri=True, isolation_level=None)
         except sqlite3.Error as error:
-            raise HistoryError("path", f"databázi {path} nelze otevřít pro zápis: {error}") from None
+            raise HistoryError("path", f"databázi {path} nelze otevřít pro zápis: {error}",
+                               _sqlite_name(error)) from None
         try:
             # Do úspěšného ověření ani zavření nezapíše checkpoint (soubor se nezmění).
             _set_no_checkpoint_on_close(conn, True)
@@ -532,7 +542,7 @@ def open_writer(path, role, host_id, quick_check=True):
             _set_no_checkpoint_on_close(conn, False)
         except sqlite3.DatabaseError as error:
             conn.close()
-            raise HistoryError("corrupt", f"databázi {path} nelze použít: {error}") from None
+            raise HistoryError("corrupt", f"databázi {path} nelze použít: {error}", _sqlite_name(error)) from None
         except BaseException:
             conn.close()
             raise
@@ -1342,7 +1352,7 @@ class HistoryRecorder:
             conn.execute("COMMIT")
         except sqlite3.Error as error:
             _rollback(conn)
-            raise HistoryError("write", f"běh nelze zahájit: {error}") from None
+            raise HistoryError("write", f"běh nelze zahájit: {error}", _sqlite_name(error)) from None
         except BaseException:
             _rollback(conn)  # i Ctrl+C nebo chyba programu: nic rozepsaného, zámek zápisu uvolněn
             raise
@@ -1358,12 +1368,14 @@ class HistoryRecorder:
         self._open_batch = Batch(self.last_batch + 1)
         return self._open_batch
 
-    def add_results(self, batch, results, ts_quality="synced"):
+    def add_results(self, batch, results, ts_quality="synced", track_changes=True):
         """Přidá do dávky výsledky jednoho měření: změny stavu (R4) a přijaté vzorky.
 
         `ts_quality` dodává volající (stav synchronizace hodin se tu nezjišťuje):
         synced a derived dovolí vzorky, unsynced ne. Čas před MIN_TRUSTED_UTC
         se bere jako unsynced. Změny a události se ukládají s kvalitou vždy.
+        `track_changes=False`: změny počítá volající už při předání (vlákno
+        zapisovače, docs/HISTORY.md 5.2) a přidá je přes add_change().
         """
         self._require_run()
         self._check_open(batch)
@@ -1391,10 +1403,42 @@ class HistoryRecorder:
             if not clock_checked:
                 self._check_clock(batch, result, ts, quality)
                 clock_checked = True
-            change = self._tracker.observe(result, ts, quality)
-            if change is not None:
-                batch.changes.append(change)
+            if track_changes:
+                change = self._tracker.observe(result, ts, quality)
+                if change is not None:
+                    batch.changes.append(change)
             self._add_sample(batch, result, ts, quality)
+
+    def add_change(self, batch, change):
+        """Přidá změnu stavu spočítanou mimo zapisovač (ChangeTracker volajícího)."""
+        self._require_run()
+        self._check_open(batch)
+        if not isinstance(change, Change):
+            raise TypeError(f"očekávána Change, ne {type(change).__name__}")
+        _check_quality(change.ts_quality)
+        if isinstance(change.ts, bool) or not isinstance(change.ts, int) or change.ts <= 0:
+            raise ValueError(f"čas změny musí být kladné celé číslo, ne {change.ts!r}")
+        states = {state.value for state in State}
+        if change.to_state not in states or (change.from_state is not None and change.from_state not in states):
+            raise ValueError(f"neznámý stav změny {change.from_state!r} → {change.to_state!r}")
+        quality = _trusted_quality(change.ts, change.ts_quality)  # čas před 2026 nikdy jako synced
+        batch.changes.append(change if quality == change.ts_quality else replace(change, ts_quality=quality))
+
+    @property
+    def commit_in_doubt(self):
+        """Poslední neúspěšný pokus došel až ke COMMIT: dávka mohla i nemusela být zapsaná."""
+        return self._committing is not None
+
+    def rebind(self, database):
+        """Pokračuje stejný běh na nově otevřeném spojení téhož souboru (po chybě I/O).
+
+        Staré spojení musí volající zavřít dřív (nikdy dvě zapisující spojení najednou).
+        """
+        if not isinstance(database, HistoryDatabase) or database.readonly or database.connection is None:
+            raise HistoryError("path", "zapisovat lze jen do databáze otevřené přes open_writer()")
+        if database.path.resolve() != self.database.path.resolve():
+            raise HistoryError("path", f"{database.path} není soubor tohoto běhu ({self.database.path})")
+        self.database = database
 
     def add_event(self, batch, event):
         self._require_run()
@@ -1469,7 +1513,7 @@ class HistoryRecorder:
             conn.execute("COMMIT")
         except sqlite3.Error as error:
             _rollback(conn)
-            raise HistoryError("write", f"dávku {batch.number} nelze zapsat, vrácena: {error}") from None
+            raise HistoryError("write", f"dávku {batch.number} nelze zapsat, vrácena: {error}", _sqlite_name(error)) from None
         except BaseException:
             _rollback(conn)  # i Ctrl+C nebo chyba programu: nic rozepsaného, zámek zápisu uvolněn
             raise
@@ -1551,7 +1595,7 @@ class HistoryRecorder:
             conn.execute("COMMIT")
         except sqlite3.Error as error:
             _rollback(conn)
-            raise HistoryError("write", f"běh nelze ukončit: {error}") from None
+            raise HistoryError("write", f"běh nelze ukončit: {error}", _sqlite_name(error)) from None
         except BaseException:
             _rollback(conn)
             raise
