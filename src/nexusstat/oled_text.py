@@ -42,6 +42,11 @@ CHECK_NAMES = {
     TX_RATE_ID: "NET TX",
     IPV4_ID: "IPV4",
     **SERVICE_LABELS,
+    # Stav ukládání historie (history_link.py, M3.3b-1 a M3.3b-2).
+    "history.storage": "HISTORY",
+    # Připravený název pro budoucí kontrolu snímku historie: snímek ani jeho
+    # kontrola ještě neexistují (M3.4), displej proto o záloze nic netvrdí.
+    "history.snapshot": "HIST SNAPSHOT",
     # Plánované kontroly, zatím jen ve fiktivních datech simulátoru.
     "system.time_sync": "TIME SYNC",
     "system.load": "LOAD",

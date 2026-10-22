@@ -20,7 +20,8 @@ from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol
 from nexusstat.oled_text import page_rows
 from nexusstat.config import Config, NetworkConfig
 from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
-from nexusstat.run import Collectors, Stopper, failed_results, format_line, live_monitor, main, run_loop, start_history
+from nexusstat.run import (COLLECTOR_FAILURE, Collectors, Stopper, failed_results, failure_name,
+                          format_line, live_monitor, main, run_loop, start_history)
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS, MEMORY_ID, SystemMonitor
 
 # Monotónní čas nezačíná nulou, aby nic nezáviselo na náhodné shodě s 0.
@@ -593,6 +594,85 @@ class LoopHistoryTest(unittest.TestCase):
         # Výjimku z record() smyčka nemaskuje; chybu zachytává HistoryLink.record
         # (viz tests/test_history_link.py), takže se do smyčky nikdy nedostane.
         self.assertEqual(len(collector.calls), 1)
+
+
+class CollectorFailureTest(unittest.TestCase):
+    """Strukturovaný údaj o selhání sběru (docs/HISTORY.md 4.4)."""
+
+    class Broken:
+        simulated = False
+        validity_seconds = 30
+        labels = LABELS
+
+        def __init__(self, error):
+            self.error = error
+
+        def collect(self, now, observed_utc):
+            raise self.error
+
+    class Working:
+        simulated = False
+        validity_seconds = 30
+        labels = NETWORK_LABELS
+
+        def collect(self, now, observed_utc):
+            return [CheckResult(check_id, State.INFO, f"{label} ok", observed_utc, now + 30, simulated=False)
+                    for check_id, label in NETWORK_LABELS.items()]
+
+    def test_failure_name_is_short_ascii(self):
+        self.assertEqual(failure_name(OSError("x")), "OSError")
+
+        class Chyba(Exception):
+            pass
+
+        self.assertEqual(failure_name(Chyba()), "Chyba")
+        weird = type("Tep lota°", (Exception,), {})
+        self.assertEqual(failure_name(weird()), "Teplota")  # jen tisknutelné ASCII bez mezer
+
+    def test_collector_failure_is_marked_in_details(self):
+        monitor = Collectors(self.Broken(RuntimeError("čtení /proc selhalo")), self.Working())
+        results = monitor.collect(START, START_UTC)
+        failed = {result.id: result for result in results if result.id in LABELS}
+        working = [result for result in results if result.id in NETWORK_LABELS]
+        self.assertEqual(len(failed), len(LABELS))
+        for result in working:  # druhý kolektor měří dál a žádný údaj o selhání nemá
+            self.assertIs(result.state, State.INFO)
+            self.assertEqual(dict(result.details), {})
+        for result in failed.values():
+            self.assertIs(result.state, State.UNKNOWN)  # nic nevypadá jako OK
+            self.assertEqual(dict(result.details), {COLLECTOR_FAILURE: "RuntimeError"})
+            self.assertIsNone(result.measurement)
+            self.assertIn("měření selhalo (RuntimeError)", result.summary)
+
+    def test_valid_unknown_measurement_has_no_failure_mark(self):
+        # Platné měření bez hodnoty (UNKNOWN) se od selhání sběru liší.
+        observed, expires = START_UTC, START + 30
+        valid = CheckResult(CPU_TEMP_ID, State.UNKNOWN, "Teplota CPU: nedostupná", observed, expires,
+                            simulated=False)
+        self.assertEqual(dict(valid.details), {})
+        failed = failed_results(self.Working(), START, observed, 30, failure="OSError")
+        self.assertEqual(dict(failed[0].details), {COLLECTOR_FAILURE: "OSError"})
+
+    def test_output_line_is_unchanged_by_the_failure_mark(self):
+        clock = FakeClock(stop_at=START + 15)
+        collector = FakeCollector(clock)
+        collector.errors[1] = OSError("čtení selhalo")
+        _, lines = run(clock, collector)
+        self.assertIn("měření selhalo: OSError", lines[1])
+        self.assertNotIn(COLLECTOR_FAILURE, lines[1])  # údaj je jen v datech, ne ve výpisu
+
+    def test_thresholds_are_not_disturbed_by_the_failure_mark(self):
+        # UNKNOWN ze selhání přeruší řadu potvrzování stejně jako dosud: po
+        # selhání se potvrzuje znovu od začátku (confirm_count = 2).
+        rule = AlarmRule(enabled=True, warning=40, error=60, hysteresis=2, confirm_count=2, clear_count=1)
+        clock = FakeClock(stop_at=START + 45)
+        collector = FakeCollector(clock)
+        collector.temperatures = [70.0] * 6
+        collector.errors[2] = OSError("čtení selhalo")
+        results, lines = run(clock, collector, alarms=AlarmsConfig(cpu_temp=rule))
+        states = [line.split("UTC  SIM ")[1].split()[0] for line in lines[1:-1]]
+        self.assertEqual(states, ["INFO", "UNKNOWN", "INFO", "ERROR", "ERROR"])
+        self.assertIs({result.id: result.state for result in results}[CPU_TEMP_ID], State.ERROR)
 
 
 class StopperTest(unittest.TestCase):

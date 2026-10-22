@@ -48,6 +48,7 @@ from nexusstat.history_worker import (
     STARTING,
     STOPPED,
     HistoryWorker,
+    MaintenanceStatus,
     StopReport,
     WorkerStatus,
 )
@@ -130,13 +131,19 @@ class Sync:
         return self.states[0] if len(self.states) == 1 else self.states.pop(0)
 
 
+def maintenance_status(**changes):
+    """Snímek údržby pro testy diagnostiky."""
+    return MaintenanceStatus(**changes)
+
+
 def worker_status(**changes):
     """Snímek stavu zapisovače pro testy kontroly history.storage."""
     fields = dict(state=RUNNING, run_id=1, commits=2, last_commit_monotonic=1000.0, last_commit_utc=BASE,
                   pending_measurements=0, pending_values=0, pending_changes=0, pending_events=0, in_flight=0,
                   confirmed_measurements=5, confirmed_changes=3, confirmed_events=1, held_unsynced=0,
                   time_base="synced", losses={}, unrecorded_losses={}, error_kind=None, last_error=None,
-                  consecutive_failures=0, retry_in=None)
+                  consecutive_failures=0, retry_in=None, unconfirmed_since=None,
+                  maintenance=MaintenanceStatus())
     fields.update(changes)
     return WorkerStatus(**fields)
 
@@ -363,6 +370,95 @@ class StorageStateTest(unittest.TestCase):
                                                pending_measurements=5), stalled=True, time_synced=True)
         self.assertIs(state, State.ERROR)
 
+    def test_aggregation_conflict_is_error(self):
+        state, text = storage_state(worker_status(maintenance=maintenance_status(
+            aggregation_monotonic=1000.0, conflict="okno 1800003600 už existuje; doklad zapsán",
+            blocked="conflict")), time_synced=True)
+        self.assertIs(state, State.ERROR)
+        self.assertIn("rozporem", text)
+        self.assertIn("doklad", text)
+
+    def test_maintenance_failure_is_warning(self):
+        state, text = storage_state(worker_status(maintenance=maintenance_status(
+            aggregation_monotonic=1000.0, failures=3, last_error="busy: database is locked")),
+            time_synced=True)
+        self.assertIs(state, State.WARNING)
+        self.assertIn("údržba selhává (3×", text)
+
+    def test_stopped_retention_is_warning(self):
+        state, text = storage_state(worker_status(maintenance=maintenance_status(
+            aggregation_monotonic=1000.0, retention_monotonic=1000.0,
+            retention_stopped={"sample": "aggregation_mismatch"})), time_synced=True)
+        self.assertIs(state, State.WARNING)
+        self.assertIn("retence zastavena", text)
+        self.assertIn("aggregation_mismatch", text)
+
+    def test_large_wal_is_warning(self):
+        state, text = storage_state(worker_status(maintenance=maintenance_status(
+            aggregation_monotonic=1000.0, wal_bytes=history_link.WAL_WARNING_BYTES + 1)), time_synced=True)
+        self.assertIs(state, State.WARNING)
+        self.assertIn("WAL má 64 MiB", text)
+        small = storage_state(worker_status(maintenance=maintenance_status(
+            aggregation_monotonic=1000.0, wal_bytes=history_link.WAL_WARNING_BYTES)), time_synced=True)
+        self.assertIs(small[0], State.INFO)
+
+    def test_late_aggregation_is_warning(self):
+        maintenance = maintenance_status(aggregation_monotonic=1000.0, done_5m=BASE)
+        late = storage_state(worker_status(maintenance=maintenance), time_synced=True,
+                             now_utc=BASE + history_link.AGGREGATION_LAG_SECONDS + 60)
+        self.assertIs(late[0], State.WARNING)
+        self.assertIn("agregace je", late[1])
+        fresh = storage_state(worker_status(maintenance=maintenance), time_synced=True,
+                              now_utc=BASE + history_link.AGGREGATION_LAG_SECONDS)
+        self.assertIs(fresh[0], State.INFO)
+
+    def test_late_aggregation_never_escalates_to_error(self):
+        # Zpoždění je podezření, ne doklad poruchy: ERROR z něj nikdy není.
+        maintenance = maintenance_status(aggregation_monotonic=1000.0, done_5m=BASE)
+        for hours in (2, 24, 24 * 30):
+            with self.subTest(hours=hours):
+                state, text = storage_state(worker_status(maintenance=maintenance), time_synced=True,
+                                            now_utc=BASE + hours * 3600)
+                self.assertIs(state, State.WARNING)
+                self.assertIn("agregace je", text)
+
+    def test_aggregation_lag_needs_trustworthy_time(self):
+        # Bez doloženě synchronizovaného času rozdíl nic neznamená.
+        maintenance = maintenance_status(aggregation_monotonic=1000.0, done_5m=BASE)
+        state, _ = storage_state(worker_status(time_base="sync_lost", maintenance=maintenance),
+                                 time_synced=False, now_utc=BASE + 10 * 3600)
+        self.assertIs(state, State.WARNING)  # hlásí se ztráta synchronizace, ne zpoždění
+        self.assertIsNone(history_link._aggregation_lag(
+            worker_status(time_base="unsynced", maintenance=maintenance), BASE + 10 * 3600))
+
+    def test_blocked_retention_is_not_a_fault(self):
+        # Prvních 24 h od startu se nemaže: je to normální stav, ne závada.
+        state, text = storage_state(worker_status(maintenance=maintenance_status(
+            aggregation_monotonic=1000.0, retention_monotonic=1000.0,
+            retention_blocked="clock_unstable", stable_s=3600)), time_synced=True)
+        self.assertIs(state, State.INFO)
+        self.assertIn("retence blokována (clock_unstable)", text)
+
+    def test_maintenance_summary_is_in_the_description(self):
+        state, text = storage_state(worker_status(maintenance=maintenance_status(
+            aggregation_monotonic=1000.0, windows_5m=12, windows_1h=1, retention_monotonic=1000.0,
+            deleted={"sample": 120, "event": 3})), time_synced=True)
+        self.assertIs(state, State.INFO)
+        self.assertIn("agregace 12+1 oken", text)
+        self.assertIn("retence smazala 123 řádků", text)
+
+    def test_maintenance_not_run_yet_is_stated(self):
+        state, text = storage_state(worker_status(), time_synced=True)
+        self.assertIs(state, State.INFO)
+        self.assertIn("agregace zatím neproběhla", text)
+        self.assertIn("retence zatím neproběhla", text)
+
+    def test_conflict_outranks_maintenance_warnings(self):
+        state, _ = storage_state(worker_status(maintenance=maintenance_status(
+            conflict="rozpor", failures=2, last_error="x", wal_bytes=history_link.WAL_WARNING_BYTES * 2)),
+            time_synced=True)
+        self.assertIs(state, State.ERROR)
+
     def test_truncated_text_is_warning_not_loss(self):
         state, text = storage_state(worker_status(losses={"result_truncated": 3}), time_synced=True)
         self.assertIs(state, State.WARNING)
@@ -423,6 +519,11 @@ class StorageStateTest(unittest.TestCase):
         # sama tak nevytváří další změny k zápisu (zpětná vazba, R4).
         self.assertEqual(dict(first.details), {"state": RUNNING, "time": "synced"})
         self.assertEqual(dict(first.details), dict(second.details))
+        # Ani měnící se stav údržby nepřidá do details nic nestálého.
+        busy = storage_result(worker_status(maintenance=maintenance_status(
+            aggregation_monotonic=1.0, windows_5m=7, retention_monotonic=2.0, deleted={"sample": 9})),
+            observed, 100.0)
+        self.assertEqual(dict(busy.details), dict(first.details))
 
     def test_check_never_feeds_itself_back(self):
         # Opakovaná kontrola se stejným stavem historie nevytvoří další změnu (R4).
@@ -904,7 +1005,8 @@ class OutageTest(LinkCase):
     def test_frozen_write_stops_being_reported_as_fine(self):
         link = self.make()
         status = worker_status(pending_measurements=4, pending_values=16, commits=1,
-                              last_commit_monotonic=self.clock.monotonic())
+                              last_commit_monotonic=self.clock.monotonic(),
+                              unconfirmed_since=self.clock.monotonic())
         with mock.patch.object(link.worker, "status", return_value=status):
             fresh = link.check(self.clock.monotonic(), self.clock.utc())
             self.assertIs(fresh.state, State.INFO)  # dávka se právě potvrdila
@@ -915,9 +1017,22 @@ class OutageTest(LinkCase):
 
     def test_empty_queue_is_not_stalled(self):
         link = self.make()
-        status = worker_status(pending_measurements=0, commits=1, last_commit_monotonic=0.0)
+        status = worker_status(pending_measurements=0, commits=1, last_commit_monotonic=0.0,
+                               unconfirmed_since=None)
         with mock.patch.object(link.worker, "status", return_value=status):
             self.assertIs(link.check(self.clock.monotonic(), self.clock.utc()).state, State.INFO)
+
+    def test_check_does_not_touch_sqlite(self):
+        # Diagnostika v hlavním vlákně čte jen snímek v paměti: žádné nové
+        # spojení ani dotaz do databáze (ani kvůli stavu údržby).
+        link = self.make()
+        link.record([CheckResult(CPU_USAGE_ID, State.INFO, "CPU 5 %", self.clock.utc(),
+                                 self.clock.monotonic() + VALIDITY, simulated=False,
+                                 measurement=Measurement(5, "%"))], self.clock.monotonic())
+        with mock.patch("sqlite3.connect", side_effect=AssertionError("hlavní vlákno nesmí otevřít SQLite")):
+            result = link.check(self.clock.monotonic(), self.clock.utc())
+        self.assertIsNotNone(result.summary)
+        self.assertIn("údržba", result.summary)
 
     def test_unreadable_status_is_unknown_not_ok(self):
         link = self.make()
@@ -970,6 +1085,100 @@ class OutageTest(LinkCase):
         self.flush(link)
         self.assertTrue(self.samples(CPU_USAGE_ID))
         self.assertEqual(link.submit_failures, 0)
+
+
+class BlockingConnection:
+    """Obal spojení zapisovače, který zadrží COMMIT na bariéře (zaseknuté I/O)."""
+
+    def __init__(self, connection, entered, release, skip=1):
+        self._connection = connection
+        self._entered = entered
+        self._release = release
+        self._skip = skip  # první COMMIT patří start_run, ten se nezdržuje
+
+    def execute(self, sql, *args):
+        if sql == "COMMIT":
+            if self._skip:
+                self._skip -= 1
+            else:
+                self._entered.set()
+                self._release.wait(WAIT)
+        return self._connection.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+class StalledTest(LinkCase):
+    """Upozornění na nepotvrzený zápis vzniká až po prokazatelném zpoždění."""
+
+    def results(self):
+        observed, expires = self.clock.utc(), self.clock.monotonic() + VALIDITY
+        return [CheckResult(CPU_USAGE_ID, State.INFO, "CPU 5 %", observed, expires, simulated=False,
+                            measurement=Measurement(5, "%"))]
+
+    def blocking_opener(self):
+        """Opener, jehož první COMMIT uvízne; vrací (bariéra vstupu, uvolnění)."""
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def opener():
+            database = history.open_writer(self.db, "development", HOST)
+            database.connection = BlockingConnection(database.connection, entered, release)
+            return database
+
+        return opener, entered, release
+
+    def test_first_measurement_is_not_stalled(self):
+        # Běžné čekání na první dávku není závada: žádný commit zatím být nemusí.
+        link = self.make()
+        status = worker_status(commits=0, last_commit_monotonic=None, last_commit_utc=None,
+                               pending_measurements=1, pending_values=1)
+        with mock.patch.object(link.worker, "status", return_value=status):
+            self.assertIs(link.check(self.clock.monotonic(), self.clock.utc()).state, State.INFO)
+
+    def test_waiting_for_the_first_batch_is_not_stalled(self):
+        # Ani po 59 s čekání na minutovou dávku nejde o zaseknutý zápis.
+        opener, entered, release = self.blocking_opener()
+        link = self.make(opener=opener)
+        link.record(self.results(), self.clock.monotonic())
+        self.assertTrue(entered.wait(WAIT))  # první dávka uvízla v COMMIT
+        self.clock.advance(history_link.STALE_COMMIT_SECONDS - 1)
+        self.assertIs(link.check(self.clock.monotonic(), self.clock.utc()).state, State.INFO)
+
+    def test_frozen_first_commit_is_detected(self):
+        # Zamrznutí během prvního COMMIT: fronta je prázdná (data jsou v dávce),
+        # přesto nesmí stav vypadat v pořádku.
+        opener, entered, release = self.blocking_opener()
+        link = self.make(opener=opener)
+        link.record(self.results(), self.clock.monotonic())
+        self.assertTrue(entered.wait(WAIT))
+        self.assertEqual(link.worker.status().pending_measurements, 0)  # vzorky jsou v dávce
+        self.clock.advance(history_link.STALE_COMMIT_SECONDS)
+        result = link.check(self.clock.monotonic(), self.clock.utc())
+        self.assertIs(result.state, State.WARNING)
+        self.assertIn("nepotvrdil", result.summary)
+
+    def test_repeated_attempt_after_reopen_keeps_the_age(self):
+        # Opakování zápisu po znovuotevření nesmí věk nepotvrzené práce vynulovat.
+        link = self.make()
+        first = worker_status(commits=0, last_commit_monotonic=None, last_commit_utc=None,
+                              pending_measurements=1, unconfirmed_since=self.clock.monotonic())
+        self.clock.advance(history_link.STALE_COMMIT_SECONDS)
+        with mock.patch.object(link.worker, "status", return_value=first):
+            stuck = link.check(self.clock.monotonic(), self.clock.utc())
+        self.assertIs(stuck.state, State.WARNING)
+
+    def test_measurement_waiting_for_the_clock_is_not_stalled(self):
+        # Čekání na synchronizaci hodin má vlastní hlášení, ne „nepotvrzený zápis“.
+        self.clock.set_utc(WRONG)
+        link = self.make(sync=Sync(None))
+        link.record(self.results(), self.clock.monotonic())
+        self.clock.advance(history_link.STALE_COMMIT_SECONDS * 2)
+        result = link.check(self.clock.monotonic(), self.clock.utc())
+        self.assertIs(result.state, State.WARNING)
+        self.assertIn("synchroniz", result.summary)
+        self.assertNotIn("nepotvrdil", result.summary)
 
 
 class ClockTest(LinkCase):
@@ -1150,6 +1359,19 @@ class RealCollectors:
         return [replace(result, simulated=False) for result in self._collectors.collect(now, observed_utc)]
 
 
+class FailingCollectors:
+    """Kolektor, jehož měření vždy selže (strukturovaný údaj o selhání)."""
+
+    def __init__(self, collectors, error):
+        self.validity_seconds = collectors.validity_seconds
+        self.labels = collectors.labels
+        self.simulated = False
+        self._error = error
+
+    def collect(self, now, observed_utc):
+        raise self._error
+
+
 class LoopTest(LinkCase):
     """Smyčka měření s historií: měření pokračuje, kontrola se nepředává do historie."""
 
@@ -1180,6 +1402,31 @@ class LoopTest(LinkCase):
         self.assertNotIn(HISTORY_STORAGE_ID, {result.id for result in results})
         self.assertFalse(any("HISTORY" in line for line in self.lines))
         self.assertEqual(self.query("SELECT count(*) FROM run"), [(0,)])
+
+    def test_disabled_history_does_no_maintenance(self):
+        # Vypnutá historie neagreguje ani nemaže: databáze zůstane, jak byla.
+        before = (self.query("SELECT level, done_until FROM aggregation_state"),
+                  self.query("SELECT count(*) FROM run"), self.query("SELECT count(*) FROM sample"))
+        self.loop(None, RealCollectors(self.collectors()))
+        self.assertEqual((self.query("SELECT level, done_until FROM aggregation_state"),
+                          self.query("SELECT count(*) FROM run"), self.query("SELECT count(*) FROM sample")),
+                         before)
+        self.assertEqual(history.retained_since(
+            history.open_reader(self.db).connection)["sample"], None)
+
+    def test_collector_failure_is_distinguishable_in_history(self):
+        # Selhání sběru má v historii strukturovaný údaj; platné UNKNOWN ne.
+        link = self.make()
+        collectors = RealCollectors(self.collectors())
+        self.loop(link, collectors, measurements=1)
+        broken = FailingCollectors(collectors, RuntimeError("kolektor spadl"))
+        self.clock.stop_at = None
+        self.loop(link, broken, measurements=1)
+        self.flush(link)
+        details = [json.loads(row[0]) if row[0] else None for row in self.query(
+            "SELECT details FROM check_change WHERE check_id = ? ORDER BY id", (CPU_USAGE_ID,))]
+        self.assertIsNone(details[0])  # platné měření: žádný údaj o selhání
+        self.assertEqual(details[-1], {"failure": "RuntimeError"})
 
     def test_disabled_history_does_no_database_operation(self):
         # Vypnutá historie nesmí vůbec sáhnout na sqlite3: žádné spojení, žádný soubor.

@@ -106,6 +106,15 @@ class NamesTest(unittest.TestCase):
         self.assertNotEqual(check_name("disk.a"), check_name("disk.b"))
         self.assertNotIn("CHECK", " ".join(CHECK_NAMES.values()))  # známé kontroly fallback nepoužijí
 
+    def test_history_names_are_prepared_without_claiming_anything(self):
+        # Názvy pro diagnostiku historie; snímek ještě neexistuje (M3.4), takže
+        # displej o záloze nic netvrdí a stav nese jen sloupec stavu.
+        self.assertEqual(check_name("history.storage"), "HISTORY")
+        self.assertEqual(check_name("history.snapshot"), "HIST SNAPSHOT")
+        self.assertNotIn("history.snapshot", FAULT_TEXT)
+        self.assertEqual(status_texts(result("history.storage", State.UNKNOWN), 10)[0], "HISTORY NO DATA")
+        self.assertEqual(status_texts(result("history.snapshot", State.NA), 10)[0], "HIST SNAPSHOT N/A")
+
     def test_root_mode_name_and_read_only_fault(self):
         self.assertEqual(check_name("disk.root_readonly"), "ROOT MODE")
         self.assertEqual(status_texts(result("disk.root_readonly", State.UNKNOWN, expires=5), 10)[0], "ROOT MODE STALE")

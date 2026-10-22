@@ -31,6 +31,19 @@ from .network_monitor import NetworkMonitor
 from .system_monitor import SystemMonitor
 
 
+# Klíč v details, kterým se selhání sběru odlišuje od platného měření bez hodnoty
+# (docs/HISTORY.md 4.4). Hodnotou je jméno výjimky; stav zůstává UNKNOWN, takže
+# prahy, výpis ani displej se nemění a nic nevypadá jako OK.
+COLLECTOR_FAILURE = "failure"
+
+
+def failure_name(error):
+    """Jméno výjimky jako krátký údaj ASCII pro details (nikdy nevyhodí chybu)."""
+    name = "".join(character for character in type(error).__name__
+                   if character.isascii() and character.isprintable() and character != " ")
+    return name or "Exception"
+
+
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -40,18 +53,22 @@ def print_now(line):
     print(line, flush=True)
 
 
-def failed_results(monitor, now, observed_utc, validity_seconds, reason="měření selhalo"):
+def failed_results(monitor, now, observed_utc, validity_seconds, reason="měření selhalo", failure=None):
     """Výsledky pro měření, které celé selhalo: všechny kontroly kolektoru UNKNOWN.
 
     Kontroly určuje `monitor.labels` (id → popisek). Předchozí hodnoty se
     nepodrží, i když by ještě byly platné: víme, že aktuální měření
     neproběhlo, a staré INFO/OK by vypadalo jako čerstvé. Stejně se kolektor
     chová při selhání jedné kontroly.
+    `failure` je strukturovaný údaj o selhání sběru (jméno výjimky) v
+    `details[COLLECTOR_FAILURE]`: v historii tak jde selhání kolektoru odlišit
+    od platného měření, které jen nemá hodnotu. Stav zůstává UNKNOWN.
     """
+    details = {} if failure is None else {COLLECTOR_FAILURE: failure}
     return [
         CheckResult(
             check_id, State.UNKNOWN, f"{label}: {reason}", observed_utc,
-            now + validity_seconds, simulated=monitor.simulated,
+            now + validity_seconds, simulated=monitor.simulated, details=details,
         )
         for check_id, label in monitor.labels.items()
     ]
@@ -84,7 +101,8 @@ class Collectors:
             except Exception as error:
                 # Ctrl+C (KeyboardInterrupt) není Exception a projde až do smyčky.
                 results += failed_results(monitor, now, observed_utc, self.validity_seconds,
-                                          f"měření selhalo ({type(error).__name__})")
+                                          f"měření selhalo ({type(error).__name__})",
+                                          failure=failure_name(error))
         return results
 
 
@@ -195,7 +213,8 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
                 text = None
             except Exception as error:
                 # Ctrl+C (KeyboardInterrupt) není Exception a smyčku ukončí níže.
-                results = failed_results(monitor, now, observed_utc, config.validity_seconds)
+                results = failed_results(monitor, now, observed_utc, config.validity_seconds,
+                                         failure=failure_name(error))
                 text = f"měření selhalo: {type(error).__name__}: {error}"
             # Prahy se vyhodnotí i po selhání: UNKNOWN přeruší řadu měření pro
             # potvrzení závady, ale závadu nevyřeší.

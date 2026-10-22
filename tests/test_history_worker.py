@@ -10,6 +10,8 @@ Chyby SQLite se vyvolávají ve vlákně zapisovače obalem spojení nebo skute�
 
 import hashlib
 import json
+import math
+import os
 import os
 import sqlite3
 import stat
@@ -20,6 +22,7 @@ import threading
 import time
 import unittest
 from dataclasses import FrozenInstanceError
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,9 +30,11 @@ from nexusstat import history
 from nexusstat.core import CheckResult, Measurement, State
 from nexusstat import history_worker
 from nexusstat.history_worker import (
+    AGGREGATION_INTERVAL_SECONDS,
     DEGRADED,
     FAILED,
     MAX_RESULT_BYTES,
+    RETENTION_INTERVAL_SECONDS,
     RUNNING,
     STOPPED,
     HistoryWorker,
@@ -230,6 +235,30 @@ class WorkerTest(unittest.TestCase):
     def query(self, sql, params=()):
         with history.open_reader(self.db) as reader:
             return reader.connection.execute(sql, params).fetchall()
+
+    def stable(self, worker):
+        """Doložená doba souvislé synchronizace ze snímku stavu (None = nedoložená)."""
+        return worker.status().maintenance.stable_s
+
+    def observe(self, worker, monotonic=None, synced=True):
+        """Jedno pozorování zdroje synchronizace bez měření (jen evidence stability)."""
+        monotonic = self.clock.monotonic() if monotonic is None else monotonic
+        with worker._cond:
+            worker._track_stability(monotonic, monotonic + self.clock.offset, synced)
+
+    def run_for(self, worker, seconds, step=300):
+        """Posune čas po krocích s průběžným potvrzováním synchronizace (jako skutečný provoz)."""
+        end = self.clock.monotonic() + seconds
+        while self.clock.monotonic() < end:
+            self.clock.advance(min(step, end - self.clock.monotonic()))
+            self.observe(worker)
+        worker.wake()
+
+    def query_connection(self):
+        """Spojení jen pro čtení pro kontroly, které potřebují dotaz (zavře se s testem)."""
+        reader = history.open_reader(self.db)
+        self.addCleanup(reader.close)
+        return reader.connection
 
     def samples(self, check_id=CPU_TEMP_ID):
         return self.query("SELECT s.ts, s.value FROM sample s JOIN metric m ON m.id = s.metric_id "
@@ -665,6 +694,780 @@ class ResultSizeTest(WorkerTest):
         self.assertTrue(self.submit(worker, temp_state=State.WARNING, temp=75.0))
         self.assertTrue(worker.flush(WAIT))
         self.assertEqual([row[3] for row in self.changes()], ["INFO", "WARNING"])
+
+
+class QueueStateTest(WorkerTest):
+    """Kontrakt fronty pro uzavírání oken: EMPTY jen tehdy, když to lze doložit."""
+
+    def state(self, worker):
+        with worker._cond:
+            queue, quality = worker._queue_state()
+        return queue, quality
+
+    def test_empty_queue_with_synchronized_clock(self):
+        worker = self.make(start=False)
+        worker.start(time_synced=True)
+        self.settle(worker, lambda s: s.state != "STARTING")
+        queue, quality = self.state(worker)
+        self.assertEqual((queue.known, queue.oldest_utc, quality), (True, None, "synced"))
+
+    def test_waiting_measurement_reports_its_time(self):
+        worker = self.make()
+        self.submit(worker)
+        queue, quality = self.state(worker)
+        self.assertEqual((queue.known, queue.oldest_utc), (True, BASE))
+        self.assertEqual(quality, "synced")
+
+    def test_oldest_time_decides_even_after_the_clock_went_back(self):
+        worker = self.make(start=False)
+        worker.start(time_synced=True)
+        self.submit(worker)
+        self.clock.advance(10)
+        self.clock.set_utc(BASE - 50)  # čas šel zpět: první měření je novější
+        self.submit(worker)
+        queue, _ = self.state(worker)
+        self.assertEqual(queue.oldest_utc, BASE - 50)
+
+    def test_unsynchronized_measurement_is_unknown(self):
+        self.clock.set_utc(WRONG)
+        worker = self.make(start=False, synced=False)
+        worker.start(time_synced=False)
+        self.submit(worker, synced=False)
+        queue, quality = self.state(worker)
+        self.assertEqual((queue.known, quality), (False, "unsynced"))
+
+    def test_measurement_held_before_the_first_synchronization_is_unknown(self):
+        # Hodiny ukazovaly věrohodný čas, ale zdroj ho nedokládal: takové měření
+        # dostane až odvozený čas po první synchronizaci, takže dokud není
+        # zapsané, okno uzavřít nelze — i když jeho čas vypadá použitelně.
+        worker = self.make(start=False, synced=False)  # bez vlákna: nic se nezapisuje
+        worker.start(time_synced=False)
+        self.submit(worker, synced=False)  # čas BASE, ale nedoložený
+        self.clock.advance(10)
+        self.submit(worker, synced=True)  # první doložená synchronizace
+        held = [item for item in worker._measurements if item.quality == "unsynced"]
+        self.assertEqual(len(held), 1)
+        self.assertGreaterEqual(math.floor(held[0].results[0].observed_utc.timestamp()), history.MIN_TRUSTED_UTC)
+        queue, quality = self.state(worker)
+        self.assertEqual(quality, "synced")
+        self.assertFalse(queue.known)
+
+    def test_measurement_without_results_is_unknown(self):
+        worker = self.make()
+        worker.submit([], self.clock.monotonic(), True)
+        queue, _ = self.state(worker)
+        self.assertFalse(queue.known)
+
+    def test_selected_or_sealed_batch_is_unknown(self):
+        worker = self.make()
+        release = self.hold(worker)  # dávka drží COMMIT: její vzorky nejsou zapsané
+        queue, _ = self.state(worker)
+        self.assertFalse(queue.known)
+        release.set()
+
+    def test_quality_follows_the_source_of_synchronization(self):
+        worker = self.make()
+        self.submit(worker, synced=False)  # ztráta synchronizace: čas „teď“ není jistý
+        _, quality = self.state(worker)
+        self.assertEqual(quality, "unsynced")
+
+
+class MaintenanceTest(WorkerTest):
+    """Automatická agregace a retence spouštěná vláknem zapisovače (M3.3b-2)."""
+
+    GRACE = history.AGGREGATION_GRACE_SECONDS
+
+    def fill(self, worker, count, step=10):
+        """Předá a potvrdí `count` měření v odstupu `step` sekund."""
+        for _ in range(count):
+            self.submit(worker)
+            self.clock.advance(step)
+        self.assertTrue(worker.flush(WAIT), worker.status())
+
+    def aggregated(self, worker, done_5m):
+        self.assertTrue(worker.wait_until(
+            lambda s: s.maintenance.done_5m is not None and s.maintenance.done_5m >= done_5m, WAIT),
+            worker.status().maintenance)
+
+    def test_no_maintenance_right_after_opening(self):
+        worker = self.make()
+        self.advance(worker, AGGREGATION_INTERVAL_SECONDS - 1)
+        time.sleep(0.05)
+        maintenance = worker.status().maintenance
+        self.assertIsNone(maintenance.aggregation_monotonic)  # start sám nic neagreguje
+        self.assertIsNone(maintenance.retention_monotonic)
+
+    def test_aggregation_after_the_interval_without_any_data(self):
+        worker = self.make()
+        self.advance(worker, AGGREGATION_INTERVAL_SECONDS)
+        self.settle(worker, lambda s: s.maintenance.aggregation_monotonic is not None, "čekám na agregaci")
+        self.assertEqual(worker.status().maintenance.windows_5m, 0)  # není co uzavřít
+
+    def test_aggregation_runs_after_a_confirmed_batch(self):
+        worker = self.make()
+        self.fill(worker, 31)  # BASE .. BASE+300
+        self.advance(worker, self.GRACE + 1)
+        self.aggregated(worker, BASE + 300)
+        # Dvě řady měření (teplota a vytížení CPU) dávají dva řádky na okno.
+        rows = self.query("SELECT bucket, n_samples, n_valid FROM agg_5m ORDER BY bucket")
+        self.assertEqual(rows, [(BASE, 30, 30), (BASE, 30, 30)])
+        maintenance = worker.status().maintenance
+        self.assertEqual((maintenance.windows_5m, maintenance.blocked, maintenance.conflict), (2, None, None))
+        self.assertIsNotNone(maintenance.aggregation_utc)
+
+    def test_five_minute_and_hourly_windows(self):
+        worker = self.make()
+        self.fill(worker, 61, step=60)  # celá hodina vzorků
+        self.advance(worker, self.GRACE + 1)
+        self.settle(worker, lambda s: s.maintenance.done_1h is not None and s.maintenance.done_1h >= BASE + 3600,
+                    "čekám na hodinovou agregaci")
+        self.assertEqual(len(self.query("SELECT DISTINCT bucket FROM agg_5m")), 12)
+        self.assertEqual(len(self.query("SELECT bucket FROM agg_5m")), 24)  # 12 oken × 2 řady
+        self.assertEqual(self.query("SELECT bucket, n_samples FROM agg_1h"), [(BASE, 60), (BASE, 60)])
+
+    def test_unconfirmed_batch_blocks_maintenance(self):
+        worker = self.make()
+        release = self.hold(worker)  # dávka visí v COMMIT
+        self.advance(worker, AGGREGATION_INTERVAL_SECONDS * 2)
+        time.sleep(0.05)
+        self.assertIsNone(worker.status().maintenance.aggregation_monotonic)
+        release.set()
+        self.settle(worker, lambda s: s.maintenance.aggregation_monotonic is not None, "agregace po potvrzení")
+
+    def test_sealed_batch_waiting_for_retry_blocks_maintenance(self):
+        # Dávka po chybě čeká na odstup: vlákno je volné, ale údržba se nespustí,
+        # dokud není výsledek zápisu znám (ani agregace, ani retence).
+        worker = self.make()
+        self.faults.add(lambda sql: sql == "BEGIN IMMEDIATE",
+                        fail(sqlite_error(sqlite3.OperationalError, "SQLITE_BUSY", "database is locked")))
+        self.submit(worker)
+        self.settle(worker, lambda s: s.error_kind == "busy", "čekám na chybu zápisu")
+        self.assertIsNotNone(worker._batch)  # zapečetěná dávka čeká
+        with worker._cond:
+            worker._aggregate_at = worker._retain_at = 0.0  # údržba by byla na řadě
+        worker.wake()
+        time.sleep(0.05)
+        maintenance = worker.status().maintenance
+        self.assertIsNone(maintenance.aggregation_monotonic)
+        self.assertIsNone(maintenance.retention_monotonic)
+        self.faults.clear()
+        self.advance(worker, 10)
+        self.commits(worker, 1)
+        self.settle(worker, lambda s: s.maintenance.aggregation_monotonic is not None, "agregace po potvrzení")
+
+    def test_conflict_stops_aggregation_and_keeps_writing(self):
+        worker = self.make()
+        error = history.HistoryError("conflict", "okno 1800003600 už existuje; doklad zapsán")
+        with mock.patch.object(history.HistoryRecorder, "aggregate", side_effect=error) as aggregate:
+            self.fill(worker, 2)
+            self.advance(worker, self.GRACE + 1)
+            self.settle(worker, lambda s: s.maintenance.conflict is not None, "čekám na konflikt")
+            calls = aggregate.call_count
+            self.advance(worker, AGGREGATION_INTERVAL_SECONDS * 3)
+            time.sleep(0.05)
+            self.assertEqual(aggregate.call_count, calls)  # po konfliktu se už neagreguje
+        maintenance = worker.status().maintenance
+        self.assertEqual(maintenance.blocked, "conflict")
+        self.assertIn("doklad", maintenance.conflict)
+        self.assertEqual(worker.status().state, RUNNING)  # měření a zápis pokračují
+        self.submit(worker, temp_state=State.WARNING, temp=75.0)
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual([row[3] for row in self.changes()], ["INFO", "WARNING"])
+
+    def test_maintenance_failure_does_not_stop_writing(self):
+        worker = self.make()
+        busy = history.HistoryError("write", "agregaci nelze zapsat: database is locked", "SQLITE_BUSY")
+        with mock.patch.object(history.HistoryRecorder, "aggregate", side_effect=busy):
+            self.fill(worker, 2)
+            self.advance(worker, self.GRACE + 1)
+            self.settle(worker, lambda s: s.maintenance.failures > 0, "čekám na selhání údržby")
+        status = worker.status()
+        self.assertEqual(status.state, RUNNING)  # zápis měření není v chybě
+        self.assertIsNone(status.error_kind)
+        self.assertIn("busy", status.maintenance.last_error)
+        self.submit(worker, temp_state=State.CRITICAL, temp=95.0)
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual([row[3] for row in self.changes()], ["INFO", "CRITICAL"])
+        self.advance(worker, 600)  # po odstupu se údržba zkusí znovu a uspěje
+        self.settle(worker, lambda s: s.maintenance.failures == 0, "čekám na obnovu údržby")
+
+    def test_fatal_maintenance_error_stops_the_writer(self):
+        worker = self.make()
+        corrupt = history.HistoryError("write", "databáze je poškozená", "SQLITE_CORRUPT")
+        with mock.patch.object(history.HistoryRecorder, "aggregate", side_effect=corrupt):
+            self.fill(worker, 2)
+            self.advance(worker, self.GRACE + 1)
+            self.settle(worker, lambda s: s.state == FAILED, "čekám na zastavení")
+        self.assertEqual(worker.status().error_kind, "corrupt")
+
+    def test_new_measurement_is_written_during_catch_up(self):
+        worker = self.make()
+        self.fill(worker, 121, step=60)  # dvě hodiny vzorků k dohnání
+        self.advance(worker, self.GRACE + 1)
+        self.submit(worker, temp_state=State.CRITICAL, temp=95.0)  # nová data během dohánění
+        self.assertTrue(worker.flush(WAIT), worker.status())
+        self.assertIn("CRITICAL", [row[3] for row in self.changes()])
+        self.settle(worker, lambda s: s.maintenance.done_1h is not None and s.maintenance.done_1h >= BASE + 3600,
+                    "dohánění pokračuje")
+
+    def seed_days(self, days=3, step=300):
+        """Předchozí běh zapsal vzorky za několik dní; spojení se pak zavře.
+
+        Vzorky končí před BASE, takže nová měření zapisovače projdou horní mezí.
+        Databáze musí vzniknout ještě dřív: `aggregation_state` začíná hodinou
+        vzniku a starší vzorky by pravidla přijetí odmítla jako pozdní.
+        """
+        for path in (self.db, *history.companion_paths(self.db)):
+            path.unlink(missing_ok=True)
+        history.create_database(self.db, "test", HOST, now_utc=BASE - (days + 1) * history.DAY_SECONDS)
+        database = history.open_writer(self.db, "test", HOST)
+        recorder = history.HistoryRecorder(database)
+        start = BASE - days * history.DAY_SECONDS
+        recorder.start_run("seed", 300, datetime.fromtimestamp(start - step, timezone.utc))
+        batch = recorder.begin_batch()
+        count = days * history.DAY_SECONDS // step
+        for index in range(count):
+            moment = start + index * step
+            observed = datetime.fromtimestamp(moment, timezone.utc)
+            recorder.add_results(batch, [CheckResult(CPU_TEMP_ID, State.INFO, "x", observed,
+                                                     1000.0 + index * step, simulated=False,
+                                                     measurement=Measurement(50.0, CELSIUS))])
+            if len(batch.samples) >= 500:
+                recorder.write(batch)
+                batch = recorder.begin_batch()
+        recorder.write(batch)
+        recorder.finish_run(datetime.fromtimestamp(BASE - step, timezone.utc))
+        database.close()
+        return count
+
+    def test_catch_up_over_several_days_is_progressive(self):
+        # Jedno volání uzavře nejvýš hodinu oken, takže se tři dny dohánějí
+        # postupně; mezi voláními se smyčka vrací k zápisu a k požadavku na stop.
+        self.seed_days(3)
+        worker = self.make()
+        self.advance(worker, AGGREGATION_INTERVAL_SECONDS)
+        self.assertTrue(worker.wait_until(
+            lambda s: s.maintenance.done_5m is not None and s.maintenance.done_5m >= BASE - 300, 20),
+            worker.status().maintenance)
+        maintenance = worker.status().maintenance
+        self.assertGreater(maintenance.windows_5m, 12)  # víc než jedna hodina = víc volání
+        self.assertGreaterEqual(maintenance.done_1h, BASE - history.HOUR_SECONDS)
+        self.assertFalse(maintenance.more)
+        self.assertEqual(maintenance.failures, 0)
+
+    def test_wal_size_is_recorded(self):
+        worker = self.make()
+        self.fill(worker, 2)
+        self.settle(worker, lambda s: s.maintenance.wal_bytes is not None, "čekám na velikost WAL")
+        self.assertGreater(worker.status().maintenance.wal_bytes, 0)
+
+    def test_stop_during_maintenance_is_clean(self):
+        worker = self.make()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = history.HistoryRecorder.aggregate
+
+        def slow(recorder, *args, **kwargs):
+            entered.set()
+            release.wait(1.0)
+            return original(recorder, *args, **kwargs)
+
+        with mock.patch.object(history.HistoryRecorder, "aggregate", slow):
+            self.fill(worker, 2)
+            self.advance(worker, self.GRACE + 1)
+            self.assertTrue(entered.wait(WAIT))
+            release.set()
+            report = worker.stop(timeout=WAIT)
+        self.assertTrue(report.completed and report.clean_stop, report)
+        self.assertEqual(self.query("SELECT clean_stop FROM run"), [(1,)])
+
+
+class RetentionAutomationTest(WorkerTest):
+    """Automatická retence: maže jen s doloženou stabilitou hodin a pod agregací."""
+
+    MONTH = 31 * history.DAY_SECONDS
+
+    def prepare(self, worker, count=31, step=10):
+        """Zapíše vzorky a nechá je zagregovat, aby je retence vůbec mohla smazat."""
+        for _ in range(count):
+            self.submit(worker)
+            self.clock.advance(step)
+        self.assertTrue(worker.flush(WAIT))
+        self.advance(worker, history.AGGREGATION_GRACE_SECONDS + 1)
+        self.assertTrue(worker.wait_until(
+            lambda s: s.maintenance.done_5m is not None and s.maintenance.done_5m >= BASE + 300, WAIT),
+            worker.status().maintenance)
+
+    def test_retention_deletes_after_proven_stability(self):
+        worker = self.make()
+        self.prepare(worker)
+        before = self.query("SELECT count(*) FROM sample")[0][0]
+        self.run_for(worker, self.MONTH)  # měsíc provozu s průběžným potvrzováním
+        self.settle(worker, lambda s: s.maintenance.retention_monotonic is not None, "čekám na retenci")
+        maintenance = worker.status().maintenance
+        self.assertIsNone(maintenance.retention_blocked)
+        self.assertGreater(maintenance.deleted.get("sample", 0), 0)
+        self.assertLess(self.query("SELECT count(*) FROM sample")[0][0], before)
+        self.assertIsNotNone(history.retained_since(self.query_connection())["sample"])
+
+    def test_retention_is_blocked_just_before_twenty_four_hours(self):
+        worker = self.make()
+        self.prepare(worker)
+        self.run_for(worker, history.RETENTION_STABLE_CLOCK_SECONDS - 600 - 431)
+        self.settle(worker, lambda s: s.maintenance.retention_monotonic is not None, "čekám na pokus o retenci")
+        maintenance = worker.status().maintenance
+        self.assertEqual(maintenance.retention_blocked, "clock_unstable")
+        self.assertEqual(maintenance.deleted.get("sample", 0), 0)
+
+    def test_lost_synchronization_blocks_retention(self):
+        worker = self.make()
+        self.prepare(worker)
+        self.run_for(worker, self.MONTH)
+        self.submit(worker, synced=False)  # ztráta synchronizace ruší doloženou stabilitu
+        worker.wake()
+        self.settle(worker, lambda s: s.maintenance.retention_monotonic is not None, "čekám na pokus o retenci")
+        self.assertEqual(worker.status().maintenance.retention_blocked, "time_unsynced")
+        self.assertEqual(worker.status().maintenance.deleted.get("sample", 0), 0)
+
+    def test_retention_never_passes_the_aggregation_boundary(self):
+        worker = self.make()
+        for _ in range(5):  # vzorky, které se nikdy neagregovaly
+            self.submit(worker)
+            self.clock.advance(10)
+        self.assertTrue(worker.flush(WAIT))
+        before = self.query("SELECT count(*) FROM sample")[0][0]
+        self.run_for(worker, self.MONTH)
+        self.settle(worker, lambda s: s.maintenance.retention_monotonic is not None, "čekám na retenci")
+        self.assertIsNone(worker.status().maintenance.retention_blocked)
+        self.assertEqual(self.query("SELECT count(*) FROM sample")[0][0], before)  # nic bez agregace
+
+    def test_aggregation_conflict_does_not_open_the_way_to_retention(self):
+        # Po konfliktu se hranice agregace nehýbe, takže retence nemůže smazat
+        # nic nového: surové vzorky zůstanou nad potvrzeným done_until.
+        worker = self.make()
+        for _ in range(31):
+            self.submit(worker)
+            self.clock.advance(10)
+        self.assertTrue(worker.flush(WAIT))
+        before = self.query("SELECT count(*) FROM sample")[0][0]
+        error = history.HistoryError("conflict", "okno už existuje; doklad zapsán")
+        with mock.patch.object(history.HistoryRecorder, "aggregate", side_effect=error):
+            self.advance(worker, history.AGGREGATION_GRACE_SECONDS + 1)
+            self.settle(worker, lambda s: s.maintenance.conflict is not None, "čekám na konflikt")
+            self.run_for(worker, self.MONTH)
+            self.settle(worker, lambda s: s.maintenance.retention_monotonic is not None, "čekám na retenci")
+        maintenance = worker.status().maintenance
+        self.assertIsNone(maintenance.retention_blocked)  # čas je v pořádku
+        self.assertEqual(maintenance.deleted.get("sample", 0), 0)  # přesto se nic nesmazalo
+        self.assertEqual(self.query("SELECT count(*) FROM sample")[0][0], before)
+
+    def test_retention_runs_at_most_once_an_hour(self):
+        worker = self.make()
+        self.prepare(worker)
+        self.run_for(worker, self.MONTH)
+        self.settle(worker, lambda s: s.maintenance.retention_monotonic is not None, "první retence")
+        first = worker.status().maintenance.retention_monotonic
+        self.run_for(worker, RETENTION_INTERVAL_SECONDS - 300, step=300)
+        time.sleep(0.05)
+        self.assertEqual(worker.status().maintenance.retention_monotonic, first)
+        self.advance(worker, 300)
+        self.settle(worker, lambda s: s.maintenance.retention_monotonic != first, "druhá retence po hodině")
+
+    def test_stop_during_retention_is_clean(self):
+        worker = self.make()
+        self.prepare(worker)
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = history.HistoryRecorder.retain
+
+        def slow(recorder, *args, **kwargs):
+            entered.set()
+            release.wait(1.0)
+            return original(recorder, *args, **kwargs)
+
+        with mock.patch.object(history.HistoryRecorder, "retain", slow):
+            self.run_for(worker, self.MONTH)
+            self.assertTrue(entered.wait(WAIT))
+            release.set()
+            report = worker.stop(timeout=WAIT)
+        self.assertTrue(report.completed and report.clean_stop, report)
+
+
+class ClockJumpEvidenceTest(WorkerTest):
+    """Doklad skoku hodin: zápis, dohledatelnost a vliv na retenci."""
+
+    def jump(self, worker, shift=3600):
+        """Vyvolá skok systémového času mezi dvěma měřeními."""
+        self.submit(worker, synced=True)
+        self.clock.advance(10)
+        self.clock.set_utc(self.clock.utc().timestamp() + shift)
+        self.submit(worker, temp_state=State.WARNING, temp=75.0, synced=True)
+
+    def test_jump_event_reaches_the_database(self):
+        worker = self.make()
+        self.jump(worker)
+        self.assertTrue(worker.flush(WAIT))
+        events = self.events("clock.jump")
+        self.assertEqual(len(events), 1)
+        self.assertGreater(events[0][3]["shift_s"], 3000)
+        self.assertEqual(events[0][2], "WARNING")
+        self.assertEqual(self.stable(worker), 0)  # a zároveň ruší doloženou stabilitu
+
+    def test_jump_event_survives_a_transient_error(self):
+        # Přechodná chyba SQLite událost neztratí tiše: zůstane ve frontě dávky.
+        worker = self.make()
+        self.faults.add(lambda sql: sql == "BEGIN IMMEDIATE",
+                        fail(sqlite_error(sqlite3.OperationalError, "SQLITE_BUSY", "database is locked")), times=1)
+        self.jump(worker)
+        self.settle(worker, lambda s: s.error_kind == "busy", "čekám na chybu zápisu")
+        self.assertEqual(self.events("clock.jump"), [])  # ještě nezapsaná
+        self.advance(worker, 10)
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual(len(self.events("clock.jump")), 1)  # po obnovení dohledatelná
+
+    def test_recorded_jump_blocks_retention_for_twenty_four_hours(self):
+        # Doklad v databázi platí i proti doložené stabilitě v paměti.
+        worker = self.make()
+        self.run_for(worker, history.RETENTION_STABLE_CLOCK_SECONDS)
+        state = worker._clock_state()
+        self.assertEqual(state.stable_s, history.RETENTION_STABLE_CLOCK_SECONDS)
+        now = math.floor(self.clock.utc().timestamp())
+        worker.submit_event(history.Event(now - 3600, "synced", "clock.jump", "WARNING", "skok o +5 s",
+                                          data={"shift_s": 5.0}))
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual(history._retention_guard(self.query_connection(), now, state), "clock_jump_recent")
+
+    def test_unrecorded_event_loss_blocks_retention(self):
+        # Ztracená událost mohla být doklad skoku: dokud o ztrátě není záznam
+        # v databázi, retence se nepovažuje za bezpečnou, i když je stabilita
+        # doložená. Po zapsání ztráty je mezera viditelná a skok v tomto běhu
+        # hlídá i vlastní detekce posunu času.
+        worker = self.make(event_capacity=1)
+        self.run_for(worker, history.RETENTION_STABLE_CLOCK_SECONDS)
+        self.assertTrue(worker._clock_state().synced)
+        release = self.hold(worker)  # zapisovač drží dávku: fronta událostí přeteče
+        for index in range(3):
+            worker.submit_event(history.Event(BASE + index, "synced", "test.e", "INFO", "x"))
+        status = worker.status()
+        self.assertGreater(status.losses.get("events_dropped", 0), 0)
+        self.assertGreater(status.unrecorded_losses.get("events_dropped", 0), 0)
+        self.assertFalse(worker._clock_state().synced)  # doklad skoku mohl zmizet
+        release.set()
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual(len(self.events("history.events_dropped")), 1)  # ztráta je doložená
+        self.assertTrue(worker._clock_state().synced)
+
+    def test_oversized_event_blocks_retention_until_recorded(self):
+        worker = self.make()
+        self.run_for(worker, history.RETENTION_STABLE_CLOCK_SECONDS)
+        huge = history.Event(BASE, "synced", "test.big", "INFO", "x" * (history_worker.MAX_EVENT_BYTES + 1))
+        release = self.hold(worker)
+        self.assertFalse(worker.submit_event(huge))
+        self.assertEqual(worker.status().losses.get("event_too_large"), 1)
+        self.assertFalse(worker._clock_state().synced)
+        release.set()
+        self.assertTrue(worker.flush(WAIT))
+        self.assertTrue(worker._clock_state().synced)  # po zapsání dokladu ztráty
+
+
+class StarvationTest(WorkerTest):
+    """Zápis má přednost: údržba nesmí vyhladovět měření ani se zacyklit."""
+
+    def test_measurements_are_not_dropped_during_catch_up(self):
+        # Tři dny oken k dohnání a měření každou sekundu: nic se nesmí zahodit.
+        MaintenanceTest.seed_days(self, days=3)
+        worker = self.make(interval_s=1)
+        self.advance(worker, AGGREGATION_INTERVAL_SECONDS)
+        for index in range(60):  # kmitání dvou kontrol, nová data každou sekundu
+            self.submit(worker, temp_state=State.CRITICAL if index % 2 else State.INFO,
+                        temp=95.0 if index % 2 else 40.0)
+            self.clock.advance(1)
+            worker.wake()
+        self.assertTrue(worker.flush(WAIT), worker.status())
+        status = worker.status()
+        self.assertEqual(status.losses.get("queue_full", 0), 0)
+        self.assertEqual(status.confirmed_measurements, 60)
+        self.assertGreaterEqual(len(self.changes()), 60)  # všechny přechody zapsané
+        self.assertTrue(worker.wait_until(
+            lambda s: s.maintenance.done_5m is not None and s.maintenance.done_5m >= BASE - 300, 20),
+            worker.status().maintenance)
+
+    def test_new_event_during_catch_up_is_written(self):
+        MaintenanceTest.seed_days(self, days=2)
+        worker = self.make()
+        self.advance(worker, AGGREGATION_INTERVAL_SECONDS)
+        worker.submit_event(history.Event(BASE, "synced", "test.urgent", "WARNING", "během dohánění"))
+        self.settle(worker, lambda s: s.confirmed_events >= 1, "událost během dohánění")
+        self.assertEqual(len(self.events("test.urgent")), 1)
+
+    def test_stop_during_catch_up_is_clean(self):
+        MaintenanceTest.seed_days(self, days=2)
+        worker = self.make()
+        self.advance(worker, AGGREGATION_INTERVAL_SECONDS)
+        report = worker.stop(timeout=WAIT)
+        self.assertTrue(report.completed and report.clean_stop, report)
+
+    def test_catch_up_without_progress_does_not_spin(self):
+        # Bez posunu hranice se další pokus odloží na interval (žádná smyčka).
+        worker = self.make()
+        self.fill = MaintenanceTest.fill.__get__(self)
+        self.fill(worker, 2)
+        stuck = history.AggregationResult(done_5m=BASE, done_1h=BASE, windows_5m=0, windows_1h=0, more=True)
+        with mock.patch.object(history.HistoryRecorder, "aggregate", return_value=stuck) as aggregate:
+            self.advance(worker, AGGREGATION_INTERVAL_SECONDS)
+            self.settle(worker, lambda s: s.maintenance.more, "čekám na more")
+            calls = aggregate.call_count
+            time.sleep(0.1)
+            self.assertLessEqual(aggregate.call_count - calls, 1)
+
+
+class WalTest(WorkerTest):
+    """Velikost WAL pochází ze skutečného souboru správné databáze."""
+
+    def test_no_automatic_truncate_or_vacuum(self):
+        # Údržba velikost souboru nikdy neupravuje: žádný VACUUM ani vynucený
+        # checkpoint (ani v podobě wal_checkpoint(TRUNCATE), HISTORY.md 5.7, 7).
+        # "result_truncated" je zkrácení textu výsledku, ne operace nad souborem.
+        for name in ("history.py", "history_worker.py", "history_link.py", "run.py"):
+            source = (REPO / "src" / "nexusstat" / name).read_text(encoding="utf-8").lower()
+            for forbidden in ("vacuum", "wal_checkpoint", "checkpoint(", "truncate)"):
+                with self.subTest(module=name, forbidden=forbidden):
+                    self.assertNotIn(forbidden, source)
+
+    def test_size_is_read_from_the_real_file(self):
+        worker = self.make()
+        MaintenanceTest.fill.__get__(self)(worker, 2)
+        self.settle(worker, lambda s: s.maintenance.wal_bytes is not None, "čekám na velikost WAL")
+        real = (self.folder / "history.sqlite3-wal").stat().st_size
+        self.assertEqual(worker.status().maintenance.wal_bytes, real)
+
+    def test_symlinked_database_reports_the_real_wal(self):
+        link = self.folder / "odkaz.sqlite3"
+        link.symlink_to(self.db)
+        worker = self.make(start=False)
+        worker._path = link  # cesta z konfigurace může být symlink
+        self.assertEqual(worker._wal_bytes(), None if not (self.folder / "history.sqlite3-wal").exists()
+                         else (self.folder / "history.sqlite3-wal").stat().st_size)
+        worker.start(time_synced=True)
+        self.settle(worker, lambda s: s.state != "STARTING")
+        MaintenanceTest.fill.__get__(self)(worker, 2)
+        self.settle(worker, lambda s: s.maintenance.wal_bytes is not None, "čekám na velikost WAL")
+        self.assertEqual(worker.status().maintenance.wal_bytes,
+                         (self.folder / "history.sqlite3-wal").stat().st_size)
+
+    def test_missing_wal_is_not_an_error(self):
+        worker = self.make(start=False)
+        worker._path = self.folder / "neexistuje.sqlite3"
+        self.assertIsNone(worker._wal_bytes())
+
+    def test_unreadable_wal_is_unknown_not_zero(self):
+        worker = self.make(start=False)
+        with mock.patch.object(os.path, "getsize", side_effect=PermissionError("nelze")):
+            self.assertIsNone(worker._wal_bytes())
+
+
+class StabilityTest(WorkerTest):
+    """Evidence souvislé synchronizace hodin pro retenci (ClockState, M3.3b-2).
+
+    Nic se nepředpokládá: stabilitu dokládají jen pozorované odpovědi zdroje
+    a monotónní čas. Systémový čas se nikde nenastavuje.
+    """
+
+    def test_start_with_synchronized_clock_starts_from_zero(self):
+        worker = self.make(synced=True)
+        self.assertEqual(self.stable(worker), 0)  # po startu se 24 h nemaže
+        self.run_for(worker, 3600)  # hodina provozu s průběžným potvrzováním
+        self.assertEqual(self.stable(worker), 3600)
+
+    def test_start_without_synchronization_has_no_stability(self):
+        self.clock.set_utc(WRONG)
+        worker = self.make(synced=False)
+        self.assertIsNone(self.stable(worker))
+        self.assertFalse(worker._clock_state().synced)
+
+    def test_first_synchronization_starts_the_interval(self):
+        self.clock.set_utc(WRONG)
+        worker = self.make(synced=False)
+        self.submit(worker, synced=False)
+        self.assertIsNone(self.stable(worker))
+        self.clock.advance(10)
+        self.clock.set_utc(BASE + 10)
+        self.submit(worker, synced=True)  # první doložená synchronizace
+        self.assertEqual(self.stable(worker), 0)
+        self.run_for(worker, 60, step=10)
+        self.assertEqual(self.stable(worker), 60)
+
+    def test_loss_and_recovery_restart_the_interval(self):
+        worker = self.make(synced=True)
+        self.run_for(worker, 7200)
+        self.assertEqual(self.stable(worker), 7200)
+        self.submit(worker, synced=False)  # ztráta synchronizace
+        self.assertIsNone(self.stable(worker))
+        self.clock.advance(10)
+        self.submit(worker, synced=True)  # obnova: interval začíná znovu
+        self.assertEqual(self.stable(worker), 0)
+
+    def test_unknown_state_cancels_stability(self):
+        worker = self.make(synced=True)
+        self.run_for(worker, 86400)
+        self.assertEqual(self.stable(worker), 86400)
+        self.submit(worker, synced=None)  # neznámý stav nic nedokládá
+        self.assertIsNone(self.stable(worker))
+        self.assertFalse(worker._clock_state().synced)
+
+    def test_short_outage_restarts_the_interval(self):
+        worker = self.make(synced=True)
+        self.run_for(worker, 86400)
+        self.assertEqual(self.stable(worker), 86400)
+        self.clock.advance(10)
+        self.submit(worker, synced=None)  # krátký výpadek NTP
+        self.clock.advance(10)
+        self.submit(worker, synced=True)
+        self.assertEqual(self.stable(worker), 0)  # 24 h se počítá znovu
+
+    def test_restart_of_the_process_does_not_inherit_stability(self):
+        worker = self.make(synced=True)
+        self.run_for(worker, 86400 * 2)
+        self.submit(worker, synced=True)
+        self.assertTrue(worker.flush(WAIT))
+        worker.stop(timeout=WAIT)
+        second = self.make(synced=True, boot_id="jiny-boot-id")
+        self.assertEqual(self.stable(second), 0)  # jiný proces i boot: od nuly
+        self.assertEqual(second.status().maintenance.stable_s, 0)
+
+    def test_forward_jump_restarts_the_interval(self):
+        worker = self.make(synced=True)
+        self.run_for(worker, 86400)
+        self.submit(worker, synced=True)
+        self.clock.advance(10)
+        self.clock.set_utc(BASE + 86400 + 10 + 3600)  # skok UTC dopředu o hodinu
+        self.submit(worker, synced=True)
+        self.assertEqual(self.stable(worker), 0)
+
+    def test_backward_jump_restarts_the_interval(self):
+        worker = self.make(synced=True)
+        self.run_for(worker, 86400)
+        self.submit(worker, synced=True)
+        self.clock.advance(10)
+        self.clock.set_utc(BASE + 86400)  # skok UTC dozadu o 10 s
+        self.submit(worker, synced=True)
+        self.assertEqual(self.stable(worker), 0)
+
+    def test_jump_threshold_is_the_documented_two_seconds(self):
+        # Práh je stejný jako u události clock.jump (HISTORY.md 4.3): běžné
+        # doladění NTP je řádově milisekundy, 2 s už je skok.
+        for drift, restarts in ((history.CLOCK_JUMP_SECONDS, False), (history.CLOCK_JUMP_SECONDS + 0.5, True)):
+            with self.subTest(drift=drift):
+                self.setUp()
+                worker = self.make(synced=True)
+                self.run_for(worker, 3600)
+                self.submit(worker, synced=True)
+                self.clock.advance(10)
+                self.clock.set_utc(BASE + 3610 + drift)
+                self.submit(worker, synced=True)
+                self.assertEqual(self.stable(worker) == 0, restarts)
+
+    def test_retention_boundary_is_exactly_twenty_four_hours(self):
+        worker = self.make(synced=True)
+        self.run_for(worker, history.RETENTION_STABLE_CLOCK_SECONDS - 60)
+        state = worker._clock_state()
+        self.assertEqual(state.stable_s, history.RETENTION_STABLE_CLOCK_SECONDS - 60)
+        self.assertEqual(history._retention_guard(self.query_connection(), BASE, state), "clock_unstable")
+        self.run_for(worker, 60, step=60)
+        state = worker._clock_state()
+        self.assertEqual(state.stable_s, history.RETENTION_STABLE_CLOCK_SECONDS)
+        self.assertIsNone(history._retention_guard(self.query_connection(), BASE + 86400, state))
+
+    # --- průběžnost pozorování (M3.3b-2, review) ---------------------------------------
+
+    def test_single_confirmation_without_further_measurements_is_not_proof(self):
+        # Měřicí smyčka může být mrtvá: samotný uplynulý monotónní čas nic nedokládá.
+        worker = self.make(synced=True)
+        self.clock.advance(history.RETENTION_STABLE_CLOCK_SECONDS)
+        state = worker._clock_state()
+        self.assertFalse(state.synced, f"stabilita bez pozorování: {state}")
+        self.assertIsNone(worker.status().maintenance.stable_s)
+
+    def test_outage_of_six_hours_breaks_the_interval(self):
+        worker = self.make(synced=True)
+        self.submit(worker, synced=True)
+        self.clock.advance(6 * 3600)  # šest hodin bez měření
+        self.submit(worker, synced=True)
+        self.assertEqual(self.stable(worker), 0)
+
+    def test_outage_of_twenty_five_hours_breaks_the_interval(self):
+        worker = self.make(synced=True)
+        self.submit(worker, synced=True)
+        self.clock.advance(25 * 3600)
+        self.submit(worker, synced=True)
+        state = worker._clock_state()
+        self.assertEqual(state.stable_s, 0)  # dvě vzdálená pozorování nejsou 25 h stability
+
+    def test_regular_confirmations_prove_the_span(self):
+        worker = self.make(synced=True)
+        start = self.clock.monotonic()
+        step = 60
+        for index in range(1, history.RETENTION_STABLE_CLOCK_SECONDS // step + 1):
+            self.observe(worker, start + index * step)
+        self.clock.advance(history.RETENTION_STABLE_CLOCK_SECONDS)
+        state = worker._clock_state()
+        self.assertTrue(state.synced)
+        self.assertGreaterEqual(state.stable_s, history.RETENTION_STABLE_CLOCK_SECONDS)
+
+    def test_exact_boundary_with_regular_confirmations(self):
+        worker = self.make(synced=True)
+        start = self.clock.monotonic()
+        step = 60
+        for index in range(1, history.RETENTION_STABLE_CLOCK_SECONDS // step):
+            self.observe(worker, start + index * step)
+        self.clock.advance(history.RETENTION_STABLE_CLOCK_SECONDS - step)
+        self.assertEqual(worker._clock_state().stable_s, history.RETENTION_STABLE_CLOCK_SECONDS - step)
+        self.observe(worker, start + history.RETENTION_STABLE_CLOCK_SECONDS)
+        self.clock.advance(step)
+        self.assertEqual(worker._clock_state().stable_s, history.RETENTION_STABLE_CLOCK_SECONDS)
+
+    def test_unobserved_time_is_never_counted(self):
+        # Čas, kdy se nikdo neptal, se do doloženého rozsahu nepřičítá — ani když
+        # je poslední potvrzení ještě čerstvé.
+        worker = self.make(synced=True)
+        self.run_for(worker, 3600)
+        self.assertEqual(self.stable(worker), 3600)
+        self.clock.advance(120)  # čerstvé (pod sync_fresh_seconds), ale bez pozorování
+        self.assertEqual(self.stable(worker), 3600)
+
+    def test_boundary_is_not_reached_by_unobserved_time(self):
+        worker = self.make(synced=True)
+        self.run_for(worker, history.RETENTION_STABLE_CLOCK_SECONDS - 120)
+        self.clock.advance(120)
+        state = worker._clock_state()
+        self.assertEqual(state.stable_s, history.RETENTION_STABLE_CLOCK_SECONDS - 120)
+        self.assertEqual(history._retention_guard(self.query_connection(), BASE + 86400, state), "clock_unstable")
+
+    def test_stale_evidence_blocks_retention_even_after_a_long_series(self):
+        worker = self.make(synced=True)
+        start = self.clock.monotonic()
+        for index in range(1, history.RETENTION_STABLE_CLOCK_SECONDS // 60 + 1):
+            self.observe(worker, start + index * 60)
+        self.clock.advance(history.RETENTION_STABLE_CLOCK_SECONDS)
+        self.assertTrue(worker._clock_state().synced)
+        self.clock.advance(2 * 3600)  # měření přestala přicházet
+        self.assertFalse(worker._clock_state().synced)
+
+    def test_resume_from_suspend_breaks_the_interval(self):
+        # Po uspání notebooku monotónní čas stojí, UTC jde dál: to je skok.
+        worker = self.make(synced=True)
+        self.submit(worker, synced=True)
+        self.clock.advance(1)
+        self.clock.set_utc(BASE + 7200)  # dvě hodiny uspání
+        self.submit(worker, synced=True)
+        self.assertEqual(self.stable(worker), 0)
+
+    def test_measurement_without_results_extends_the_interval(self):
+        # Měření bez výsledků je stále pozorování zdroje: jen nejde porovnat čas.
+        worker = self.make(synced=True)
+        self.clock.advance(60)
+        worker.submit([], self.clock.monotonic(), True)
+        self.assertEqual(self.stable(worker), 60)
 
 
 class OwnershipTest(WorkerTest):

@@ -8,20 +8,24 @@ takže ho jiné vlákno použít nemůže. Změny stavu (R4) se počítají už 
 takže přetečení fronty vzorků nikdy neztratí přechod alarmu.
 
 Napojení na měřicí smyčku, SIGTERM a skutečný zdroj synchronizace hodin má
-`history_link.py` (M3.3b-1); agregaci ani retenci zapisovač nevolá (M3.3b-2).
+`history_link.py` (M3.3b-1). Od M3.3b-2 vlákno samo spouští i údržbu: agregaci
+uzavřených oken a hodinovou retenci (HISTORY.md 6, 7, 11.6). Zápis čekajících
+měření a změn má vždy přednost; druhé spojení ani druhé vlákno nevzniká.
 """
 
 import math
+import os
 import sqlite3
 import threading
 import time
 from collections import Counter, deque
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from types import MappingProxyType
 
 from . import history
+from .config import VALIDITY_INTERVALS
 from .core import CheckResult, is_finite_number
 
 STARTING = "STARTING"  # vlákno ještě neotevřelo databázi
@@ -51,6 +55,21 @@ MAX_RESULT_BYTES = 512
 # Režie jednoho údaje details v JSON ("klíč":"hodnota",) při měření velikosti.
 DETAILS_OVERHEAD = 6
 TRUNCATION_MARK = "…"
+# Údržba (M3.3b-2): pokus o agregaci nejvýš takhle často, hned po potvrzené dávce
+# a při dohánění (more) hned znovu. Retence nejvýš jednou za hodinu monotónního času.
+AGGREGATION_INTERVAL_SECONDS = 60
+RETENTION_INTERVAL_SECONDS = 3600
+# Nejdelší mezera mezi pozorováními synchronizace, která ještě neruší doloženou
+# stabilitu hodin: platnost výsledku (3 × interval měření, stejné pravidlo jako
+# u zastaralých dat), nejméně ale jedno agregační okno (300 s), aby jediné
+# zdržené měření nezahodilo celodenní doklad. Při výchozím intervalu 10 s je to
+# 300 s, tedy nejvýš 0,35 % z 24 h bez pozorování na jednu mezeru.
+MIN_SYNC_FRESH_SECONDS = history.WINDOW_SECONDS
+# Ztráty, po kterých nelze vyloučit, že se nezapsal doklad skoku hodin
+# (clock.jump je událost). Dokud nejsou zapsané v databázi, nelze o nich nic
+# doložit a retence se nepovažuje za bezpečnou; po zapsání je mezera v historii
+# viditelná a skok v tomto běhu hlídá i vlastní detekce posunu času.
+CLOCK_EVIDENCE_LOSSES = frozenset({"events_dropped", "event_too_large"})
 STOP_TIMEOUT_SECONDS = 10  # HISTORY.md 5.5
 MAX_WAIT_SECONDS = 10  # vlákno se probudí nejméně jednou za 10 s (HISTORY.md 5.2)
 FINAL_ATTEMPTS = 2  # pokusy o poslední zápis při zastavení (bez čekání na odstup)
@@ -199,6 +218,53 @@ class _Loss:
             self.mono_to = monotonic if self.mono_to is None else max(self.mono_to, monotonic)
 
 
+class _Maintenance:
+    """Počitadla údržby v paměti; mění je jen vlákno zapisovače pod zámkem."""
+
+    __slots__ = ("aggregation_monotonic", "aggregation_utc", "done_5m", "done_1h", "windows_5m",
+                 "windows_1h", "blocked", "conflict", "more", "retention_monotonic",
+                 "retention_blocked", "retention_stopped", "deleted", "retention_more",
+                 "failures", "last_error", "wal_bytes")
+
+    def __init__(self):
+        self.aggregation_monotonic = self.aggregation_utc = None
+        self.done_5m = self.done_1h = None
+        self.windows_5m = self.windows_1h = 0
+        self.blocked = self.conflict = None
+        self.more = False
+        self.retention_monotonic = self.retention_blocked = None
+        self.retention_stopped = {}
+        self.deleted = Counter()
+        self.retention_more = False
+        self.failures = 0
+        self.last_error = None
+        self.wal_bytes = None
+
+
+@dataclass(frozen=True)
+class MaintenanceStatus:
+    """Snímek automatické údržby pro history.storage; čte se bez SQLite."""
+
+    aggregation_monotonic: float | None = None  # poslední dokončený pokus o agregaci
+    aggregation_utc: int | None = None  # jen při synchronizovaném čase
+    done_5m: int | None = None  # potvrzená hranice agregace z posledního pokusu
+    done_1h: int | None = None
+    windows_5m: int = 0  # vložená okna od startu
+    windows_1h: int = 0
+    blocked: str | None = None  # time_unsynced, queue_unknown, conflict
+    conflict: str | None = None  # doklad konfliktu; agregace je do konce běhu zastavená
+    more: bool = False  # zbývají uzavřená okna na další pokus
+    retention_monotonic: float | None = None  # poslední dokončený běh retence
+    retention_blocked: str | None = None  # time_unsynced, clock_unstable, clock_jump_recent, …
+    retention_stopped: Mapping = field(default_factory=dict)  # tabulka -> důvod zastavení
+    deleted: Mapping = field(default_factory=dict)  # tabulka -> smazané řádky od startu
+    retention_more: bool = False
+    stable_s: int | None = None  # doložená doba souvislé synchronizace hodin
+    failures: int = 0  # po sobě jdoucí selhání údržby
+    last_error: str | None = None
+    wal_bytes: int | None = None  # velikost -wal při posledním zápisu nebo pokusu o údržbu
+
+
 @dataclass(frozen=True)
 class WorkerStatus:
     """Snímek stavu pro budoucí history.storage; čte se bez SQLite."""
@@ -224,6 +290,12 @@ class WorkerStatus:
     last_error: str | None
     consecutive_failures: int
     retry_in: float | None  # sekundy do dalšího pokusu (monotónní), nebo None
+    # Monotónní čas nejstarší nepotvrzené zapisovatelné práce: nejstarší měření ve
+    # frontě, nebo začátek prvního pokusu o zápis dávky (opakování ho nevynuluje).
+    # None = nic nepotvrzeného nečeká. Data čekající na synchronizaci hodin se sem
+    # nepočítají (hlásí se zvlášť jako held_unsynced).
+    unconfirmed_since: float | None = None
+    maintenance: MaintenanceStatus = field(default_factory=MaintenanceStatus)
 
 
 @dataclass(frozen=True)
@@ -255,10 +327,13 @@ class HistoryWorker:
         if isinstance(interval_s, bool) or not isinstance(interval_s, int) or not 1 <= interval_s <= 3600:
             raise ValueError(f"interval_s musí být celé číslo 1–3600, ne {interval_s!r}")
         self._app_version, self._interval_s, self._boot_id = app_version, interval_s, boot_id
+        self._path = path  # jen pro velikost -wal (stat souboru, nikdy SQLite)
         self._monotonic = monotonic
         self._utc_now = utc_now or (lambda: datetime.now(timezone.utc))
         self._opener = opener or (lambda: history.open_writer(path, role, host_id))
         self._batch_seconds = batch_seconds
+        # Čerstvost pozorování se odvozuje od skutečné frekvence kolektoru.
+        self.sync_fresh_seconds = max(VALIDITY_INTERVALS * interval_s, MIN_SYNC_FRESH_SECONDS)
         per_hour = math.ceil(QUEUE_SECONDS / interval_s)
         self.measurement_capacity = per_hour  # hodina měření (HISTORY.md 5.2)
         self.change_capacity = per_hour * flapping_checks
@@ -283,10 +358,17 @@ class HistoryWorker:
         self._last_commit = (None, None)
         self._in_flight = 0
         self._attempt = None  # pokus o zápis dávky: None, "writing", "rolled_back" (jistě nezapsáno), "in_doubt"
+        self._attempt_since = None  # monotónní čas prvního pokusu o zápis této dávky
         self._error = (None, None)
         self._failures = 0
         self._retry_at = None
         self._stop_requested = False
+        self._synced_since = None  # monotónní začátek souvislé doložené synchronizace
+        self._synced_seen = None  # monotónní čas posledního potvrzení synchronizace
+        self._last_seen = None  # (monotónní čas, UTC) posledního měření: detekce skoku
+        self._maint = _Maintenance()
+        self._aggregate_at = 0.0  # monotónní čas dalšího pokusu o agregaci
+        self._retain_at = 0.0
         self._flush_target = 0
         self._clean_stop = False
         self._thread = None
@@ -307,8 +389,13 @@ class HistoryWorker:
             if time_synced is True:
                 moment = self._utc_now().timestamp()
                 if moment >= history.MIN_TRUSTED_UTC:
-                    self._offset = moment - self._monotonic()
+                    now = self._monotonic()
+                    self._offset = moment - now
                     self._synced_last = True
+                    # Stabilita se počítá od prvního doloženého pozorování v tomto
+                    # procesu: po restartu je nulová, takže retence 24 h nemaže.
+                    self._synced_since = self._synced_seen = now
+                    self._last_seen = (now, moment)
             self._start_synced = self._offset is not None
         self._thread = threading.Thread(target=self._run, name="nexusstat-history", daemon=True)
         self._thread.start()
@@ -461,6 +548,7 @@ class HistoryWorker:
     def _time_quality(self, results, monotonic, synced):
         """Kvalita času měření; první synchronizace dá posun pro odvození čekajících (HISTORY.md 4.3)."""
         observed = results[0].observed_utc.timestamp() if results else None
+        self._track_stability(monotonic, observed, synced)
         if synced and self._offset is None and observed is not None and observed >= history.MIN_TRUSTED_UTC:
             self._offset = observed - monotonic
             if self._unsynced_seen:
@@ -483,6 +571,95 @@ class HistoryWorker:
                 moment, quality, "clock.sync_restored", "INFO", "synchronizace hodin obnovena")), self.event_capacity)
         self._synced_last = synced
         return "synced"
+
+    def _track_stability(self, monotonic, observed, synced):
+        """Posune nebo zruší evidenci souvislé synchronizace hodin (pro retenci).
+
+        Stabilita se počítá jen z doložených odpovědí zdroje (`True`): ztráta
+        i neznámý stav ji ruší. Zruší ji také skok času, tedy změna posunu
+        UTC − monotonic mezi měřeními nad `history.CLOCK_JUMP_SECONDS` (stejný
+        práh jako u události `clock.jump`, HISTORY.md 4.3: běžné doladění NTP je
+        řádově milisekundy za sekundu), a mezera mezi pozorováními delší než
+        `sync_fresh_seconds`: za dobu, kdy se nikdo neptal, není co dokládat.
+        Falešně zjištěný skok nebo mezera retenci jen odloží o dalších 24 h,
+        nikdy nerozšíří, co se smí smazat.
+        """
+        jumped = False
+        if observed is not None and self._last_seen is not None:
+            seen_monotonic, seen_utc = self._last_seen
+            drift = (observed - seen_utc) - (monotonic - seen_monotonic)
+            jumped = abs(drift) > history.CLOCK_JUMP_SECONDS
+        if observed is not None:
+            self._last_seen = (monotonic, observed)
+        if synced is not True:
+            self._synced_since = self._synced_seen = None  # nedoložený stav nic nedokládá
+            return
+        stale = self._synced_seen is None or monotonic - self._synced_seen > self.sync_fresh_seconds
+        if jumped or stale or self._synced_since is None:
+            self._synced_since = monotonic  # začátek nového souvislého úseku
+        self._synced_seen = monotonic
+
+    def _clock_state(self):
+        """ClockState pro retenci: doložená doba **průběžně** potvrzované synchronizace.
+
+        Dokládá se jen rozsah mezi prvním a posledním potvrzením jedné nepřerušené
+        řady pozorování (nikdy čas, kdy se nikdo neptal), a to jen tehdy, když je
+        poslední potvrzení čerstvé (`sync_fresh_seconds`). Samotný uplynulý
+        monotónní čas tedy nic nedokládá: zastavená nebo mrtvá měřicí smyčka
+        retenci zablokuje. Po startu procesu, po ztrátě i neznámém stavu
+        synchronizace, po skoku času a po dlouhé mezeře v měření začíná řada
+        znovu od nuly, takže prvních 24 h běhu retence nemaže nic (HISTORY.md 7).
+        Nelze-li vyloučit ztracený doklad skoku hodin (ztráta událostí), je stav
+        rovněž neznámý.
+        """
+        if self._offset is None or self._synced_last is not True:
+            return history.ClockState.unknown()
+        if self._synced_since is None or self._synced_seen is None:
+            return history.ClockState.unknown()
+        if self._monotonic() - self._synced_seen > self.sync_fresh_seconds:
+            return history.ClockState.unknown()  # poslední potvrzení už není čerstvé
+        if any(self._unrecorded_loss(kind) for kind in CLOCK_EVIDENCE_LOSSES):
+            return history.ClockState.unknown()  # nezapsaná ztráta mohla být doklad clock.jump
+        return history.ClockState.synced_for(max(0, int(self._synced_seen - self._synced_since)))
+
+    def _unrecorded_loss(self, kind):
+        """Počet ztrát daného druhu, které ještě nejsou zapsané v databázi."""
+        loss = self._losses.get(kind)
+        return (loss.count if loss is not None else 0) + self._in_flight_losses.get(kind, 0)
+
+    def _queue_state(self):
+        """Stav fronty pro uzavírání oken (HISTORY.md 6.1) a kvalita času „teď“.
+
+        `empty()` jen tehdy, když to lze doložit: synchronizovaný čas, žádné
+        čekající měření a žádná vybraná ani zapečetěná dávka. Čekající
+        nesynchronizované vzorky znamenají `unknown()`, protože čas UTC nemají;
+        stejně tak měření bez výsledků, u kterého čas určit nelze. Z toho, že
+        zapisovač momentálně nezapisuje, se úplnost okna nedovozuje.
+        """
+        quality = "synced" if self._offset is not None and self._synced_last is True else "unsynced"
+        if self._offset is None or self._batch is not None or self._work is not None or self._in_flight:
+            return history.QueueState.unknown(), quality
+        if any(item.quality == "unsynced" for item in self._measurements):
+            return history.QueueState.unknown(), quality
+        if not self._measurements:
+            return history.QueueState.empty(), quality
+        moments = [math.floor(item.results[0].observed_utc.timestamp())
+                   for item in self._measurements if item.results]
+        if not moments or min(moments) < history.MIN_TRUSTED_UTC:
+            return history.QueueState.unknown(), quality
+        return history.QueueState.waiting_since(min(moments)), quality
+
+    def _maintenance_snapshot(self):
+        """Neměnný snímek údržby; doplní doloženou stabilitu hodin."""
+        maint = self._maint
+        state = self._clock_state()
+        return MaintenanceStatus(
+            maint.aggregation_monotonic, maint.aggregation_utc, maint.done_5m, maint.done_1h,
+            maint.windows_5m, maint.windows_1h, maint.blocked, maint.conflict, maint.more,
+            maint.retention_monotonic, maint.retention_blocked,
+            MappingProxyType(dict(maint.retention_stopped)), MappingProxyType(dict(maint.deleted)),
+            maint.retention_more, state.stable_s if state.synced else None,
+            maint.failures, maint.last_error, maint.wal_bytes)
 
     def _clock_synced_event(self, moment):
         held_m = [item.monotonic for item in self._measurements if item.quality == "unsynced"]
@@ -548,13 +725,18 @@ class HistoryWorker:
         unrecorded.update(self._in_flight_losses)
         mono, utc = self._last_commit
         kind, text = self._error
+        unconfirmed = self._attempt_since
+        if self._offset is not None and self._measurements:
+            oldest = self._measurements[0].monotonic
+            unconfirmed = oldest if unconfirmed is None else min(unconfirmed, oldest)
         return WorkerStatus(
             self._state, self._run_id, self._commits, mono, utc, len(self._measurements),
             sum(len(item.results) for item in self._measurements), len(self._changes), len(self._events),
             self._in_flight, self._confirmed["m"], self._confirmed["c"], self._confirmed["e"], held,
             "unsynced" if self._offset is None else ("sync_lost" if self._sync_lost else "synced"),
             MappingProxyType(dict(self._loss_totals)), MappingProxyType(dict(unrecorded)), kind, text,
-            self._failures, None if self._retry_at is None else max(0.0, self._retry_at - now))
+            self._failures, None if self._retry_at is None else max(0.0, self._retry_at - now),
+            unconfirmed_since=unconfirmed, maintenance=self._maintenance_snapshot())
 
     def _take(self, final):
         """Vybere obsah dávky z front (pod zámkem). Bez synchronizace čekají měření i změny."""
@@ -664,6 +846,10 @@ class HistoryWorker:
                 return
             if action == "open":
                 self._open()
+            elif action == "aggregate":
+                self._aggregate()
+            elif action == "retain":
+                self._retain()
             else:
                 self._write()
 
@@ -682,8 +868,12 @@ class HistoryWorker:
                 return "open"
             due, wait = self._write_due(now)
             if due:
-                return "write"
-            self._cond.wait(MAX_WAIT_SECONDS if wait is None else min(wait, MAX_WAIT_SECONDS))
+                return "write"  # čekající měření a změny mají vždy přednost před údržbou
+            action, maintenance_wait = self._maintenance_due(now)
+            if action is not None:
+                return action
+            waits = [value for value in (wait, maintenance_wait) if value is not None]
+            self._cond.wait(min([MAX_WAIT_SECONDS, *waits]))
 
     def _write_due(self, now):
         if self._batch is not None or self._events or self._ready_losses(final=False):
@@ -698,6 +888,135 @@ class HistoryWorker:
             age = now - self._measurements[0].monotonic
             return (True, None) if age >= self._batch_seconds else (False, self._batch_seconds - age)
         return False, None
+
+    def _maintenance_due(self, now):
+        """Co má údržba udělat teď ("aggregate", "retain") a za jak dlouho zkusit znovu.
+
+        Údržba běží jen s otevřenou databází, bez nepotvrzené nebo nejisté dávky
+        a nikdy při ukončování: zapsat čekající data je důležitější. Agregace se
+        po konfliktu už nespouští (zapisovač ji do konce běhu odmítá), retence
+        dál smí, protože hranici drží potvrzené `done_until` a nemůže se posunout.
+        """
+        if self._stop_requested or self._database is None or self._recorder is None:
+            return None, None
+        if self._batch is not None or self._work is not None or self._in_flight:
+            return None, None
+        if self._recorder.commit_in_doubt:
+            return None, None  # výsledek předchozího commitu není znám
+        if self._maint.conflict is None and now >= self._aggregate_at:
+            return "aggregate", None
+        if now >= self._retain_at:
+            return "retain", None
+        pending = [at - now for at in (self._aggregate_at, self._retain_at) if at > now]
+        return None, min(pending) if pending else None
+
+    def _wal_bytes(self):
+        """Velikost souboru `-wal` této databáze (jen stat, nikdy SQLite).
+
+        Cesta se rozvine (`realpath`), protože SQLite vytváří `-wal` vedle
+        skutečného souboru, ne vedle symlinku. None znamená „nezjištěno“:
+        chybějící soubor (zatím žádný WAL) i chyba čtení, nikdy nulová velikost.
+        """
+        try:
+            return os.path.getsize(f"{os.path.realpath(self._path)}-wal")
+        except OSError:
+            return None
+
+    def _aggregate(self):
+        """Jeden pokus o agregaci uzavřených oken; vrací True při dokončení pokusu."""
+        wal = self._wal_bytes()
+        with self._cond:
+            queue, quality = self._queue_state()
+            self._maint.wal_bytes = wal
+            self._aggregate_at = self._monotonic() + AGGREGATION_INTERVAL_SECONDS
+        try:
+            result = self._recorder.aggregate(self._utc_now(), quality, queue)
+        except history.HistoryError as error:
+            if error.reason == "conflict":
+                # Rozpor s hotovou agregací: nic se nepřepsalo a do konce běhu se
+                # neagreguje. Není to chyba zápisu měření, takže se jen hlásí.
+                with self._cond:
+                    self._maint.conflict, self._maint.blocked = str(error), "conflict"
+                    self._cond.notify_all()
+                return False
+            self._maintenance_failed(error)
+            return False
+        with self._cond:
+            maint = self._maint
+            previous = maint.done_5m, maint.done_1h
+            maint.aggregation_monotonic = self._monotonic()
+            maint.aggregation_utc = math.floor(self._utc_now().timestamp()) if quality == "synced" else None
+            maint.done_5m, maint.done_1h = result.done_5m, result.done_1h
+            maint.windows_5m += result.windows_5m
+            maint.windows_1h += result.windows_1h
+            maint.blocked, maint.more = result.blocked, result.more
+            maint.failures, maint.last_error = 0, None
+            # Dohánění pokračuje hned, ale až po dalším kole smyčky (zápis a stop
+            # mají přednost). Pokrokem je posun potvrzené hranice, ne počet
+            # vložených oken: hodina bez měření je také hotová práce. Bez posunu
+            # se čeká na interval, aby se dohánění nemohlo zacyklit.
+            advanced = previous[0] is None or result.done_5m > previous[0] or result.done_1h > previous[1]
+            if result.more and advanced:
+                self._aggregate_at = 0.0
+            self._cond.notify_all()
+        return True
+
+    def _retain(self):
+        """Jeden běh retence (nejvýš 24 mazacích transakcí po hodině historie)."""
+        wal = self._wal_bytes()
+        with self._cond:
+            clock = self._clock_state()
+            self._maint.wal_bytes = wal
+            self._retain_at = self._monotonic() + RETENTION_INTERVAL_SECONDS
+        try:
+            result = self._recorder.retain(self._utc_now(), clock)
+        except history.HistoryError as error:
+            self._maintenance_failed(error)
+            return False
+        with self._cond:
+            maint = self._maint
+            maint.retention_monotonic = self._monotonic()
+            maint.retention_blocked = result.blocked
+            maint.retention_stopped = dict(result.stopped)
+            for table, count in result.deleted.items():
+                maint.deleted[table] += count
+            maint.retention_more = result.more
+            maint.failures, maint.last_error = 0, None
+            if result.more and result.transactions:
+                self._retain_at = 0.0  # limit transakcí došel, zbytek po dalším kole
+            self._cond.notify_all()
+        return True
+
+    def _handle_error(self, error):
+        """Reakce na chybu zápisu dávky: druh, případné zavření spojení a odstup."""
+        kind = classify(error)
+        if kind == "io":
+            self._close_database()  # nové spojení až po zavření starého (jediný zapisovač)
+        with self._cond:
+            self._set_failure(kind, error)
+
+    def _maintenance_failed(self, error):
+        """Selhání údržby: zápis měření nezastaví, jen se ohlásí a odloží.
+
+        Agregace ani retence nejsou podmínkou sledování, takže přechodná chyba
+        (zámek, plný disk, I/O) nesmí přepnout zapisovač do DEGRADED a zdržet
+        zápis čekajících měření; odloží se jen další pokus o údržbu. Nevratná
+        chyba (poškozená nebo cizí databáze, porušená integrita) je naopak chyba
+        databáze jako celku a zastaví zapisovače stejně jako při zápisu.
+        """
+        kind = classify(error)
+        with self._cond:
+            self._maint.failures += 1
+            self._maint.last_error = f"{kind}: {error}"
+            if kind in FATAL_KINDS:
+                self._set_failure(kind, error)
+                return
+            base, cap = BACKOFF[kind]
+            delay = min(cap, base * 2 ** min(self._maint.failures - 1, 10))
+            now = self._monotonic()
+            self._aggregate_at = max(self._aggregate_at, now + delay)
+            self._retain_at = max(self._retain_at, now + delay)
+            self._cond.notify_all()
 
     def _open(self):
         """Otevře databázi (a při prvním otevření zahájí běh); vrací True při úspěchu."""
@@ -728,6 +1047,12 @@ class HistoryWorker:
             self._retry_at = None
             if self._batch is None:
                 self._state, self._failures = RUNNING, 0
+            # Otevření samo nic neagreguje ani nemaže: první agregace přijde po
+            # první potvrzené dávce (HISTORY.md 5.1), jinak po intervalu, a
+            # retence nejdřív za hodinu. Start tak nepřidá žádnou transakci.
+            now = self._monotonic()
+            self._aggregate_at = max(self._aggregate_at, now + AGGREGATION_INTERVAL_SECONDS)
+            self._retain_at = max(self._retain_at, now + RETENTION_INTERVAL_SECONDS)
             self._cond.notify_all()
         return True
 
@@ -741,25 +1066,29 @@ class HistoryWorker:
             self._build(work)
         with self._cond:
             self._attempt = "writing"
+            if self._attempt_since is None:
+                # Věk pokusu se počítá od prvního zápisu dávky: opakování po chybě
+                # ani znovuotevření spojení skutečné zaseknutí neskryje.
+                self._attempt_since = self._monotonic()
         try:
             self._recorder.write(self._batch)
         except history.HistoryError as error:
             with self._cond:
                 self._attempt = "in_doubt" if self._recorder.commit_in_doubt else "rolled_back"
-            kind = classify(error)
-            if kind == "io":
-                self._close_database()  # nové spojení až po zavření starého (jediný zapisovač)
-            with self._cond:
-                self._set_failure(kind, error)
+            self._handle_error(error)
             return False
+        wal = self._wal_bytes()
         with self._cond:
             work, self._batch, self._work, self._attempt = self._work, None, None, None
+            self._attempt_since = None
             self._confirmed.update(m=len(work.measurements), c=len(work.changes), e=len(work.events))
             self._in_flight, self._in_flight_losses = 0, Counter()
             self._commits += 1
             moment = self._utc_now().timestamp()
             self._last_commit = (self._monotonic(), math.floor(moment) if self._offset is not None else None)
             self._state, self._failures, self._retry_at = RUNNING, 0, None
+            self._maint.wal_bytes = wal
+            self._aggregate_at = 0.0  # po potvrzené dávce zkusit uzavřít okna (HISTORY.md 5.1)
             self._cond.notify_all()
         return True
 

@@ -13,6 +13,7 @@ Role je vždy `development` (konfigurace jinou nenastaví) a cesta na síťovém
 Agregaci ani retenci tento krok nespouští (M3.3b-2).
 """
 
+import math
 import os
 import re
 from pathlib import Path, PurePosixPath
@@ -46,6 +47,13 @@ NETWORK_FILESYSTEMS = frozenset({
 # jen se nepotvrzuje žádná dávka. Pozná se podle toho, že data čekají a poslední
 # potvrzení je starší než několik dávkovacích intervalů (dávka má 60 s).
 STALE_COMMIT_SECONDS = 3 * history_worker.BATCH_SECONDS
+
+# Zpoždění agregace, které už není běžný provoz: normálně je hranice hotových oken
+# jen minuty za „teď“ (okno 5 min + rezerva 120 s + dávka 60 s, HISTORY.md 6.1).
+# Hodina znamená, že agregace nepostupuje, i když se zápis nehlásí jako chybný.
+AGGREGATION_LAG_SECONDS = 3600
+# Velikost WAL, při které je něco v nepořádku (dlouhá čtecí transakce, HISTORY.md 8, 10.6).
+WAL_WARNING_BYTES = 64 * 1024 * 1024
 
 # Druhy ztrát, při kterých data skutečně zmizela. Zkrácený text mezi ně nepatří:
 # stav, hodnota ani identita kontroly se nezahodily.
@@ -127,8 +135,28 @@ def _counts(losses):
     return ", ".join(f"{kind} {count}" for kind, count in sorted(losses.items()) if count)
 
 
+def _maintenance_text(maint):
+    """Krátký souhrn automatické údržby do popisu kontroly."""
+    parts = []
+    if maint.aggregation_monotonic is None:
+        parts.append("agregace zatím neproběhla")
+    elif maint.conflict is not None:
+        parts.append("agregace zastavena rozporem")
+    elif maint.blocked:
+        parts.append(f"agregace čeká ({maint.blocked})")
+    else:
+        parts.append(f"agregace {maint.windows_5m}+{maint.windows_1h} oken")
+    if maint.retention_monotonic is None:
+        parts.append("retence zatím neproběhla")
+    elif maint.retention_blocked:
+        parts.append(f"retence blokována ({maint.retention_blocked})")
+    else:
+        parts.append(f"retence smazala {sum(maint.deleted.values())} řádků")
+    return ", ".join(parts)
+
+
 def storage_state(status, *, queue_full=False, stalled=False, time_synced=None, submit_failures=0,
-                  source=None):
+                  source=None, now_utc=None):
     """Stav a popis kontroly `history.storage`; `status` None = historie vypnutá.
 
     Pořadí rozhoduje: doložená ztráta a zastavený zapisovač před přechodnou
@@ -150,6 +178,10 @@ def storage_state(status, *, queue_full=False, stalled=False, time_synced=None, 
         return State.ERROR, f"ztráta dat ({_counts(losses)}); {pending}"
     if queue_full:
         return State.ERROR, f"fronta plná, nejstarší data se zahazují; {pending}"
+    if status.maintenance.conflict is not None:
+        # Hotová agregace se nikdy nepřepíše: rozpor je chyba k zásahu správce
+        # a agregace je do konce běhu zastavená (HISTORY.md 6.2).
+        return State.ERROR, f"agregace zastavena rozporem: {status.maintenance.conflict}"
     if status.state == STOPPED:
         return State.ERROR, f"vlákno zapisovače neběží; {pending}"
     if status.state == DEGRADED:
@@ -174,10 +206,36 @@ def storage_state(status, *, queue_full=False, stalled=False, time_synced=None, 
     if truncated:
         return State.WARNING, (f"zkrácený text {truncated} výsledků nad {MAX_RESULT_BYTES} B; "
                                f"zapsáno {status.commits} dávek")
+    maint = status.maintenance
+    maintenance = _maintenance_text(maint)
+    if maint.failures:
+        return State.WARNING, f"údržba selhává ({maint.failures}×: {maint.last_error}); {maintenance}"
+    if maint.retention_stopped:
+        return State.WARNING, (f"retence zastavena: {_counts(maint.retention_stopped)}; {maintenance}")
+    if maint.wal_bytes is not None and maint.wal_bytes > WAL_WARNING_BYTES:
+        return State.WARNING, (f"WAL má {maint.wal_bytes // 1_048_576} MiB (nad {WAL_WARNING_BYTES // 1_048_576} MiB); "
+                               "pravděpodobně dlouhá čtecí transakce")
+    lag = _aggregation_lag(status, now_utc)
+    if lag is not None and lag > AGGREGATION_LAG_SECONDS:
+        return State.WARNING, f"agregace je {lag // 60} min za aktuálním časem; {maintenance}"
+    # Blokovaná retence není závada: prvních 24 h běhu se ještě nemaže vždy
+    # (doložená stabilita hodin), stejně jako agregace čekající na frontu.
     if status.commits == 0:
-        return State.INFO, f"zapisovač běží, zatím bez potvrzené dávky; {pending}"
+        return State.INFO, f"zapisovač běží, zatím bez potvrzené dávky; {pending}; údržba: {maintenance}"
     return State.INFO, (f"zapsáno {status.commits} dávek, potvrzeno {status.confirmed_measurements} měření; "
-                        f"{pending}")
+                        f"{pending}; údržba: {maintenance}")
+
+
+def _aggregation_lag(status, now_utc):
+    """Zpoždění hranice hotových 5min oken za aktuálním časem, nebo None.
+
+    Počítá se jen s doloženě synchronizovaným časem a známou hranicí: bez nich
+    by rozdíl nic neznamenal.
+    """
+    done = status.maintenance.done_5m
+    if now_utc is None or done is None or status.time_base != "synced":
+        return None
+    return max(0, now_utc - done)
 
 
 def storage_result(status, observed_utc, expires_monotonic, **state_args):
@@ -309,18 +367,21 @@ class HistoryLink:
                                observed_utc, expires, simulated=False)
         return storage_result(status, observed_utc, expires, queue_full=queue_full, stalled=stalled,
                               time_synced=self._synced, submit_failures=self.submit_failures,
-                              source=self.sync_source)
+                              source=self.sync_source, now_utc=math.floor(observed_utc.timestamp()))
 
     def _stalled(self, status, now):
-        """True, když data čekají a poslední dávka se dlouho nepotvrdila.
+        """True, když se nejstarší nepotvrzená zapisovatelná práce dlouho nepotvrdila.
 
+        Rozhoduje věk konkrétní čekající práce (nejstarší měření ve frontě nebo
+        probíhající pokus o zápis dávky), ne doba od startu vlákna ani od
+        posledního potvrzení: první měření ani běžné čekání na minutovou dávku
+        proto závada nejsou a zaseknutý první COMMIT se naopak pozná, i když jsou
+        fronty prázdné. Data čekající na synchronizaci hodin se hlásí zvlášť.
         Zaseknuté I/O se jinak nepozná: vlákno zůstane ve stavu RUNNING a žádnou
-        chybu nenahlásí, protože ani nedojde k jejímu vzniku.
+        chybu nenahlásí, protože k jejímu vzniku ani nedojde.
         """
-        if not status.pending_measurements:
-            return False
-        last = status.last_commit_monotonic
-        return last is None or now - last >= STALE_COMMIT_SECONDS
+        since = status.unconfirmed_since
+        return since is not None and now - since >= STALE_COMMIT_SECONDS
 
     def _queues_full(self, status):
         """True, když některá fronta dosáhla kapacity: od té chvíle se zahazuje nejstarší."""
