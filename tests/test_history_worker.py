@@ -26,7 +26,17 @@ from pathlib import Path
 from nexusstat import history
 from nexusstat.core import CheckResult, Measurement, State
 from nexusstat import history_worker
-from nexusstat.history_worker import DEGRADED, FAILED, RUNNING, STOPPED, HistoryWorker, classify
+from nexusstat.history_worker import (
+    DEGRADED,
+    FAILED,
+    MAX_RESULT_BYTES,
+    RUNNING,
+    STOPPED,
+    HistoryWorker,
+    classify,
+    result_bytes,
+    trim_result,
+)
 from nexusstat.network_monitor import INTERFACE, LINK, LINK_ID
 from nexusstat.system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, PERCENT
 
@@ -534,6 +544,127 @@ class MemoryTest(WorkerTest):
         self.assertEqual(events[0][2:], ("ERROR", {"reason": "event_too_large", "count": 1, "from": BASE + 5,
                                                    "to": BASE + 5}))
         self.assertEqual(self.query("SELECT count(*) FROM event WHERE kind = 'test.big'")[0][0], 1)
+
+
+class ResultSizeTest(WorkerTest):
+    """Velikost jednoho výsledku: text se zkrátí, identita a hodnota zůstanou."""
+
+    def result(self, summary="x", details=None, check_id=CPU_TEMP_ID, state=State.INFO, value=50.0):
+        return CheckResult(check_id, state, summary, self.clock.utc(), self.clock.monotonic() + 30,
+                           simulated=False, details=details or {},
+                           measurement=None if value is None else Measurement(value, CELSIUS))
+
+    def test_size_counts_id_summary_and_details(self):
+        plain = self.result(summary="CPU 50 °C")  # ° je v UTF-8 dvoubajtový
+        self.assertEqual(result_bytes(plain), len(CPU_TEMP_ID.encode()) + len("CPU 50 °C".encode()))
+        with_details = self.result(summary="x", details={INTERFACE: "eth0"})
+        self.assertEqual(result_bytes(with_details) - result_bytes(self.result(summary="x")),
+                         len(INTERFACE) + len("eth0") + history_worker.DETAILS_OVERHEAD)
+
+    def test_result_within_limit_is_untouched(self):
+        exact = self.result(summary="x" * (MAX_RESULT_BYTES - len(CPU_TEMP_ID)))
+        self.assertEqual(result_bytes(exact), MAX_RESULT_BYTES)
+        trimmed, cut = trim_result(exact)
+        self.assertFalse(cut)
+        self.assertIs(trimmed, exact)
+
+    def test_one_byte_over_limit_is_trimmed(self):
+        over = self.result(summary="x" * (MAX_RESULT_BYTES - len(CPU_TEMP_ID) + 1))
+        trimmed, cut = trim_result(over)
+        self.assertTrue(cut)
+        self.assertLessEqual(result_bytes(trimmed), MAX_RESULT_BYTES)
+        self.assertTrue(trimmed.summary.endswith(history_worker.TRUNCATION_MARK))
+
+    def test_identity_state_and_value_survive(self):
+        huge = self.result(summary="á" * 10_000, state=State.WARNING, details={INTERFACE: "eth0"})
+        trimmed, _ = trim_result(huge)
+        self.assertEqual(trimmed.id, huge.id)
+        self.assertIs(trimmed.state, State.WARNING)
+        self.assertEqual(trimmed.measurement, huge.measurement)
+        self.assertEqual((trimmed.observed_utc, trimmed.expires_monotonic),
+                         (huge.observed_utc, huge.expires_monotonic))
+        self.assertFalse(trimmed.simulated)
+        trimmed.summary.encode().decode()  # řez uprostřed znaku UTF-8 nenechá rozbitý text
+
+    def test_series_subject_has_priority_in_details(self):
+        # "aaa" se do limitu vejde samo, ale po zachování rozhraní už ne: objekt
+        # řady (rozhraní u RX/TX) má přednost, jinak by vzorek řadu nedostal.
+        huge = self.result(check_id=history.RX_RATE_ID, summary="x" * 1000, value=None,
+                           details={INTERFACE: "eth0", "aaa": "y" * 480, "zzz": "z" * 1000})
+        trimmed, cut = trim_result(huge)
+        self.assertTrue(cut)
+        self.assertEqual(dict(trimmed.details), {INTERFACE: "eth0"})
+        self.assertLessEqual(result_bytes(trimmed), MAX_RESULT_BYTES)
+
+    def test_absurd_id_passes_without_text(self):
+        huge = self.result(check_id="t" * (MAX_RESULT_BYTES + 10), summary="x" * 100, value=None,
+                           details={"a": "b"})
+        trimmed, cut = trim_result(huge)
+        self.assertTrue(cut)
+        self.assertEqual((trimmed.summary, dict(trimmed.details)), ("", {}))
+        self.assertEqual(trimmed.id, huge.id)  # identita kontroly se nikdy nezahodí
+
+    def test_queue_holds_only_trimmed_results(self):
+        worker = self.make()
+        release = self.hold(worker)
+        for index in range(10):
+            self.clock.advance(1)
+            self.assertTrue(worker.submit([self.result(summary="x" * 100_000)], self.clock.monotonic(), True))
+        status = worker.status()
+        self.assertEqual(status.pending_measurements, 10)
+        self.assertEqual(status.losses["result_truncated"], 10)
+        queued = [item.results[0] for item in worker._measurements]
+        self.assertTrue(all(result_bytes(result) <= MAX_RESULT_BYTES for result in queued))
+        release.set()
+        self.assertTrue(worker.flush(WAIT))
+        notes = self.query("SELECT note FROM check_change WHERE check_id = ?", (CPU_TEMP_ID,))
+        self.assertTrue(all(len(note[0].encode()) <= MAX_RESULT_BYTES for note in notes))
+
+    def test_truncation_is_recorded_per_check(self):
+        worker = self.make()
+        self.assertTrue(worker.submit([self.result(summary="x" * 100_000),
+                                       self.result(check_id=CPU_USAGE_ID, summary="y" * 100_000, value=5.0)],
+                                      self.clock.monotonic(), True))
+        self.assertTrue(worker.flush(WAIT))
+        events = self.events("history.result_truncated")
+        self.assertEqual(len(events), 1)
+        ts, quality, severity, data = events[0]
+        self.assertEqual((quality, severity), ("synced", "WARNING"))  # zkrácení textu není ztráta měření
+        self.assertEqual(data["count"], 2)
+        self.assertEqual(data["limit_bytes"], MAX_RESULT_BYTES)
+        self.assertEqual({check: item["count"] for check, item in data["checks"].items()},
+                         {CPU_TEMP_ID: 1, CPU_USAGE_ID: 1})
+        self.assertEqual(self.samples(CPU_TEMP_ID), [(BASE, 50.0)])  # hodnota se zapsala normálně
+
+    def test_important_state_survives_truncation_with_evidence(self):
+        # Velký výsledek nesmí umlčet důležitý diagnostický stav: stav i hodnota
+        # se zapíšou a zkrácení textu má vlastní doklad.
+        worker = self.make()
+        self.assertTrue(worker.submit([self.result(summary="x" * 50_000, state=State.CRITICAL, value=99.0)],
+                                      self.clock.monotonic(), True))
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual([row[3] for row in self.changes()], ["CRITICAL"])
+        self.assertEqual(self.samples(CPU_TEMP_ID), [(BASE, 99.0)])
+        self.assertEqual(self.events("history.result_truncated")[0][3]["count"], 1)
+
+    def test_truncation_before_synchronization_has_no_utc_range(self):
+        worker = self.make(synced=False)
+        self.clock.set_utc(WRONG)
+        self.assertTrue(worker.submit([self.result(summary="x" * 100_000)], self.clock.monotonic(), False))
+        status = worker.status()
+        self.assertEqual(status.losses["result_truncated"], 1)
+        self.assertEqual(status.time_base, "unsynced")
+
+    def test_oversized_result_does_not_stop_monitoring(self):
+        worker = self.make()
+        self.assertTrue(worker.submit([self.result(summary="x" * 500_000, details={"big": "y" * 500_000})],
+                                      self.clock.monotonic(), True))
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual(worker.status().state, RUNNING)
+        self.clock.advance(10)
+        self.assertTrue(self.submit(worker, temp_state=State.WARNING, temp=75.0))
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual([row[3] for row in self.changes()], ["INFO", "WARNING"])
 
 
 class OwnershipTest(WorkerTest):

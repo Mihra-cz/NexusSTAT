@@ -42,6 +42,24 @@ clear_count = 2
 # error =
 # hysteresis =
 
+# Ukládání historie do SQLite (M3.3b-1). Výchozí stav: vypnuto.
+# Cesta NEMÁ výchozí hodnotu: bez `path` se nic neotevírá ani nevytváří.
+# Při `enabled = true` musí `path` být absolutní cesta k souboru s příponou
+# .sqlite3, který už vytvořil správce v roli `development`:
+#   PYTHONPATH=src python3 -c "from pathlib import Path; from nexusstat import history; \
+#     history.create_database(Path.home() / '.local/state/nexusstat/history.sqlite3', \
+#                             'development', history.local_host_id())"
+# Aplikace databázi nikdy nevytváří, nepřepisuje ani nenahrazuje: chybějící,
+# cizí, poškozená nebo nekompatibilní databáze znamená, že se historie
+# nezapisuje (stav kontroly `history.storage`), a měření běží dál.
+# Roli nelze nastavit (vždy `development`), takže produkční databázi nelze
+# otevřít omylem. Cesta na síťovém úložišti (NAS, CIFS, NFS) se odmítne.
+# Interval dávky je 60 s (změny stavu se zapisují hned); automatická agregace
+# a retence se v tomto kroku nespouštějí.
+[history]
+enabled = false
+# path = "/home/uzivatel/.local/state/nexusstat/history.sqlite3"
+
 # --- Budoucí možnosti: zatím NEIMPLEMENTOVÁNO a nenačítá se ---
 # Nápis na první stránce je pevně NEXUS, hodiny jsou vždy 24h.
 # Symboly na stránce NEXUS (trojúhelník / "?") nelze vypnout.

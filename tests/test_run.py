@@ -2,12 +2,17 @@
 
 import contextlib
 import io
+import os
+import signal
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+from nexusstat import __version__, history
 from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmRule, AlarmsConfig, CollectorConfig, OledConfig
 from nexusstat.core import CheckResult, Measurement, State, active_problems, effective, overall_state
@@ -15,7 +20,7 @@ from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol
 from nexusstat.oled_text import page_rows
 from nexusstat.config import Config, NetworkConfig
 from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
-from nexusstat.run import Collectors, failed_results, format_line, live_monitor, main, run_loop
+from nexusstat.run import Collectors, Stopper, failed_results, format_line, live_monitor, main, run_loop, start_history
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS, MEMORY_ID, SystemMonitor
 
 # Monotónní čas nezačíná nulou, aby nic nezáviselo na náhodné shodě s 0.
@@ -508,6 +513,180 @@ class OledCompatibilityTest(unittest.TestCase):
         self.assertIs(controller.mode, Mode.STATUS)
 
 
+class FakeLink:
+    """Náhradní napojení historie: zaznamená předaná měření a vrátí svou kontrolu."""
+
+    def __init__(self, state=State.INFO, record_error=None):
+        self.recorded = []
+        self.checks = []
+        self.state = state
+        self.record_error = record_error
+        self.stops = 0
+        self.path = "/tmp/historie.sqlite3"
+        self.sync_source = "test"
+        self.sync_note = ""  # doplňující informace o markeru; nerozhoduje o stavu hodin
+
+    def start(self):
+        self.started = True
+
+    def record(self, results, measured_monotonic):
+        if self.record_error is not None:
+            raise self.record_error
+        self.recorded.append((list(results), measured_monotonic))
+        return True
+
+    def check(self, now, observed_utc):
+        self.checks.append(now)
+        return CheckResult("history.storage", self.state, "HISTORY: test", observed_utc, now + 30,
+                           simulated=False)
+
+    def stop(self):
+        self.stops += 1
+
+
+class LoopHistoryTest(unittest.TestCase):
+    """Smyčka s volitelným napojením historie; bez něj se chová jako dosud."""
+
+    def test_history_gets_final_results_and_measurement_time(self):
+        clock = FakeClock(stop_at=START + 25)
+        collector = FakeCollector(clock)
+        link = FakeLink()
+        rule = AlarmRule(enabled=True, warning=40, error=60, hysteresis=2, confirm_count=1, clear_count=1)
+        lines = []
+        run_loop(collector, CONFIG, AlarmEvaluator(AlarmsConfig(cpu_temp=rule)), clock=clock,
+                 utc_clock=clock.utc, sleep=clock.sleep, output=lines.append, history_link=link)
+        self.assertEqual(len(link.recorded), 3)
+        for (results, monotonic), measured in zip(link.recorded, collector.calls):
+            self.assertEqual(monotonic, measured)  # skutečný monotónní čas měření
+            states = {result.id: result.state for result in results}
+            self.assertIs(states[CPU_TEMP_ID], State.WARNING)  # vyhodnocený stav, ne surové INFO
+            self.assertNotIn("history.storage", states)  # vlastní kontrola se nepředává
+
+    def test_history_check_is_in_output_and_results(self):
+        clock = FakeClock(stop_at=START + 15)
+        link = FakeLink(state=State.ERROR)
+        collector = FakeCollector(clock)
+        lines = []
+        results = run_loop(collector, CONFIG, AlarmEvaluator(AlarmsConfig()), clock=clock, utc_clock=clock.utc,
+                           sleep=clock.sleep, output=lines.append, history_link=link)
+        collector_calls = collector.calls
+        self.assertEqual(results[-1].id, "history.storage")
+        self.assertIn("HISTORY: test", lines[1])
+        self.assertIn("SIM ERROR", lines[1])  # celkový stav řádku vidí chybu historie
+        self.assertEqual(link.checks, collector_calls)  # kontrola po každém měření
+
+    def test_loop_without_history_is_unchanged(self):
+        clock = FakeClock(stop_at=START + 25)
+        results, lines = run(clock, FakeCollector(clock))
+        self.assertEqual(results[-1].id, DISK_ROOT_ID)
+        self.assertFalse(any("HISTORY" in line for line in lines))
+        self.assertEqual(lines[-1], "\nUkončeno (Ctrl+C), počet měření: 3.")
+
+    def test_broken_history_does_not_stop_measuring(self):
+        clock = FakeClock(stop_at=START + 25)
+        collector = FakeCollector(clock)
+        link = FakeLink(record_error=RuntimeError("historie spadla"))
+        lines = []
+        with self.assertRaises(RuntimeError):
+            run_loop(collector, CONFIG, AlarmEvaluator(AlarmsConfig()), clock=clock, utc_clock=clock.utc,
+                     sleep=clock.sleep, output=lines.append, history_link=link)
+        # Výjimku z record() smyčka nemaskuje; chybu zachytává HistoryLink.record
+        # (viz tests/test_history_link.py), takže se do smyčky nikdy nedostane.
+        self.assertEqual(len(collector.calls), 1)
+
+
+class StopperTest(unittest.TestCase):
+    """SIGINT i SIGTERM vedou na řízené ukončení, obsluha jen v hlavním vlákně."""
+
+    def stopper(self):
+        stopper = Stopper()
+        self.assertTrue(stopper.install())
+        self.addCleanup(stopper.restore)
+        return stopper
+
+    def deliver(self, number):
+        os.kill(os.getpid(), number)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            time.sleep(0.01)  # čekání na doručení signálu hlavnímu vláknu
+
+    def test_default_label_is_ctrl_c(self):
+        self.assertEqual(Stopper().label, "Ctrl+C")
+
+    def test_sigint_raises_keyboard_interrupt(self):
+        stopper = self.stopper()
+        with self.assertRaises(KeyboardInterrupt):
+            self.deliver(signal.SIGINT)
+        self.assertEqual(stopper.label, "Ctrl+C")
+
+    def test_sigterm_raises_keyboard_interrupt(self):
+        stopper = self.stopper()
+        with self.assertRaises(KeyboardInterrupt):
+            self.deliver(signal.SIGTERM)
+        self.assertEqual(stopper.signal, signal.SIGTERM)
+        self.assertEqual(stopper.label, "SIGTERM")
+
+    def test_second_signal_during_stopping_does_not_interrupt(self):
+        stopper = self.stopper()
+        stopper.stopping = True
+        self.deliver(signal.SIGTERM)  # nevyvolá KeyboardInterrupt: dopisování front se nepřeruší
+        self.assertEqual(stopper.signal, signal.SIGTERM)
+
+    def test_restore_puts_back_previous_handlers(self):
+        before = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
+        stopper = Stopper()
+        stopper.install()
+        self.assertIsNot(signal.getsignal(signal.SIGTERM), before[signal.SIGTERM])
+        stopper.restore()
+        self.assertEqual({number: signal.getsignal(number) for number in before}, before)
+
+    def test_not_installed_outside_main_thread(self):
+        before = signal.getsignal(signal.SIGTERM)
+        result = []
+        thread = threading.Thread(target=lambda: result.append(Stopper().install()))
+        thread.start()
+        thread.join()
+        self.assertEqual(result, [False])
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    def test_loop_names_the_signal_that_stopped_it(self):
+        clock = FakeClock(stop_at=START + 15)
+        stopper = Stopper()
+        stopper.signal = signal.SIGTERM
+        lines = []
+        run_loop(FakeCollector(clock), CONFIG, AlarmEvaluator(AlarmsConfig()), clock=clock, utc_clock=clock.utc,
+                 sleep=clock.sleep, output=lines.append, stopper=stopper)
+        self.assertEqual(lines[-1], "\nUkončeno (SIGTERM), počet měření: 2.")
+
+
+class StartHistoryTest(unittest.TestCase):
+    """Příprava historie v main(): vypnutá nic nespustí, chyba nezastaví měření."""
+
+    def test_disabled_history_returns_nothing(self):
+        lines = []
+        self.assertIsNone(start_history(Config(), output=lines.append))
+        self.assertEqual(lines, [])
+
+    def test_enabled_history_is_started_and_announced(self):
+        lines = []
+        link = FakeLink()
+        with mock.patch("nexusstat.run.open_history", return_value=link) as factory:
+            self.assertIs(start_history(Config(), output=lines.append), link)
+        self.assertTrue(link.started)
+        self.assertEqual(factory.call_args.kwargs["app_version"], __version__)
+        self.assertIn("historie.sqlite3", lines[0])
+        self.assertIn("development", lines[0])
+        self.assertIn("nikdy nevytváří", lines[0])
+
+    def test_unavailable_history_keeps_measuring(self):
+        lines = []
+        error = history.HistoryError("host", "nelze přečíst /etc/machine-id")
+        with mock.patch("nexusstat.run.open_history", side_effect=error):
+            self.assertIsNone(start_history(Config(), output=lines.append))
+        self.assertIn("nedostupná", lines[0])
+        self.assertIn("pokračuje bez historie", lines[0])
+
+
 class MainTest(unittest.TestCase):
     def write_config(self, text):
         directory = tempfile.TemporaryDirectory()
@@ -579,6 +758,33 @@ class MainTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             self.run_main(["--config", "/neexistujici/nexusstat.toml"])
         self.assertEqual(raised.exception.code, 2)
+
+    def test_history_is_off_without_section(self):
+        run_loop_mock, _ = self.run_main([])
+        self.assertIsNone(run_loop_mock.call_args.kwargs["history_link"])
+        self.assertIsInstance(run_loop_mock.call_args.kwargs["stopper"], Stopper)
+
+    def test_history_link_is_passed_to_the_loop_and_stopped(self):
+        link = FakeLink()
+        with mock.patch("nexusstat.run.start_history", return_value=link):
+            run_loop_mock, _ = self.run_main([])
+        self.assertIs(run_loop_mock.call_args.kwargs["history_link"], link)
+        self.assertEqual(link.stops, 1)
+
+    def test_history_is_stopped_even_after_failure_in_the_loop(self):
+        link = FakeLink()
+        stderr = io.StringIO()
+        with mock.patch("nexusstat.run.start_history", return_value=link), \
+                mock.patch("nexusstat.run.run_loop", side_effect=RuntimeError("pád smyčky")), \
+                contextlib.redirect_stderr(stderr):
+            with self.assertRaises(RuntimeError):
+                main([])
+        self.assertEqual(link.stops, 1)
+
+    def test_signal_handlers_are_restored_after_the_loop(self):
+        before = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
+        self.run_main([])
+        self.assertEqual({number: signal.getsignal(number) for number in before}, before)
 
 
 if __name__ == "__main__":

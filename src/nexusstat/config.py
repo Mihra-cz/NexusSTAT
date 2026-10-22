@@ -1,8 +1,9 @@
-"""Načtení a validace konfiguračního TOML: sekce [oled], [collector], [network] a [alarms]."""
+"""Načtení a validace konfiguračního TOML: sekce [oled], [collector], [network], [alarms] a [history]."""
 
 import re
 import tomllib
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 from .core import is_finite_number
 
@@ -30,6 +31,7 @@ KNOWN_OLED_KEYS = {
 }
 KNOWN_COLLECTOR_KEYS = {"interval_seconds"}
 KNOWN_NETWORK_KEYS = {"interface"}
+KNOWN_HISTORY_KEYS = {"enabled", "path"}
 KNOWN_RULE_KEYS = {"enabled", "warning", "error", "hysteresis", "confirm_count", "clear_count"}
 
 # Názvy síťových rozhraní, se kterými NexusSTAT pracuje: nejvýš 15 znaků jako
@@ -61,7 +63,16 @@ MAX_CONFIRM_COUNT = 60
 
 # Načítané sekce. Ostatní ([web], [storage], ...) jsou chyba,
 # dokud je kód skutečně nepoužívá, jinak by se tiše ignorovaly.
-KNOWN_SECTIONS = {"oled", "collector", "network", "alarms"}
+KNOWN_SECTIONS = {"oled", "collector", "network", "alarms", "history"}
+
+# Role databáze historie v tomto kroku: jen vývojová databáze na notebooku.
+# Konfigurace roli nenastavuje, takže produkční databázi nelze zapnout omylem
+# ani překlepem; `history` roli production v tomto kroku navíc sama odmítá.
+HISTORY_ROLE = "development"
+
+# Přípona souboru databáze historie. Stejné pravidlo má .gitignore (*.sqlite3),
+# takže ani omylem zadaná cesta v repozitáři nepůjde zaverzovat.
+HISTORY_SUFFIX = ".sqlite3"
 
 
 class ConfigError(ValueError):
@@ -220,6 +231,47 @@ class AlarmsConfig:
 
 
 @dataclass(frozen=True)
+class HistoryConfig:
+    """Volitelné ukládání měření do SQLite historie (M3.3b-1, docs/HISTORY.md 5).
+
+    Výchozí stav je vypnuto a `path` nemá žádnou výchozí hodnotu: bez výslovně
+    zadané cesty se nikdy neotevírá ani nevytváří žádný soubor, takže se nelze
+    omylem dostat na produkční cestu Nexusu. Zapnutá historie vyžaduje
+    absolutní cestu k databázi, kterou už vytvořil správce (role
+    `development`); aplikace databázi nikdy nevytváří, nepřepisuje ani
+    nenahrazuje. Existence souboru, jeho identita (role a stroj) a souborový
+    systém se ověřují až při otevření, protože se mohou měnit za běhu.
+    """
+
+    enabled: bool = False
+    path: str | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(f"enabled musí být true nebo false, ne {self.enabled!r}")
+        if self.path is not None:
+            self._check_path()
+        if self.enabled and self.path is None:
+            raise ConfigError("enabled = true vyžaduje path k existující databázi historie")
+
+    def _check_path(self):
+        if not isinstance(self.path, str) or not self.path:
+            raise ConfigError(f"path musí být neprázdná cesta k souboru, ne {self.path!r}")
+        if "\x00" in self.path:
+            raise ConfigError("path nesmí obsahovat nulový bajt")
+        # Absolutní cesta bez pomlčky "~": cesta se použije přesně tak, jak je
+        # zadaná, aby nezávisela na pracovním adresáři ani na domovském adresáři
+        # uživatele, pod kterým služba zrovna běží.
+        if not self.path.startswith("/"):
+            raise ConfigError(f"path musí být absolutní cesta, ne {self.path!r}")
+        name = PurePosixPath(self.path).name
+        if not name or self.path.endswith("/"):
+            raise ConfigError(f"path musí být soubor databáze, ne adresář: {self.path!r}")
+        if PurePosixPath(name).suffix != HISTORY_SUFFIX:
+            raise ConfigError(f"path musí mít příponu {HISTORY_SUFFIX}, ne {name!r}")
+
+
+@dataclass(frozen=True)
 class Config:
     """Celá konfigurace. Chybějící sekce mají výchozí hodnoty."""
 
@@ -227,6 +279,7 @@ class Config:
     collector: CollectorConfig = field(default_factory=CollectorConfig)
     alarms: AlarmsConfig = field(default_factory=AlarmsConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
+    history: HistoryConfig = field(default_factory=HistoryConfig)
 
 
 def oled_config_from_dict(section):
@@ -252,6 +305,12 @@ def network_config_from_dict(section):
     """Vytvoří NetworkConfig ze slovníku sekce [network]. Bez klíče interface = automatický výběr."""
     _check_section("network", section, KNOWN_NETWORK_KEYS)
     return NetworkConfig(**section)
+
+
+def history_config_from_dict(section):
+    """Vytvoří HistoryConfig ze slovníku sekce [history]. Bez sekce i bez klíčů = vypnuto."""
+    _check_section("history", section, KNOWN_HISTORY_KEYS)
+    return HistoryConfig(**section)
 
 
 def alarms_config_from_dict(section):
@@ -282,4 +341,5 @@ def load_config(path):
         collector=collector_config_from_dict(data.get("collector", {})),
         alarms=alarms_config_from_dict(data.get("alarms", {})),
         network=network_config_from_dict(data.get("network", {})),
+        history=history_config_from_dict(data.get("history", {})),
     )

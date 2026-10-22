@@ -4,16 +4,20 @@ import unittest
 from pathlib import Path
 
 from nexusstat.config import (
+    HISTORY_ROLE,
+    HISTORY_SUFFIX,
     THRESHOLD_LIMITS,
     AlarmRule,
     AlarmsConfig,
     CollectorConfig,
     Config,
     ConfigError,
+    HistoryConfig,
     NetworkConfig,
     OledConfig,
     alarms_config_from_dict,
     collector_config_from_dict,
+    history_config_from_dict,
     load_config,
     network_config_from_dict,
     oled_config_from_dict,
@@ -37,7 +41,13 @@ class DefaultsTest(unittest.TestCase):
         # Ostatní sekce (web, storage) jsou v ukázce jen jako komentář,
         # aby nevypadaly funkčně, dokud je kód nenačítá.
         with open(EXAMPLE_CONFIG, "rb") as file:
-            self.assertEqual(set(tomllib.load(file)), {"oled", "collector", "network", "alarms"})
+            self.assertEqual(set(tomllib.load(file)), {"oled", "collector", "network", "alarms", "history"})
+
+    def test_example_config_keeps_history_off_without_path(self):
+        # Ukázka nesmí zapnout ukládání ani nabídnout výchozí cestu k databázi.
+        history = load_config(EXAMPLE_CONFIG).history
+        self.assertFalse(history.enabled)
+        self.assertIsNone(history.path)
 
     def test_example_config_selects_interface_automatically(self):
         # Ukázka nesmí natvrdo určit rozhraní: na Nexusu se může jmenovat jinak.
@@ -308,6 +318,61 @@ class AlarmsConfigTest(unittest.TestCase):
         self.assertIn("[alarms.disk_root]", str(raised.exception))
 
 
+class HistoryConfigTest(unittest.TestCase):
+    """Sekce [history]: výchozí vypnuto, bez výchozí cesty, striktní validace."""
+
+    def test_default_is_disabled_without_path(self):
+        config = HistoryConfig()
+        self.assertFalse(config.enabled)
+        self.assertIsNone(config.path)
+        self.assertEqual(Config().history, config)
+
+    def test_no_implicit_path_anywhere_in_code(self):
+        # Žádná výchozí cesta: zapnutí bez výslovné cesty je chyba, ne odhad.
+        with self.assertRaises(ConfigError):
+            HistoryConfig(enabled=True)
+
+    def test_enabled_needs_absolute_file_path(self):
+        config = HistoryConfig(enabled=True, path="/var/lib/nexusstat/history.sqlite3")
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.path, "/var/lib/nexusstat/history.sqlite3")
+
+    def test_invalid_paths_are_refused(self):
+        for value in ("", "relativni/history.sqlite3", "~/history.sqlite3", "/var/lib/nexusstat/",
+                      "/var/lib/nexusstat/history.db", "/var/lib/nexusstat/history",
+                      "/var/lib/nexusstat/history.sqlite3.lock", "/history\x00.sqlite3", 5, True, ["/x.sqlite3"]):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError):
+                    HistoryConfig(enabled=True, path=value)
+
+    def test_enabled_must_be_boolean(self):
+        for value in ("true", 1, None):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError):
+                    HistoryConfig(enabled=value, path="/x/history.sqlite3")
+
+    def test_path_without_enabled_stays_disabled(self):
+        # Cesta sama historii nezapne: zapnutí je výslovné rozhodnutí.
+        config = HistoryConfig(path="/x/history.sqlite3")
+        self.assertFalse(config.enabled)
+
+    def test_unknown_keys_are_refused(self):
+        for section in ({"role": "production"}, {"enable": True}, {"path_": "/x.sqlite3"},
+                        {"retention_days": 30}, {"interval_seconds": 10}):
+            with self.subTest(section=section):
+                with self.assertRaises(ConfigError):
+                    history_config_from_dict(section)
+
+    def test_section_must_be_a_table(self):
+        with self.assertRaises(ConfigError):
+            history_config_from_dict("zapnuto")
+
+    def test_role_is_fixed_to_development(self):
+        # Roli nelze konfigurovat, takže produkční databázi nelze otevřít omylem.
+        self.assertEqual(HISTORY_ROLE, "development")
+        self.assertEqual(HISTORY_SUFFIX, ".sqlite3")
+
+
 class LoadFileTest(unittest.TestCase):
     def load_text(self, text):
         with tempfile.TemporaryDirectory() as directory:
@@ -384,6 +449,32 @@ class LoadFileTest(unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(ConfigError):
                     self.load_text(text)
+
+    def test_history_from_file(self):
+        config = self.load_text('[history]\nenabled = true\npath = "/var/lib/nexusstat/history.sqlite3"\n')
+        self.assertEqual(config.history, HistoryConfig(True, "/var/lib/nexusstat/history.sqlite3"))
+        self.assertEqual((config.oled, config.collector, config.alarms, config.network),
+                         (OledConfig(), CollectorConfig(), AlarmsConfig(), NetworkConfig()))
+
+    def test_history_disabled_in_file(self):
+        config = self.load_text("[history]\nenabled = false\n")
+        self.assertEqual(config.history, HistoryConfig())
+
+    def test_invalid_history_rejects_whole_file(self):
+        for text in ("[history]\nenabled = true\n",
+                     '[history]\nenabled = true\npath = "historie.sqlite3"\n',
+                     '[history]\npath = "/x/history.sqlite3"\nrole = "production"\n',
+                     '[history]\nenabled = true\npath = "/x/history.db"\n',
+                     "[history]\nenabled = 1\n"):
+            with self.subTest(text=text):
+                with self.assertRaises(ConfigError):
+                    self.load_text(text)
+
+    def test_file_without_history_keeps_other_sections(self):
+        config = self.load_text('[collector]\ninterval_seconds = 5\n\n[network]\ninterface = "end0"\n')
+        self.assertFalse(config.history.enabled)
+        self.assertEqual(config.collector.interval_seconds, 5)
+        self.assertEqual(config.network.interface, "end0")
 
     def test_strict_oled_validation_is_kept(self):
         for text in ("[oled]\npage_second = 6\n", "[oled]\nwidth = 256\n", "[oled]\nhome_title = \"X\"\n"):

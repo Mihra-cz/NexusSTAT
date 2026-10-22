@@ -6,20 +6,27 @@ Použití:
 Každých `interval_seconds` (sekce [collector], výchozí 10 s) změří vytížení CPU,
 teplotu CPU, RAM, obsazenost / a síťové rozhraní ([network]: linka, RX/TX, IPv4),
 vyhodnotí zapnuté prahy ([alarms], výchozí vypnuto) a vypíše jeden řádek.
-Ukončení: Ctrl+C.
-Nic nezapisuje, neotevírá port, nic neposílá do sítě a nepřistupuje k displeji,
-NAS ani jinému hardwaru.
+Ukončení: Ctrl+C nebo SIGTERM.
+Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nic neposílá
+do sítě a nepřistupuje k displeji, NAS ani jinému hardwaru. Se zapnutou historií
+([history] enabled = true s výslovnou cestou) předává vyhodnocené výsledky
+vláknu zapisovače SQLite; samo měření zůstává read-only a chyba historie ho
+nezastaví (history_link.py).
 Alarm se jen vypíše; žádná automatická akce (vypnutí, ventilátory) neexistuje.
 """
 
 import argparse
+import signal
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import __version__, history
 from .alarms import AlarmEvaluator
-from .config import Config, ConfigError, load_config
+from .config import HISTORY_ROLE, Config, ConfigError, load_config
 from .core import ALERT_STATES, CheckResult, State, overall_state
+from .history_link import open_history
 from .network_monitor import NetworkMonitor
 from .system_monitor import SystemMonitor
 
@@ -105,14 +112,57 @@ def format_line(results, now, observed_utc, text):
     return f"{observed_utc:%Y-%m-%d %H:%M:%S} UTC  {sim}{state:<8} {text}"
 
 
+class Stopper:
+    """Řízené ukončení na SIGINT (Ctrl+C) i SIGTERM (systemd, `kill`).
+
+    Obsluha se nastaví jen v hlavním vlákně: Python signály v jiném vlákně
+    doručit neumí. Obsluha vyvolá KeyboardInterrupt, takže se smyčka ukončí
+    stejnou cestou jako dosud u Ctrl+C. Během dopisování front (`stopping`)
+    už další signál smyčku nepřerušuje, aby poslední zápis historie neskončil
+    v polovině; zaseknutý proces jde dál ukončit SIGKILL.
+    """
+
+    def __init__(self):
+        self.signal = None
+        self.stopping = False
+        self._previous = {}
+
+    @property
+    def label(self):
+        return "SIGTERM" if self.signal == signal.SIGTERM else "Ctrl+C"
+
+    def install(self):
+        """Nastaví obsluhu v hlavním vlákně; jinde vrátí False a nic nemění."""
+        if threading.current_thread() is not threading.main_thread():
+            return False
+        for number in (signal.SIGINT, signal.SIGTERM):
+            self._previous[number] = signal.getsignal(number)
+            signal.signal(number, self)
+        return True
+
+    def restore(self):
+        """Vrátí původní obsluhu signálů (po skončení smyčky)."""
+        for number, handler in self._previous.items():
+            signal.signal(number, handler)
+        self._previous.clear()
+
+    def __call__(self, number, frame):
+        self.signal = number
+        if self.stopping:
+            return
+        raise KeyboardInterrupt
+
+
 def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now, sleep=time.sleep,
-             output=print_now):
-    """Hlavní smyčka měření. Běží do Ctrl+C a vrací poslední vyhodnocené výsledky.
+             output=print_now, history_link=None, stopper=None):
+    """Hlavní smyčka měření. Běží do Ctrl+C nebo SIGTERM a vrací poslední výsledky.
 
     `config` je CollectorConfig, `evaluator` AlarmEvaluator s pravidly [alarms].
     `clock` jsou monotónní hodiny pro plánování a platnost výsledků, `utc_clock`
     dává jen čas měření. Testy dodají simulované hodiny i `sleep`, takže nic
     skutečně nečekají.
+    `history_link` (volitelně) dostane finální vyhodnocené výsledky a doplní do
+    nich vlastní kontrolu `history.storage`; bez něj se smyčka chová jako dosud.
     """
     interval = config.interval_seconds
     output(
@@ -150,6 +200,14 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
             # Prahy se vyhodnotí i po selhání: UNKNOWN přeruší řadu měření pro
             # potvrzení závady, ale závadu nevyřeší.
             results = evaluator.evaluate(results, now)
+            if history_link is not None:
+                # Do historie jdou finální vyhodnocené výsledky se skutečným
+                # monotónním časem měření; zápis probíhá v jiném vlákně, takže
+                # se tu na nic nečeká. Vlastní kontrola historie se do historie
+                # nepředává: její stav se mění podle historie, takže by zápis
+                # sám vytvářel další zápisy (zpětná vazba).
+                history_link.record(results, now)
+                results = [*results, history_link.check(now, observed_utc)]
             if text is None:
                 text = " | ".join(result_text(result) for result in results)
             measurements += 1
@@ -160,20 +218,60 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
             next_due += interval
     except KeyboardInterrupt:
         # Nový řádek, aby hláška nenavazovala na "^C" vypsané terminálem.
-        output(f"\nUkončeno (Ctrl+C), počet měření: {measurements}.")
+        label = "Ctrl+C" if stopper is None else stopper.label
+        output(f"\nUkončeno ({label}), počet měření: {measurements}.")
     return results
+
+
+def start_history(config, output=print_now):
+    """Připraví a spustí historii podle [history]; vypnutá nebo nedostupná dá None.
+
+    Nedostupná historie (např. nečitelné /etc/machine-id) měření nezastaví:
+    vypíše se důvod a měří se dál bez ukládání.
+    """
+    try:
+        link = open_history(config, app_version=__version__, output=output)
+    except (history.HistoryError, OSError, ValueError) as error:
+        output(f"Historie: nedostupná ({error}); měření pokračuje bez historie.")
+        return None
+    if link is None:
+        return None
+    link.start()
+    note = link.sync_note
+    output(f"Historie: {link.path} (role {HISTORY_ROLE}), zdroj synchronizace hodin: {link.sync_source}. "
+           "Databáze se nikdy nevytváří ani nepřepisuje."
+           + (f" ({note})" if note else ""))
+    return link
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Pravidelné read-only měření systému a sítě NexusSTAT")
-    parser.add_argument("--config", type=Path, help="TOML se sekcemi [collector], [network], [alarms] a [oled]")
+    parser.add_argument("--config", type=Path,
+                        help="TOML se sekcemi [collector], [network], [alarms], [oled] a [history]")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config) if args.config else Config()
     except (ConfigError, OSError) as error:
         # Neplatná konfigurace = žádné měření, ne tiché použití výchozích hodnot.
         parser.error(str(error))
-    run_loop(live_monitor(config), config.collector, AlarmEvaluator(config.alarms))
+    stopper = Stopper()
+    link = None
+    try:
+        stopper.install()
+        link = start_history(config)
+        run_loop(live_monitor(config), config.collector, AlarmEvaluator(config.alarms),
+                 history_link=link, stopper=stopper)
+    except KeyboardInterrupt:
+        # Signál mimo smyčku (např. během spouštění historie): ukončení je
+        # řízené i tady, jen bez řádku o počtu měření.
+        print_now(f"\nUkončeno ({stopper.label}) před prvním měřením.")
+    finally:
+        # Obsluha signálů se vrátí i tehdy, když historie selže už při spuštění.
+        # Další signál už ukončení nepřeruší: historie dopisuje fronty s limitem.
+        stopper.stopping = True
+        if link is not None:
+            link.stop()
+        stopper.restore()
 
 
 if __name__ == "__main__":

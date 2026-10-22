@@ -7,8 +7,8 @@ používá i zavře výhradně vlákno zapisovače; spojení zůstává s check_
 takže ho jiné vlákno použít nemůže. Změny stavu (R4) se počítají už při submit(),
 takže přetečení fronty vzorků nikdy neztratí přechod alarmu.
 
-Zatím ho nic nespouští: napojení na run.py, SIGTERM a skutečný zdroj
-synchronizace hodin jsou M3.3b; agregaci ani retenci nevolá.
+Napojení na měřicí smyčku, SIGTERM a skutečný zdroj synchronizace hodin má
+`history_link.py` (M3.3b-1); agregaci ani retenci zapisovač nevolá (M3.3b-2).
 """
 
 import math
@@ -42,6 +42,15 @@ EVENT_CAPACITY = 500
 # Text a údaje jedné události (UTF-8): fronta 500 událostí tak drží nejvýš ≈ 8 MB.
 # Větší událost je chyba volajícího; nepřijme se a započte jako ztráta (sledování nezastaví).
 MAX_EVENT_BYTES = 16_384
+# Text jednoho výsledku (UTF-8): id, summary a údaje details dohromady. Skutečné
+# výsledky kolektorů mají desítky bajtů (summary ≈ 30 B, details ≈ 60 B), takže
+# 512 B je osminásobná rezerva a zároveň drží paměť front v měřeném rozsahu
+# (72 000 hodnot × ≈ 0,7 kB ≈ 50 MB, HISTORY.md 5.2). Delší text se zkrátí;
+# identita kontroly, stav ani naměřená hodnota se nikdy nezahodí.
+MAX_RESULT_BYTES = 512
+# Režie jednoho údaje details v JSON ("klíč":"hodnota",) při měření velikosti.
+DETAILS_OVERHEAD = 6
+TRUNCATION_MARK = "…"
 STOP_TIMEOUT_SECONDS = 10  # HISTORY.md 5.5
 MAX_WAIT_SECONDS = 10  # vlákno se probudí nejméně jednou za 10 s (HISTORY.md 5.2)
 FINAL_ATTEMPTS = 2  # pokusy o poslední zápis při zastavení (bez čekání na odstup)
@@ -53,7 +62,57 @@ _TRANSIENT_OPEN = ("SQLITE_IOERR", "SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_CANTO
 # Druh známé ztráty -> událost, která ji zapíše (HISTORY.md 5.4). after_stop se jen počítá.
 LOSS_EVENTS = {"queue_full": "history.gap", "time_unsynced": "history.gap",
                "changes_dropped": "history.changes_dropped", "events_dropped": "history.events_dropped",
-               "event_too_large": "history.events_dropped"}
+               "event_too_large": "history.events_dropped",
+               "result_truncated": "history.result_truncated"}
+# Ztráta celých položek je ERROR; ostatní WARNING, nad hodinu rozsahu ERROR.
+SEVERE_LOSSES = frozenset({"changes_dropped", "events_dropped", "event_too_large"})
+# Zkrácený text není ztráta měření (stav, hodnota i identita zůstaly), proto
+# zůstává WARNING bez ohledu na délku rozsahu.
+TEXT_LOSSES = frozenset({"result_truncated"})
+
+
+def result_bytes(result):
+    """Velikost textu výsledku v bajtech UTF-8: id, summary a údaje details."""
+    size = len(result.id.encode()) + len(result.summary.encode())
+    for key, value in result.details.items():
+        size += len(key.encode()) + len(value.encode()) + DETAILS_OVERHEAD
+    return size
+
+
+def _cut(text, limit):
+    """Text zkrácený na `limit` bajtů UTF-8, s koncovou značkou, když se zkracoval."""
+    if limit <= 0 or not text:
+        return ""
+    mark = len(TRUNCATION_MARK.encode())
+    if limit <= mark:
+        return ""  # na značku ani není místo: text se vypustí celý
+    # Řez v bajtech může přepůlit znak UTF-8; neúplný znak se zahodí.
+    return text.encode()[:limit - mark].decode(errors="ignore") + TRUNCATION_MARK
+
+
+def trim_result(result, limit=MAX_RESULT_BYTES):
+    """Výsledek zkrácený na `limit` bajtů UTF-8; vrací (výsledek, zkráceno).
+
+    Zkracuje se jen text. Id kontroly, stav, naměřená hodnota a oba časy
+    zůstávají vždy: podle nich se pozná, co se měřilo a jak to skončilo.
+    Z údajů `details` se udrží ty, které se do limitu vejdou; klíč objektu řady
+    (např. rozhraní u RX/TX) má přednost, protože nese identitu řady. Co zbude,
+    dostane `summary`. Výsledek s nepřiměřeně dlouhým id tak projde bez textu,
+    ale nikdy se nezahodí.
+    """
+    if result_bytes(result) <= limit:
+        return result, False
+    spec = history.SERIES.get(result.id)
+    subject = None if spec is None else spec.subject_key
+    remaining = limit - len(result.id.encode())
+    details = {}
+    for key in sorted(result.details, key=lambda name: (name != subject, name)):
+        value = result.details[key]
+        cost = len(key.encode()) + len(value.encode()) + DETAILS_OVERHEAD
+        if cost <= remaining:
+            details[key] = value
+            remaining -= cost
+    return replace(result, summary=_cut(result.summary, remaining), details=details), True
 
 
 def classify(error):
@@ -275,7 +334,12 @@ class HistoryWorker:
                 self._lose("after_stop", 1, len(results))
                 return False
             self._seq += 1
+            results, truncated = self._trim(results)
             quality = self._time_quality(results, measured_monotonic, time_synced)
+            for check_id in truncated:
+                # Rozsah ztráty jen z důvěryhodného času; jinak zůstane monotónní.
+                moment = None if quality != "synced" else math.floor(results[0].observed_utc.timestamp())
+                self._lose("result_truncated", 1, 0, moment, measured_monotonic, check_id)
             for result in results:
                 if result.simulated:
                     continue  # simulace nevytváří změny; vzorky odmítne a započte zapisovač
@@ -379,6 +443,20 @@ class HistoryWorker:
             return StopReport(completed, self._clean_stop and completed, *unsaved, in_doubt, status)
 
     # --- Pomocné pod zámkem ------------------------------------------------------------
+
+    def _trim(self, results):
+        """Zkrátí příliš dlouhé výsledky; vrací (výsledky, id zkrácených kontrol).
+
+        Omezení textu platí už při předání, takže fronty nikdy nedrží neomezeně
+        velká data a zapečetěná dávka se kvůli velikosti nemusí měnit.
+        """
+        trimmed, truncated = [], []
+        for result in results:
+            result, cut = trim_result(result)
+            if cut:
+                truncated.append(result.id)
+            trimmed.append(result)
+        return tuple(trimmed), truncated
 
     def _time_quality(self, results, monotonic, synced):
         """Kvalita času měření; první synchronizace dá posun pro odvození čekajících (HISTORY.md 4.3)."""
@@ -535,9 +613,15 @@ class HistoryWorker:
             else:  # bez důvěryhodného UTC: čas systému s kvalitou unsynced, rozsah jen monotónní
                 span = 0 if loss.mono_from is None else loss.mono_to - loss.mono_from
                 moment, quality = max(1, math.floor(self._utc_now().timestamp())), "unsynced"
-            severe = kind in ("changes_dropped", "events_dropped", "event_too_large") or span > QUEUE_SECONDS
-            events.append(history.Event(moment, quality, LOSS_EVENTS[kind], "ERROR" if severe else "WARNING",
-                                        f"známá ztráta historie: {kind}, {loss.count} položek", data=data))
+            if kind in TEXT_LOSSES:
+                severity = "WARNING"
+                message = f"zkrácený text výsledku nad {MAX_RESULT_BYTES} B: {loss.count} výsledků"
+                data["limit_bytes"] = MAX_RESULT_BYTES
+            else:
+                severe = kind in SEVERE_LOSSES or span > QUEUE_SECONDS
+                severity = "ERROR" if severe else "WARNING"
+                message = f"známá ztráta historie: {kind}, {loss.count} položek"
+            events.append(history.Event(moment, quality, LOSS_EVENTS[kind], severity, message, data=data))
         return events
 
     def _set_failure(self, kind, error):
