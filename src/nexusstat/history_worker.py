@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from types import MappingProxyType
 
-from . import history
+from . import history, snapshot
 from .config import VALIDITY_INTERVALS
 from .core import CheckResult, is_finite_number
 
@@ -224,7 +224,7 @@ class _Maintenance:
     __slots__ = ("aggregation_monotonic", "aggregation_utc", "done_5m", "done_1h", "windows_5m",
                  "windows_1h", "blocked", "conflict", "more", "retention_monotonic",
                  "retention_blocked", "retention_stopped", "deleted", "retention_more",
-                 "failures", "last_error", "wal_bytes")
+                 "failures", "last_error", "wal_bytes", "snapshot")
 
     def __init__(self):
         self.aggregation_monotonic = self.aggregation_utc = None
@@ -239,6 +239,23 @@ class _Maintenance:
         self.failures = 0
         self.last_error = None
         self.wal_bytes = None
+        self.snapshot = SnapshotStatus()
+
+
+@dataclass(frozen=True)
+class SnapshotStatus:
+    """Snímek stavu snímků historie (M3.4a); čte se bez SQLite."""
+
+    requested: bool = False  # čeká požadavek na snímek
+    running: bool = False  # vlákno zapisovače právě staví snímek (zdržuje zápis)
+    started: float | None = None  # monotónní začátek probíhajícího pokusu
+    monotonic: float | None = None  # konec posledního pokusu
+    utc: int | None = None  # čas posledního úspěšného snímku
+    generation: str | None = None  # jméno poslední zveřejněné generace
+    bytes: int | None = None
+    seconds: float | None = None  # trvání posledního pokusu (zdržení zapisovače)
+    failures: int = 0  # po sobě jdoucí neúspěšné pokusy
+    last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -263,6 +280,7 @@ class MaintenanceStatus:
     failures: int = 0  # po sobě jdoucí selhání údržby
     last_error: str | None = None
     wal_bytes: int | None = None  # velikost -wal při posledním zápisu nebo pokusu o údržbu
+    snapshot: SnapshotStatus = field(default_factory=SnapshotStatus)
 
 
 @dataclass(frozen=True)
@@ -323,11 +341,15 @@ class HistoryWorker:
 
     def __init__(self, path, role, host_id, *, app_version, interval_s, boot_id=None,
                  monotonic=time.monotonic, utc_now=None, opener=None, batch_seconds=BATCH_SECONDS,
-                 flapping_checks=FLAPPING_CHECKS, event_capacity=EVENT_CAPACITY):
+                 flapping_checks=FLAPPING_CHECKS, event_capacity=EVENT_CAPACITY, snapshot_roots=None):
         if isinstance(interval_s, bool) or not isinstance(interval_s, int) or not 1 <= interval_s <= 3600:
             raise ValueError(f"interval_s musí být celé číslo 1–3600, ne {interval_s!r}")
         self._app_version, self._interval_s, self._boot_id = app_version, interval_s, boot_id
         self._path = path  # jen pro velikost -wal (stat souboru, nikdy SQLite)
+        self._role, self._host_id = role, host_id
+        # (rozpracovaný, zveřejňovaný) adresář generací snímků, nebo None = snímky
+        # se nevytvářejí. Plánování a sekce konfigurace jsou M3.4b.
+        self._snapshot_roots = snapshot_roots
         self._monotonic = monotonic
         self._utc_now = utc_now or (lambda: datetime.now(timezone.utc))
         self._opener = opener or (lambda: history.open_writer(path, role, host_id))
@@ -367,6 +389,7 @@ class HistoryWorker:
         self._synced_seen = None  # monotónní čas posledního potvrzení synchronizace
         self._last_seen = None  # (monotónní čas, UTC) posledního měření: detekce skoku
         self._maint = _Maintenance()
+        self._snapshot_requested = False
         self._aggregate_at = 0.0  # monotónní čas dalšího pokusu o agregaci
         self._retain_at = 0.0
         self._flush_target = 0
@@ -460,6 +483,19 @@ class HistoryWorker:
                 return False
             self._seq += 1
             self._push(self._events, _Event(self._seq, event), self.event_capacity)
+            self._cond.notify_all()
+            return True
+
+    def request_snapshot(self):
+        """Požádá vlákno zapisovače o snímek historie; vrací False, když se nevytváří.
+
+        Hlavní vlákno jen nastaví požadavek: snímek staví vlákno zapisovače ze
+        svého spojení (jediný zapisovač) a zápis čekajících měření má přednost.
+        """
+        with self._cond:
+            if self._snapshot_roots is None or self._stop_requested:
+                return False
+            self._snapshot_requested = True
             self._cond.notify_all()
             return True
 
@@ -659,7 +695,7 @@ class HistoryWorker:
             maint.retention_monotonic, maint.retention_blocked,
             MappingProxyType(dict(maint.retention_stopped)), MappingProxyType(dict(maint.deleted)),
             maint.retention_more, state.stable_s if state.synced else None,
-            maint.failures, maint.last_error, maint.wal_bytes)
+            maint.failures, maint.last_error, maint.wal_bytes, maint.snapshot)
 
     def _clock_synced_event(self, moment):
         held_m = [item.monotonic for item in self._measurements if item.quality == "unsynced"]
@@ -850,6 +886,8 @@ class HistoryWorker:
                 self._aggregate()
             elif action == "retain":
                 self._retain()
+            elif action == "snapshot":
+                self._snapshot()
             else:
                 self._write()
 
@@ -903,6 +941,8 @@ class HistoryWorker:
             return None, None
         if self._recorder.commit_in_doubt:
             return None, None  # výsledek předchozího commitu není znám
+        if self._snapshot_requested:
+            return "snapshot", None  # vyžádaný snímek má před ostatní údržbou přednost
         if self._maint.conflict is None and now >= self._aggregate_at:
             return "aggregate", None
         if now >= self._retain_at:
@@ -986,6 +1026,65 @@ class HistoryWorker:
                 self._retain_at = 0.0  # limit transakcí došel, zbytek po dalším kole
             self._cond.notify_all()
         return True
+
+    def _snapshot(self):
+        """Jedna generace snímku ze spojení zapisovače; vrací True při zveřejnění.
+
+        Snímek vzniká jen při doloženě synchronizovaném čase (jinak by generace
+        nesla vymyšlený čas). Kopie se přerušuje na hranici stránek, jakmile
+        přijde požadavek na ukončení; rozpracovaná generace se uklidí a žádná
+        zveřejněná se nedotkne.
+        """
+        with self._cond:
+            self._snapshot_requested = False
+            moment = math.floor(self._utc_now().timestamp())
+            trusted = self._offset is not None and self._synced_last is True
+            roots = self._snapshot_roots
+            if roots is not None:
+                # Dokud snímek běží, je to vidět: zápis měření se mezitím hromadí
+                # ve frontách a nepotvrzená práce stárne (diagnostika HISTORY.md 8).
+                previous = self._maint.snapshot
+                self._maint.snapshot = replace(previous, running=True, started=self._monotonic())
+                self._cond.notify_all()
+        if roots is None:
+            return False
+        if not trusted or moment < history.MIN_TRUSTED_UTC:
+            self._note_snapshot(error="time: čas není doložený, snímek se nevytváří")
+            return False
+        started = self._monotonic()
+
+        def progress(status, remaining, total):
+            if self._stop_requested:  # čtení příznaku bez zámku: jen True/False
+                raise snapshot.SnapshotError("stopped", "snímek přerušen požadavkem na ukončení")
+
+        try:
+            generation = snapshot.create(self._database.connection, roots[0], roots[1], moment,
+                                         app_version=self._app_version, role=self._role,
+                                         host_id=self._host_id, progress=progress)
+        except snapshot.SnapshotError as error:
+            self._note_snapshot(error=f"{error.reason}: {error}", seconds=self._monotonic() - started,
+                               counted=error.reason != "stopped")
+            return False
+        except sqlite3.Error as error:
+            self._note_snapshot(error=f"copy: {error}", seconds=self._monotonic() - started)
+            return False
+        self._note_snapshot(generation=generation, seconds=self._monotonic() - started)
+        return True
+
+    def _note_snapshot(self, *, generation=None, error=None, seconds=None, counted=True):
+        """Zapíše výsledek pokusu o snímek do stavu (bez SQLite)."""
+        with self._cond:
+            previous = self._maint.snapshot
+            if generation is not None:
+                self._maint.snapshot = SnapshotStatus(
+                    False, False, None, self._monotonic(), generation.record.snapshot_utc, generation.name,
+                    generation.record.bytes, seconds, 0, None)
+            else:
+                self._maint.snapshot = SnapshotStatus(
+                    False, False, None, self._monotonic(), previous.utc, previous.generation, previous.bytes,
+                    seconds if seconds is not None else previous.seconds,
+                    previous.failures + 1 if counted else previous.failures, error)
+            self._cond.notify_all()
 
     def _handle_error(self, error):
         """Reakce na chybu zápisu dávky: druh, případné zavření spojení a odstup."""

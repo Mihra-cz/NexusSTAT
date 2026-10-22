@@ -14,37 +14,36 @@ Agregaci ani retenci tento krok nespouští (M3.3b-2).
 """
 
 import math
-import os
-import re
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from . import clock_sync, history, history_worker
 from .config import HISTORY_ROLE
 from .core import CheckResult, State
+# Jediná definice kontrol cest a úložiště je ve storage.py (používá je i snapshot.py);
+# jména zůstávají dostupná i přes tento modul, aby se přesunem nic nezměnilo.
+from .storage import (  # noqa: F401
+    MOUNTS_PATH,
+    NETWORK_FILESYSTEMS,
+    UNVERIFIABLE_FILESYSTEMS,
+    StorageError,
+    check_local_path as _check_local_path,
+    filesystem_type,
+    is_network_filesystem,
+    resolve_path,
+)
 from .history_worker import DEGRADED, FAILED, STARTING, STOPPED, MAX_RESULT_BYTES, HistoryWorker
 
 HISTORY_STORAGE_ID = "history.storage"
 LABEL = "HISTORY"  # krátký název pro STATUS a displej (docs/HISTORY.md 8)
 STOP_TIMEOUT_SECONDS = history_worker.STOP_TIMEOUT_SECONDS
 
-MOUNTS_PATH = "/proc/self/mounts"
+# Druhy ztrát, při kterých data skutečně zmizela. Zkrácený text mezi ně nepatří:
+# stav, hodnota ani identita kontroly se nezahodily.
+DATA_LOSSES = frozenset({"queue_full", "time_unsynced", "changes_dropped", "events_dropped",
+                         "event_too_large", "after_stop"})
 
-# Typy připojení, u kterých cílové úložiště dopředu ověřit nejde: autofs připojí
-# cíl až při prvním přístupu a bývá to NFS nebo CIFS. Odmítají se stejně jako
-# síťové úložiště: lépe nezapsat nic než zapsat historii na NAS.
-UNVERIFIABLE_FILESYSTEMS = frozenset({"autofs"})
-
-# Síťová úložiště, na která databáze historie nepatří: SQLite tam nemá
-# spolehlivé zámky ani fsync a připojení může zmizet uprostřed transakce.
-# NAS je navíc mimo rozsah tohoto kroku.
-NETWORK_FILESYSTEMS = frozenset({
-    "cifs", "smb2", "smb3", "smbfs", "nfs", "nfs3", "nfs4", "afs", "ceph", "glusterfs",
-    "9p", "ncpfs", "lustre", "beegfs", "orangefs", "gfs2", "ocfs2",
-    "sshfs", "davfs", "webdav", "s3fs", "rclone", "curlftpfs", "smbnetfs",
-})
-
-# Zaseknutý zápis (visící fsync) nezmění stav zapisovače: zůstane RUNNING,
-# jen se nepotvrzuje žádná dávka. Pozná se podle toho, že data čekají a poslední
+# Zaseknutý zápis (visící fsync) nezmění stav zapisovače: zůstane RUNNING, jen se
+# nepotvrzuje žádná dávka. Pozná se podle toho, že data čekají a poslední
 # potvrzení je starší než několik dávkovacích intervalů (dávka má 60 s).
 STALE_COMMIT_SECONDS = 3 * history_worker.BATCH_SECONDS
 
@@ -54,81 +53,6 @@ STALE_COMMIT_SECONDS = 3 * history_worker.BATCH_SECONDS
 AGGREGATION_LAG_SECONDS = 3600
 # Velikost WAL, při které je něco v nepořádku (dlouhá čtecí transakce, HISTORY.md 8, 10.6).
 WAL_WARNING_BYTES = 64 * 1024 * 1024
-
-# Druhy ztrát, při kterých data skutečně zmizela. Zkrácený text mezi ně nepatří:
-# stav, hodnota ani identita kontroly se nezahodily.
-DATA_LOSSES = frozenset({"queue_full", "time_unsynced", "changes_dropped", "events_dropped",
-                         "event_too_large", "after_stop"})
-
-
-def _unescape(field):
-    # /proc/self/mounts kóduje mezeru, tabulátor, nový řádek a zpětné lomítko osmičkově.
-    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), field)
-
-
-def resolve_path(path):
-    """Cesta po rozvinutí symlinků a odstranění `.` a `..` (`os.path.realpath`).
-
-    Rozhoduje skutečné místo souboru, ne zápis cesty: symlink v poslední části
-    ani v nadřazeném adresáři nesmí historii propašovat na jiné úložiště.
-    Neexistující poslední část se rozvine podle existující předpony.
-    """
-    return PurePosixPath(os.path.realpath(path))
-
-
-def filesystem_type(path, mounts=None):
-    """Typ souborového systému, na kterém cesta skutečně leží.
-
-    Rozhoduje nejdelší bod připojení, který je předponou cesty **po rozvinutí
-    symlinků**; při stejně dlouhém bodu platí poslední záznam, protože pozdější
-    připojení překryje starší. None znamená, že typ zjistit nelze (nečitelná
-    tabulka připojení, žádný odpovídající bod); volající pak zápis odmítne.
-    Tabulka se čte až tady, protože se za běhu mění.
-    """
-    try:
-        lines = Path(mounts or MOUNTS_PATH).read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-    target = resolve_path(path)
-    found = None
-    for line in lines:
-        fields = line.split()
-        if len(fields) < 3:
-            continue  # neúplný řádek: z takové tabulky se nic nedovozuje
-        point = PurePosixPath(_unescape(fields[1]))
-        # Porovnávají se části cesty, ne text: /srv/nas-zaloha neleží pod /srv/nas.
-        if target != point and point not in target.parents:
-            continue
-        if found is None or len(point.parts) >= len(found[0].parts):
-            found = (point, _unescape(fields[2]))
-    return None if found is None else found[1]
-
-
-def is_network_filesystem(kind):
-    name = kind.split(".", 1)[1] if kind.startswith("fuse.") else kind
-    return name in NETWORK_FILESYSTEMS
-
-
-def check_local_path(path, mounts=None):
-    """Povolí jen cestu na doloženě lokálním úložišti; vrací jeho typ.
-
-    Odmítne síťové úložiště (NAS, CIFS, NFS, 9p, sshfs…), autofs (cíl se
-    připojí až při přístupu) a stejně tak stav, kdy úložiště **ověřit nelze**
-    (nečitelná nebo neúplná tabulka připojení, cesta mimo všechny body
-    připojení). Raději se nezapíše nic, než aby historie skončila na NAS.
-    Kontroluje se při každém otevření, protože připojení se mění za běhu.
-    """
-    kind = filesystem_type(path, mounts)
-    if kind is None:
-        raise history.HistoryError(
-            "path", f"úložiště cesty {path} nelze ověřit (tabulka připojení); historie se nezapisuje")
-    if is_network_filesystem(kind):
-        raise history.HistoryError(
-            "path", f"{path} leží na síťovém souborovém systému {kind}; historie se tam nezapisuje")
-    if kind in UNVERIFIABLE_FILESYSTEMS:
-        raise history.HistoryError(
-            "path", f"{path} leží pod {kind}; cílové úložiště se připojí až při přístupu a nelze ho ověřit")
-    return kind
 
 
 def _counts(losses):
@@ -156,7 +80,7 @@ def _maintenance_text(maint):
 
 
 def storage_state(status, *, queue_full=False, stalled=False, time_synced=None, submit_failures=0,
-                  source=None, now_utc=None):
+                  source=None, now_utc=None, snapshot_running=None):
     """Stav a popis kontroly `history.storage`; `status` None = historie vypnutá.
 
     Pořadí rozhoduje: doložená ztráta a zastavený zapisovač před přechodnou
@@ -192,6 +116,12 @@ def storage_state(status, *, queue_full=False, stalled=False, time_synced=None, 
     if status.time_base == "unsynced":
         reason = "stav synchronizace hodin neznámý" if time_synced is None else "hodiny nesynchronizované"
         return State.WARNING, (f"{reason} ({source}); {status.held_unsynced} položek čeká na čas; {pending}")
+    if snapshot_running is not None:
+        # Snímek drží vlákno zapisovače (kopie, kontrola, SHA-256): zápis měření
+        # se mezitím hromadí ve frontách. Není to zaseknutý zápis, a dokud snímek
+        # běží, nehlásí se jako takový; dlouhý snímek je ale varování.
+        state = State.WARNING if snapshot_running >= STALE_COMMIT_SECONDS else State.INFO
+        return state, (f"probíhá snímek historie ({snapshot_running:.0f} s), zápis měření zatím čeká; {pending}")
     if stalled:
         # Zápis se dlouho nepotvrdil, i když data čekají: typicky zaseknuté I/O.
         # Netvrdí se, že vlákno visí, jen že potvrzení chybí.
@@ -361,13 +291,15 @@ class HistoryLink:
             status = self.worker.status()
             queue_full = self._queues_full(status)
             stalled = self._stalled(status, now)
+            snapshot_running = self._snapshot_running(status, now)
         except Exception as error:
             return CheckResult(HISTORY_STORAGE_ID, State.UNKNOWN,
                                f"{LABEL}: stav zapisovače nelze přečíst ({type(error).__name__}: {error})",
                                observed_utc, expires, simulated=False)
         return storage_result(status, observed_utc, expires, queue_full=queue_full, stalled=stalled,
                               time_synced=self._synced, submit_failures=self.submit_failures,
-                              source=self.sync_source, now_utc=math.floor(observed_utc.timestamp()))
+                              source=self.sync_source, now_utc=math.floor(observed_utc.timestamp()),
+                              snapshot_running=snapshot_running)
 
     def _stalled(self, status, now):
         """True, když se nejstarší nepotvrzená zapisovatelná práce dlouho nepotvrdila.
@@ -382,6 +314,13 @@ class HistoryLink:
         """
         since = status.unconfirmed_since
         return since is not None and now - since >= STALE_COMMIT_SECONDS
+
+    def _snapshot_running(self, status, now):
+        """Jak dlouho už běží snímek, nebo None, když žádný neběží."""
+        snapshot = status.maintenance.snapshot
+        if not snapshot.running or snapshot.started is None:
+            return None
+        return max(0.0, now - snapshot.started)
 
     def _queues_full(self, status):
         """True, když některá fronta dosáhla kapacity: od té chvíle se zahazuje nejstarší."""
@@ -408,6 +347,18 @@ class HistoryLink:
         for line in stop_lines(report, self.timeout):
             self._output(line)
         return report
+
+
+def check_local_path(path, mounts=None):
+    """Povolí jen cestu na doloženě lokálním úložišti; vrací jeho typ.
+
+    Obal nad `storage.check_local_path`, který hlásí chybu jako `HistoryError`,
+    aby ji vlákno zapisovače zařadilo mezi chyby cesty (odstup, nikdy nový soubor).
+    """
+    try:
+        return _check_local_path(path, mounts)
+    except StorageError as error:
+        raise history.HistoryError("path", str(error)) from None
 
 
 def _open_writer(path, host_id, mounts=None):

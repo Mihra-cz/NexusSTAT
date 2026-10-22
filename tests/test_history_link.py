@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from nexusstat import history, history_link
+from nexusstat import history, history_link, storage
 from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmRule, AlarmsConfig, CollectorConfig, Config, HistoryConfig
 from nexusstat.core import CheckResult, Measurement, State
@@ -49,6 +49,7 @@ from nexusstat.history_worker import (
     STOPPED,
     HistoryWorker,
     MaintenanceStatus,
+    SnapshotStatus,
     StopReport,
     WorkerStatus,
 )
@@ -356,6 +357,33 @@ class StorageStateTest(unittest.TestCase):
         state, text = storage_state(worker_status(pending_measurements=360), queue_full=True, time_synced=True)
         self.assertIs(state, State.ERROR)
         self.assertIn("fronta plná", text)
+
+    def test_running_snapshot_is_not_a_stalled_write(self):
+        # Snímek drží vlákno zapisovače: je to vidět, ale není to zaseknutý zápis.
+        status = worker_status(pending_measurements=5, unconfirmed_since=1000.0,
+                               maintenance=maintenance_status(
+                                   aggregation_monotonic=1000.0,
+                                   snapshot=SnapshotStatus(running=True, started=1000.0)))
+        state, text = storage_state(status, stalled=True, snapshot_running=30.0, time_synced=True)
+        self.assertIs(state, State.INFO)
+        self.assertIn("probíhá snímek historie (30 s)", text)
+        self.assertNotIn("nepotvrdil", text)
+
+    def test_long_snapshot_is_a_warning(self):
+        status = worker_status(pending_measurements=40, unconfirmed_since=1000.0,
+                               maintenance=maintenance_status(
+                                   snapshot=SnapshotStatus(running=True, started=1000.0)))
+        state, text = storage_state(status, stalled=True,
+                                    snapshot_running=history_link.STALE_COMMIT_SECONDS, time_synced=True)
+        self.assertIs(state, State.WARNING)
+        self.assertIn("probíhá snímek", text)
+
+    def test_snapshot_does_not_hide_a_real_error(self):
+        status = worker_status(state=FAILED, error_kind="corrupt", last_error="x",
+                               maintenance=maintenance_status(
+                                   snapshot=SnapshotStatus(running=True, started=1000.0)))
+        state, _ = storage_state(status, snapshot_running=10.0, time_synced=True)
+        self.assertIs(state, State.ERROR)
 
     def test_stalled_write_is_visible(self):
         # Zaseknutý zápis nezmění stav zapisovače; stav historie to přesto přizná.
@@ -735,7 +763,7 @@ class OpenHistoryTest(LinkCase):
     def test_network_path_is_refused_without_writing(self):
         mounts = self.folder / "mounts"
         mounts.write_text(f"nas {self.folder} cifs rw 0 0\n", encoding="utf-8")
-        with mock.patch.object(history_link, "MOUNTS_PATH", str(mounts)):
+        with mock.patch.object(storage, "MOUNTS_PATH", str(mounts)):
             config = Config(history=HistoryConfig(enabled=True, path=str(self.db)))
             link = open_history(config, app_version="test", output=self.lines.append, sync=Sync(True),
                                 host_id=HOST, boot_id=BOOT)

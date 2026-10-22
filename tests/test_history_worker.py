@@ -26,7 +26,7 @@ from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
-from nexusstat import history
+from nexusstat import history, snapshot
 from nexusstat.core import CheckResult, Measurement, State
 from nexusstat import history_worker
 from nexusstat.history_worker import (
@@ -1221,6 +1221,199 @@ class StarvationTest(WorkerTest):
             self.assertLessEqual(aggregate.call_count - calls, 1)
 
 
+class SnapshotWorkerTest(WorkerTest):
+    """Snímky staví výhradně vlákno zapisovače (M3.4a)."""
+
+    def roots(self):
+        work, published = self.folder / "snapshot-work", self.folder / "snapshot"
+        work.mkdir(exist_ok=True)
+        published.mkdir(exist_ok=True)
+        return work, published
+
+    def fill(self, worker, count=30):
+        for _ in range(count):
+            self.submit(worker)
+            self.clock.advance(10)
+        self.assertTrue(worker.flush(WAIT), worker.status())
+
+    def test_without_roots_no_snapshot_is_requested(self):
+        worker = self.make()
+        self.assertFalse(worker.request_snapshot())
+        time.sleep(0.05)
+        self.assertIsNone(worker.status().maintenance.snapshot.generation)
+
+    def test_snapshot_is_built_by_the_writer_thread(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        threads = []
+        real = snapshot.create
+
+        def recording(*args, **kwargs):
+            threads.append(threading.get_ident())
+            return real(*args, **kwargs)
+
+        with mock.patch.object(snapshot, "create", recording):
+            self.assertTrue(worker.request_snapshot())
+            self.settle(worker, lambda s: s.maintenance.snapshot.generation is not None, "čekám na snímek")
+        status = worker.status().maintenance.snapshot
+        self.assertEqual(threads, [worker._thread.ident])  # hlavní vlákno snímek nestaví
+        self.assertEqual(snapshot.generations(published), [status.generation])
+        self.assertEqual(status.utc, status.utc)
+        self.assertGreater(status.bytes, 0)
+        self.assertIsNone(status.last_error)
+        self.assertEqual(status.failures, 0)
+        self.assertFalse(status.requested)
+        report = snapshot.check_restore(published / status.generation, role="test", host_id=HOST)
+        self.assertTrue(report.ok, report.problems)
+        self.assertEqual(report.rows["sample"], 60)  # 30 měření × dvě řady
+
+    def test_writing_continues_after_the_snapshot(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        self.assertTrue(worker.request_snapshot())
+        self.settle(worker, lambda s: s.maintenance.snapshot.generation is not None, "čekám na snímek")
+        self.clock.advance(10)
+        self.submit(worker, temp_state=State.WARNING, temp=75.0)
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual([row[3] for row in self.changes()], ["INFO", "WARNING"])
+        self.assertEqual(worker.status().state, RUNNING)
+
+    def test_pending_measurement_is_written_before_the_snapshot(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        self.clock.advance(10)
+        self.submit(worker, temp_state=State.CRITICAL, temp=95.0)  # změna: zapisuje se hned
+        self.assertTrue(worker.request_snapshot())
+        self.settle(worker, lambda s: s.maintenance.snapshot.generation is not None, "čekám na snímek")
+        # Měření bylo zapsané dřív, takže je i ve snímku.
+        generation = snapshot.latest_valid(published)
+        # Dva výchozí řádky obou kontrol a navíc přechod na CRITICAL.
+        self.assertEqual(generation.record.rows["check_change"], 3)
+
+    def test_snapshot_without_trusted_time_is_refused(self):
+        work, published = self.roots()
+        self.clock.set_utc(WRONG)
+        worker = self.make(snapshot_roots=(work, published), synced=False)
+        self.assertTrue(worker.request_snapshot())
+        self.settle(worker, lambda s: s.maintenance.snapshot.last_error is not None, "čekám na odmítnutí")
+        status = worker.status().maintenance.snapshot
+        self.assertIn("čas není doložený", status.last_error)
+        self.assertEqual(snapshot.generations(published), [])
+        self.assertEqual(status.failures, 1)
+
+    def test_stop_interrupts_the_copy_without_publishing(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker, 60)
+        entered = threading.Event()
+        real = snapshot.copy_database
+
+        def slow_copy(connection, target, moment, pages=None, progress=None):
+            entered.set()
+            time.sleep(0.2)  # dost času, aby mezitím přišlo stop()
+            return real(connection, target, moment, 1, progress)
+
+        with mock.patch.object(snapshot, "copy_database", slow_copy):
+            self.assertTrue(worker.request_snapshot())
+            self.assertTrue(entered.wait(WAIT))
+            report = worker.stop(timeout=WAIT)
+        self.assertTrue(report.completed, report)
+        status = worker.status().maintenance.snapshot
+        self.assertIn("stopped", status.last_error or "")
+        self.assertEqual(snapshot.generations(published), [])  # nic nezveřejněno
+        self.assertEqual(status.failures, 0)  # přerušení není selhání
+        self.assertEqual(list(work.iterdir()), [])  # rozpracovaná generace uklizena
+
+    def test_measurements_wait_during_the_snapshot(self):
+        """Kopírování po stránkách **neuvolňuje** vlákno pro další zápisy.
+
+        Mezi kroky Backup API běží jen callback; vlákno zapisovače je po celou
+        dobu snímku uvnitř `backup()`, takže čekající měření se zapíšou teprve
+        po jeho dokončení. Žádný test nesmí předpokládat opak.
+        """
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        commits = worker.status().commits
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        real = snapshot.copy_database
+
+        def blocking_copy(connection, target, moment, pages=None, progress=None):
+            entered.set()
+            release.wait(WAIT)
+            return real(connection, target, moment, 1, progress)
+
+        with mock.patch.object(snapshot, "copy_database", blocking_copy):
+            self.assertTrue(worker.request_snapshot())
+            self.assertTrue(entered.wait(WAIT))
+            self.clock.advance(10)
+            self.submit(worker, temp_state=State.CRITICAL, temp=95.0)  # změna by se jinak zapsala hned
+            worker.wake()
+            time.sleep(0.1)
+            during = worker.status()
+            self.assertEqual(during.commits, commits)  # během snímku se nic nezapíše
+            self.assertEqual(during.pending_measurements, 1)
+            self.assertTrue(during.maintenance.snapshot.running)
+            release.set()
+            self.settle(worker, lambda s: s.maintenance.snapshot.generation is not None, "čekám na snímek")
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual([row[3] for row in self.changes()], ["INFO", "CRITICAL"])  # až po snímku
+        self.assertFalse(worker.status().maintenance.snapshot.running)
+
+    def test_running_snapshot_is_visible_in_the_status(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        real = snapshot.copy_database
+
+        def blocking_copy(connection, target, moment, pages=None, progress=None):
+            entered.set()
+            release.wait(WAIT)
+            return real(connection, target, moment, 1, progress)
+
+        with mock.patch.object(snapshot, "copy_database", blocking_copy):
+            self.assertTrue(worker.request_snapshot())
+            self.assertTrue(entered.wait(WAIT))
+            snapshot_status = worker.status().maintenance.snapshot
+            self.assertTrue(snapshot_status.running)
+            self.assertIsNotNone(snapshot_status.started)
+            release.set()
+            self.settle(worker, lambda s: not s.maintenance.snapshot.running, "snímek dokončen")
+        done = worker.status().maintenance.snapshot
+        self.assertIsNotNone(done.seconds)
+        self.assertIsNone(done.started)
+
+    def test_request_after_stop_is_refused(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        worker.stop(timeout=WAIT)
+        self.assertFalse(worker.request_snapshot())
+
+    def test_failed_snapshot_keeps_the_previous_generation(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        self.assertTrue(worker.request_snapshot())
+        self.settle(worker, lambda s: s.maintenance.snapshot.generation is not None, "první snímek")
+        first = worker.status().maintenance.snapshot.generation
+        self.clock.advance(60)
+        with mock.patch.object(snapshot, "verify_database",
+                               side_effect=snapshot.SnapshotError("verify", "neprošlo")):
+            self.assertTrue(worker.request_snapshot())
+            self.settle(worker, lambda s: s.maintenance.snapshot.last_error is not None, "druhý snímek selže")
+        status = worker.status().maintenance.snapshot
+        self.assertEqual(status.generation, first)  # předchozí generace zůstává
+        self.assertEqual(snapshot.generations(published), [first])
+        self.assertEqual(status.failures, 1)
+        self.assertEqual(worker.status().state, RUNNING)  # zápis pokračuje
+
+
 class WalTest(WorkerTest):
     """Velikost WAL pochází ze skutečného souboru správné databáze."""
 
@@ -1358,6 +1551,7 @@ class StabilityTest(WorkerTest):
         # doladění NTP je řádově milisekundy, 2 s už je skok.
         for drift, restarts in ((history.CLOCK_JUMP_SECONDS, False), (history.CLOCK_JUMP_SECONDS + 0.5, True)):
             with self.subTest(drift=drift):
+                self.tearDown()  # uklidit předchozí dočasný adresář, pak začít znovu
                 self.setUp()
                 worker = self.make(synced=True)
                 self.run_for(worker, 3600)
