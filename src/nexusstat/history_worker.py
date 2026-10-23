@@ -57,6 +57,7 @@ DETAILS_OVERHEAD = 6
 TRUNCATION_MARK = "…"
 # Údržba (M3.3b-2): pokus o agregaci nejvýš takhle často, hned po potvrzené dávce
 # a při dohánění (more) hned znovu. Retence nejvýš jednou za hodinu monotónního času.
+SCAN_RETRY_SECONDS = 300  # nový pokus o prohledání generací po chybě úložiště
 AGGREGATION_INTERVAL_SECONDS = 60
 RETENTION_INTERVAL_SECONDS = 3600
 # Nejdelší mezera mezi pozorováními synchronizace, která ještě neruší doloženou
@@ -187,6 +188,7 @@ class _Work:
     events: tuple  # history.Event (včetně záznamů ztrát)
     losses: Mapping  # druh -> počet zapisovaný touto dávkou
     offset: float | None  # UTC − monotonic pro odvození času, nebo None
+    seq: int = 0  # nejvyšší pořadí položky v dávce (potvrzení konkrétní události)
 
     @property
     def size(self):
@@ -256,6 +258,17 @@ class SnapshotStatus:
     seconds: float | None = None  # trvání posledního pokusu (zdržení zapisovače)
     failures: int = 0  # po sobě jdoucí neúspěšné pokusy
     last_error: str | None = None
+    # Doklady z jediného prohledání adresáře generací při startu (M3.4b-1);
+    # dokud `scanned` není True, o stáří snímku se nic netvrdí.
+    scanned: bool = False
+    generations: int = 0  # kolik jmen generací adresář obsahoval
+    invalid: int = 0  # generace, které se nepodařilo ověřit (nepoužily se)
+    invalid_name: str | None = None  # nejnovější z nich: poškození zůstává dohledatelné
+    scan_error: str | None = None  # adresář generací nelze přečíst
+    # Pořadí auditní události o posledním zveřejnění: podle WorkerStatus.confirmed_seq
+    # se pozná, zda je událost potvrzená v živé databázi. Zveřejněná generace na
+    # ní nezávisí (leží na disku, i když se událost nezapíše).
+    event_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -314,6 +327,9 @@ class WorkerStatus:
     # nepočítají (hlásí se zvlášť jako held_unsynced).
     unconfirmed_since: float | None = None
     maintenance: MaintenanceStatus = field(default_factory=MaintenanceStatus)
+    # Nejvyšší pořadí položky, jejíž dávka byla potvrzena commitem. Podle něj se
+    # pozná, že konkrétní událost (např. o snímku) je skutečně v databázi.
+    confirmed_seq: int = 0
 
 
 @dataclass(frozen=True)
@@ -390,6 +406,8 @@ class HistoryWorker:
         self._last_seen = None  # (monotónní čas, UTC) posledního měření: detekce skoku
         self._maint = _Maintenance()
         self._snapshot_requested = False
+        self._scan_at = 0.0  # monotónní čas dalšího pokusu o prohledání generací
+        self._confirmed_seq = 0  # nejvyšší potvrzené pořadí (commit dávky)
         self._aggregate_at = 0.0  # monotónní čas dalšího pokusu o agregaci
         self._retain_at = 0.0
         self._flush_target = 0
@@ -695,7 +713,8 @@ class HistoryWorker:
             maint.retention_monotonic, maint.retention_blocked,
             MappingProxyType(dict(maint.retention_stopped)), MappingProxyType(dict(maint.deleted)),
             maint.retention_more, state.stable_s if state.synced else None,
-            maint.failures, maint.last_error, maint.wal_bytes, maint.snapshot)
+            maint.failures, maint.last_error, maint.wal_bytes,
+            replace(maint.snapshot, requested=self._snapshot_requested))
 
     def _clock_synced_event(self, moment):
         held_m = [item.monotonic for item in self._measurements if item.quality == "unsynced"]
@@ -772,7 +791,8 @@ class HistoryWorker:
             "unsynced" if self._offset is None else ("sync_lost" if self._sync_lost else "synced"),
             MappingProxyType(dict(self._loss_totals)), MappingProxyType(dict(unrecorded)), kind, text,
             self._failures, None if self._retry_at is None else max(0.0, self._retry_at - now),
-            unconfirmed_since=unconfirmed, maintenance=self._maintenance_snapshot())
+            unconfirmed_since=unconfirmed, maintenance=self._maintenance_snapshot(),
+            confirmed_seq=self._confirmed_seq)
 
     def _take(self, final):
         """Vybere obsah dávky z front (pod zámkem). Bez synchronizace čekají měření i změny."""
@@ -788,7 +808,8 @@ class HistoryWorker:
                 measurements.append(item)
             changes = list(self._changes)
             self._changes.clear()
-        events = [item.event for item in self._events]
+        queued = list(self._events)
+        events = [item.event for item in queued]
         self._events.clear()
         losses = self._ready_losses(final)
         for kind in losses:
@@ -796,8 +817,9 @@ class HistoryWorker:
         events += self._loss_events(losses)
         if not (measurements or changes or events):
             return None
+        seq = max((item.seq for item in (*measurements, *changes, *queued)), default=0)
         work = _Work(tuple(measurements), tuple(changes), tuple(events),
-                     MappingProxyType({kind: loss.count for kind, loss in losses.items()}), self._offset)
+                     MappingProxyType({kind: loss.count for kind, loss in losses.items()}), self._offset, seq)
         self._work = work
         self._in_flight = work.size
         self._in_flight_losses = Counter(work.losses)
@@ -886,6 +908,8 @@ class HistoryWorker:
                 self._aggregate()
             elif action == "retain":
                 self._retain()
+            elif action == "scan":
+                self._scan_snapshots()
             elif action == "snapshot":
                 self._snapshot()
             else:
@@ -941,13 +965,19 @@ class HistoryWorker:
             return None, None
         if self._recorder.commit_in_doubt:
             return None, None  # výsledek předchozího commitu není znám
+        # Prohledání generací proběhne jednou za běh; chyba úložiště ho nechá
+        # nedokončené (stav zůstane nedoložený) a zkusí se znovu za odstup.
+        scanning = self._snapshot_roots is not None and not self._maint.snapshot.scanned
+        if scanning and now >= self._scan_at:
+            return "scan", None
         if self._snapshot_requested:
             return "snapshot", None  # vyžádaný snímek má před ostatní údržbou přednost
         if self._maint.conflict is None and now >= self._aggregate_at:
             return "aggregate", None
         if now >= self._retain_at:
             return "retain", None
-        pending = [at - now for at in (self._aggregate_at, self._retain_at) if at > now]
+        waits = [self._aggregate_at, self._retain_at, *([self._scan_at] if scanning else [])]
+        pending = [at - now for at in waits if at > now]
         return None, min(pending) if pending else None
 
     def _wal_bytes(self):
@@ -1027,6 +1057,71 @@ class HistoryWorker:
             self._cond.notify_all()
         return True
 
+    def _audit(self, kind, severity, message, data=None):
+        """Zařadí auditní událost z vlákna zapisovače; vrací její pořadí (seq).
+
+        Čas je čas systému: s doloženou synchronizací `synced`, jinak
+        `unsynced` (vymyšlená značka nevznikne nikdy, HISTORY.md 4.3). Událost
+        jde běžnou frontou a jediným zapisovačem, takže se zapíše nejpozději
+        s další dávkou; než se potvrdí, je to vidět na `confirmed_seq`.
+        """
+        with self._cond:
+            moment = math.floor(self._utc_now().timestamp())
+            trusted = self._offset is not None and self._synced_last is True
+            quality = "synced" if trusted and moment >= history.MIN_TRUSTED_UTC else "unsynced"
+            self._seq += 1
+            event = history.Event(max(1, moment), quality, kind, severity, message, data=data)
+            self._push(self._events, _Event(self._seq, event), self.event_capacity)
+            self._cond.notify_all()
+            return self._seq
+
+    def _scan_snapshots(self):
+        """Najde poslední prokazatelně platnou generaci (jen čtení, jednou za běh).
+
+        Novější generaci, kterou nelze ověřit (vadný záznam i nečitelný
+        adresář generace), nepoužije, ale nechá ji dohledatelnou: započte ji,
+        pojmenuje ve stavu a zapíše auditní událost. Rozpracovaná generace
+        (`.<generace>.partial`) se za generaci nikdy nepovažuje, protože nemá
+        jméno generace.
+
+        **Chyba čtení adresáře generací není prázdný adresář:** stav zůstane
+        nedoložený (`scanned` dál False, důvod v `scan_error`), takže plánovač
+        nic nerozhodne a diagnostika hlásí chybu úložiště, ne chybějící snímek;
+        za `SCAN_RETRY_SECONDS` se pokus zopakuje. Souborové I/O běží mimo
+        zámek, takže hlavní vlákno na prohledání nikdy nečeká (HISTORY.md 9.3).
+        """
+        published = self._snapshot_roots[1]
+        invalid, newest, names, failure = [], None, [], None
+        try:
+            names = snapshot.generations(published)
+        except OSError as error:
+            failure = f"path: {error}"
+        else:
+            for name in reversed(names):
+                try:
+                    newest = snapshot.load_generation(os.path.join(published, name))
+                    break
+                except (snapshot.SnapshotError, OSError) as error:
+                    invalid.append((name, str(error)))
+        with self._cond:
+            previous = self._maint.snapshot
+            if failure is not None:
+                self._scan_at = self._monotonic() + SCAN_RETRY_SECONDS
+            self._maint.snapshot = replace(
+                previous, scanned=failure is None, generations=len(names), invalid=len(invalid),
+                invalid_name=invalid[0][0] if invalid else None, scan_error=failure,
+                utc=previous.utc if newest is None else newest.record.snapshot_utc,
+                generation=previous.generation if newest is None else newest.name,
+                bytes=previous.bytes if newest is None else newest.record.bytes)
+            self._cond.notify_all()
+        if invalid:
+            self._audit("history.snapshot_invalid", "WARNING",
+                        f"neověřitelné generace snímku: {len(invalid)}",
+                        data={"generations": [name for name, _ in invalid],
+                              "reason": _cut(invalid[0][1], 200),
+                              "used": None if newest is None else newest.name})
+        return True
+
     def _snapshot(self):
         """Jedna generace snímku ze spojení zapisovače; vrací True při zveřejnění.
 
@@ -1049,7 +1144,18 @@ class HistoryWorker:
         if roots is None:
             return False
         if not trusted or moment < history.MIN_TRUSTED_UTC:
+            # Pokus, při kterém snímek nevznikl, se počítá jako neúspěšný
+            # (sémantika M3.4a): jméno generace i `snapshot_utc` by nesly
+            # vymyšlený čas. Že šlo o přeskočení, a ne o závadu zápisu, říká
+            # druh auditní události a důvod v diagnostice.
             self._note_snapshot(error="time: čas není doložený, snímek se nevytváří")
+            # Bez doloženého UTC nese událost `ts_quality = "unsynced"` (čas
+            # systému, ne doklad); umístit ji pak jde jen podle monotónního času
+            # a boot_id, stejně jako u záznamů ztrát (HISTORY.md 4.3).
+            self._audit("history.snapshot_skipped", "WARNING",
+                        "snímek přeskočen: čas není doložený",
+                        data={"reason": "time_unsynced", "boot_id": self._boot_id,
+                              "mono": round(self._monotonic(), 3)})
             return False
         started = self._monotonic()
 
@@ -1062,28 +1168,64 @@ class HistoryWorker:
                                          app_version=self._app_version, role=self._role,
                                          host_id=self._host_id, progress=progress)
         except snapshot.SnapshotError as error:
-            self._note_snapshot(error=f"{error.reason}: {error}", seconds=self._monotonic() - started,
-                               counted=error.reason != "stopped")
+            seconds = self._monotonic() - started
+            stopped = error.reason == "stopped"
+            self._note_snapshot(error=f"{error.reason}: {error}", seconds=seconds, counted=not stopped)
+            if stopped:
+                # Zrušení při ukončení není závada: rozpracovaná generace je
+                # uklizená a žádná zveřejněná se nedotkla.
+                self._audit("history.snapshot_stopped", "INFO",
+                            "snímek zrušen při ukončení procesu",
+                            data={"reason": "stopped", "seconds": round(seconds, 3)})
+            else:
+                self._audit("history.snapshot_failed", "ERROR", f"snímek se nepovedl: {error.reason}",
+                            data={"reason": error.reason, "error": _cut(str(error), 200),
+                                  "seconds": round(seconds, 3)})
             return False
-        except sqlite3.Error as error:
-            self._note_snapshot(error=f"copy: {error}", seconds=self._monotonic() - started)
+        except (sqlite3.Error, OSError) as error:
+            # Chyba SQLite nebo úložiště snímků (plný disk, read-only adresář,
+            # zmizelá cesta) **nesmí zastavit zápis historie**: snímek je
+            # užitečný, ale historie je důležitější. Hlásí se jako neúspěšný
+            # pokus a vlákno zapisovače běží dál.
+            seconds = self._monotonic() - started
+            reason = "copy" if isinstance(error, sqlite3.Error) else "io"
+            self._note_snapshot(error=f"{reason}: {error}", seconds=seconds)
+            self._audit("history.snapshot_failed", "ERROR", f"snímek se nepovedl: {reason}",
+                        data={"reason": reason, "error": _cut(str(error), 200),
+                              "seconds": round(seconds, 3)})
             return False
-        self._note_snapshot(generation=generation, seconds=self._monotonic() - started)
+        seconds = self._monotonic() - started
+        # Generace je zveřejněná na disku; auditní událost je o ní, ne její
+        # podmínka. Kdyby se nezapsala, snímek tím neztrácí platnost: v
+        # diagnostice je vidět, že událost ještě není potvrzená.
+        seq = self._audit("history.snapshot", "INFO", f"snímek {generation.name} zveřejněn",
+                          data={"generation": generation.name, "bytes": generation.record.bytes,
+                                "sha256": generation.record.sha256, "seconds": round(seconds, 3),
+                                "snapshot_utc": generation.record.snapshot_utc})
+        self._note_snapshot(generation=generation, seconds=seconds, event_seq=seq)
         return True
 
-    def _note_snapshot(self, *, generation=None, error=None, seconds=None, counted=True):
-        """Zapíše výsledek pokusu o snímek do stavu (bez SQLite)."""
+    def _note_snapshot(self, *, generation=None, error=None, seconds=None, counted=True, event_seq=None):
+        """Zapíše výsledek pokusu o snímek do stavu (bez SQLite).
+
+        Neúspěšný pokus nikdy nesmaže údaje o poslední platné generaci: snímek
+        na disku existuje dál a diagnostika musí umět říct, jak je starý.
+        """
         with self._cond:
             previous = self._maint.snapshot
+            common = {"requested": False, "running": False, "started": None,
+                      "monotonic": self._monotonic()}
             if generation is not None:
-                self._maint.snapshot = SnapshotStatus(
-                    False, False, None, self._monotonic(), generation.record.snapshot_utc, generation.name,
-                    generation.record.bytes, seconds, 0, None)
+                self._maint.snapshot = replace(
+                    previous, **common, utc=generation.record.snapshot_utc, generation=generation.name,
+                    bytes=generation.record.bytes, seconds=seconds, failures=0, last_error=None,
+                    event_seq=event_seq)
             else:
-                self._maint.snapshot = SnapshotStatus(
-                    False, False, None, self._monotonic(), previous.utc, previous.generation, previous.bytes,
-                    seconds if seconds is not None else previous.seconds,
-                    previous.failures + 1 if counted else previous.failures, error)
+                self._maint.snapshot = replace(
+                    previous, **common,
+                    seconds=seconds if seconds is not None else previous.seconds,
+                    failures=previous.failures + 1 if counted else previous.failures,
+                    last_error=error)
             self._cond.notify_all()
 
     def _handle_error(self, error):
@@ -1181,6 +1323,7 @@ class HistoryWorker:
             work, self._batch, self._work, self._attempt = self._work, None, None, None
             self._attempt_since = None
             self._confirmed.update(m=len(work.measurements), c=len(work.changes), e=len(work.events))
+            self._confirmed_seq = max(self._confirmed_seq, work.seq)
             self._in_flight, self._in_flight_losses = 0, Counter()
             self._commits += 1
             moment = self._utc_now().timestamp()

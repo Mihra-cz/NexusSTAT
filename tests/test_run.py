@@ -18,7 +18,7 @@ from nexusstat.config import AlarmRule, AlarmsConfig, CollectorConfig, OledConfi
 from nexusstat.core import CheckResult, Measurement, State, active_problems, effective, overall_state
 from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol
 from nexusstat.oled_text import page_rows
-from nexusstat.config import Config, NetworkConfig
+from nexusstat.config import Config, HistoryConfig, NetworkConfig, SnapshotConfig
 from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
 from nexusstat.run import (COLLECTOR_FAILURE, Collectors, Stopper, failed_results, failure_name,
                           format_line, live_monitor, main, run_loop, start_history)
@@ -517,15 +517,19 @@ class OledCompatibilityTest(unittest.TestCase):
 class FakeLink:
     """Náhradní napojení historie: zaznamená předaná měření a vrátí svou kontrolu."""
 
-    def __init__(self, state=State.INFO, record_error=None):
+    def __init__(self, state=State.INFO, record_error=None, snapshot_state=State.NA):
         self.recorded = []
         self.checks = []
+        self.snapshot_checks = []
+        self.plans = []
         self.state = state
+        self.snapshot_state = snapshot_state
         self.record_error = record_error
         self.stops = 0
         self.path = "/tmp/historie.sqlite3"
         self.sync_source = "test"
         self.sync_note = ""  # doplňující informace o markeru; nerozhoduje o stavu hodin
+        self.snapshot_error = None
 
     def start(self):
         self.started = True
@@ -540,6 +544,15 @@ class FakeLink:
         self.checks.append(now)
         return CheckResult("history.storage", self.state, "HISTORY: test", observed_utc, now + 30,
                            simulated=False)
+
+    def plan_snapshot(self, now, observed_utc):
+        self.plans.append(now)
+        return False
+
+    def snapshot_check(self, now, observed_utc):
+        self.snapshot_checks.append(now)
+        return CheckResult("history.snapshot", self.snapshot_state, "HIST SNAPSHOT: test", observed_utc,
+                           now + 30, simulated=False)
 
     def stop(self):
         self.stops += 1
@@ -561,7 +574,8 @@ class LoopHistoryTest(unittest.TestCase):
             self.assertEqual(monotonic, measured)  # skutečný monotónní čas měření
             states = {result.id: result.state for result in results}
             self.assertIs(states[CPU_TEMP_ID], State.WARNING)  # vyhodnocený stav, ne surové INFO
-            self.assertNotIn("history.storage", states)  # vlastní kontrola se nepředává
+            self.assertNotIn("history.storage", states)  # vlastní kontroly se nepředávají
+            self.assertNotIn("history.snapshot", states)
 
     def test_history_check_is_in_output_and_results(self):
         clock = FakeClock(stop_at=START + 15)
@@ -571,10 +585,13 @@ class LoopHistoryTest(unittest.TestCase):
         results = run_loop(collector, CONFIG, AlarmEvaluator(AlarmsConfig()), clock=clock, utc_clock=clock.utc,
                            sleep=clock.sleep, output=lines.append, history_link=link)
         collector_calls = collector.calls
-        self.assertEqual(results[-1].id, "history.storage")
+        self.assertEqual([result.id for result in results[-2:]], ["history.storage", "history.snapshot"])
         self.assertIn("HISTORY: test", lines[1])
+        self.assertIn("HIST SNAPSHOT: test", lines[1])
         self.assertIn("SIM ERROR", lines[1])  # celkový stav řádku vidí chybu historie
         self.assertEqual(link.checks, collector_calls)  # kontrola po každém měření
+        self.assertEqual(link.snapshot_checks, collector_calls)
+        self.assertEqual(link.plans, collector_calls)  # plán se vyhodnotí při každém měření
 
     def test_loop_without_history_is_unchanged(self):
         clock = FakeClock(stop_at=START + 25)
@@ -757,6 +774,40 @@ class StartHistoryTest(unittest.TestCase):
         self.assertIn("historie.sqlite3", lines[0])
         self.assertIn("development", lines[0])
         self.assertIn("nikdy nevytváří", lines[0])
+
+    def test_snapshot_note_says_snapshots_are_off(self):
+        lines = []
+        link = FakeLink()
+        with mock.patch("nexusstat.run.open_history", return_value=link):
+            start_history(Config(), output=lines.append)
+        self.assertIn("snímky vypnuté", lines[1])
+
+    def test_snapshot_note_describes_the_daily_plan(self):
+        lines = []
+        link = FakeLink()
+        config = Config(history=HistoryConfig(
+            enabled=True, path="/tmp/h.sqlite3",
+            snapshot=SnapshotConfig(enabled=True, work_dir="/tmp/w", published_dir="/tmp/p",
+                                    daily_time="02:00", timezone="Europe/Prague")))
+        with mock.patch("nexusstat.run.open_history", return_value=link):
+            start_history(config, output=lines.append)
+        self.assertIn("každý den v 02:00 (Europe/Prague)", lines[1])
+        self.assertIn("/tmp/p", lines[1])
+        self.assertIn("nemažou", lines[1])
+
+    def test_snapshot_note_admits_unusable_directories(self):
+        lines = []
+        link = FakeLink()
+        link.snapshot_error = "adresář /tmp/p neexistuje"
+        config = Config(history=HistoryConfig(
+            enabled=True, path="/tmp/h.sqlite3",
+            snapshot=SnapshotConfig(enabled=True, work_dir="/tmp/w", published_dir="/tmp/p",
+                                    daily_time="02:00", timezone="UTC")))
+        with mock.patch("nexusstat.run.open_history", return_value=link):
+            start_history(config, output=lines.append)
+        self.assertIn("nepoužitelné", lines[1])
+        self.assertIn("neexistuje", lines[1])
+        self.assertIn("snímek nevznikne", lines[1])
 
     def test_unavailable_history_keeps_measuring(self):
         lines = []

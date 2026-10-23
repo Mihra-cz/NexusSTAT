@@ -222,11 +222,15 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
             if history_link is not None:
                 # Do historie jdou finální vyhodnocené výsledky se skutečným
                 # monotónním časem měření; zápis probíhá v jiném vlákně, takže
-                # se tu na nic nečeká. Vlastní kontrola historie se do historie
-                # nepředává: její stav se mění podle historie, takže by zápis
+                # se tu na nic nečeká. Vlastní kontroly historie se do historie
+                # nepředávají: jejich stav se mění podle historie, takže by zápis
                 # sám vytvářel další zápisy (zpětná vazba).
                 history_link.record(results, now)
-                results = [*results, history_link.check(now, observed_utc)]
+                # Denní snímek se jen vyžádá (staví ho vlákno zapisovače a
+                # čekající měření mají přednost); smyčka na nic nečeká.
+                history_link.plan_snapshot(now, observed_utc)
+                results = [*results, history_link.check(now, observed_utc),
+                           history_link.snapshot_check(now, observed_utc)]
             if text is None:
                 text = " | ".join(result_text(result) for result in results)
             measurements += 1
@@ -240,6 +244,17 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
         label = "Ctrl+C" if stopper is None else stopper.label
         output(f"\nUkončeno ({label}), počet měření: {measurements}.")
     return results
+
+
+def snapshot_note(config, link):
+    """Jedna věta o stavu denních snímků pro výpis při startu."""
+    settings = config.history.snapshot
+    if not settings.enabled:
+        return "vypnuté ([history.snapshot] enabled = false)."
+    if link.snapshot_error is not None:
+        return f"zapnuté, ale nepoužitelné: {link.snapshot_error}; snímek nevznikne."
+    return (f"každý den v {settings.daily_time} ({settings.timezone}) do {settings.published_dir}; "
+            f"rozpracované v {settings.work_dir}. Staré generace se nemažou.")
 
 
 def start_history(config, output=print_now):
@@ -260,6 +275,7 @@ def start_history(config, output=print_now):
     output(f"Historie: {link.path} (role {HISTORY_ROLE}), zdroj synchronizace hodin: {link.sync_source}. "
            "Databáze se nikdy nevytváří ani nepřepisuje."
            + (f" ({note})" if note else ""))
+    output(f"Historie: snímky {snapshot_note(config, link)}")
     return link
 
 

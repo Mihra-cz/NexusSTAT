@@ -18,16 +18,25 @@ import threading
 import time
 import unittest
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from nexusstat import history, history_link, storage
+from nexusstat import history, history_link, snapshot, storage
 from nexusstat.alarms import AlarmEvaluator
-from nexusstat.config import AlarmRule, AlarmsConfig, CollectorConfig, Config, HistoryConfig
+from nexusstat.config import (
+    AlarmRule,
+    AlarmsConfig,
+    CollectorConfig,
+    Config,
+    HistoryConfig,
+    SnapshotConfig,
+)
 from nexusstat.core import CheckResult, Measurement, State
+from nexusstat.snapshot_plan import SnapshotPlanner
 from nexusstat.history_link import (
     DATA_LOSSES,
+    HISTORY_SNAPSHOT_ID,
     HISTORY_STORAGE_ID,
     HistoryLink,
     _open_writer,
@@ -35,7 +44,9 @@ from nexusstat.history_link import (
     filesystem_type,
     is_network_filesystem,
     open_history,
+    prepare_snapshots,
     resolve_path,
+    snapshot_state,
     storage_result,
     storage_state,
     stop_lines,
@@ -570,6 +581,7 @@ class StorageStateTest(unittest.TestCase):
         result = storage_result(None, observed, 100.0)
         self.assertIs(result.state, State.NA)
         self.assertEqual(dict(result.details), {"state": "off", "time": "off"})
+
 
 
 class StopLinesTest(unittest.TestCase):
@@ -1414,15 +1426,18 @@ class LoopTest(LinkCase):
         link = self.make()
         results = self.loop(link, collectors)
         self.flush(link)
-        self.assertEqual(results[-1].id, HISTORY_STORAGE_ID)
+        self.assertEqual([result.id for result in results[-2:]],
+                         [HISTORY_STORAGE_ID, HISTORY_SNAPSHOT_ID])
         self.assertTrue(any("HISTORY:" in line for line in self.lines))
+        self.assertTrue(any("HIST SNAPSHOT: vypnuto" in line for line in self.lines))
         # Čas vzorku patří ke svému měřicímu cyklu: tři cykly v intervalu 10 s.
         self.assertEqual([row[3] for row in self.samples(CPU_USAGE_ID)],
                          [BASE + index * INTERVAL for index in range(3)])
         self.assertEqual({row[2] for row in self.changes()}, {"synced"})
         # Kontrola historie se do historie nepředává: žádná její změna ani vzorek.
-        self.assertNotIn(HISTORY_STORAGE_ID, {row[0] for row in self.changes()})
-        self.assertNotIn(HISTORY_STORAGE_ID, {row[0] for row in self.samples()})
+        for check_id in (HISTORY_STORAGE_ID, HISTORY_SNAPSHOT_ID):
+            self.assertNotIn(check_id, {row[0] for row in self.changes()})
+            self.assertNotIn(check_id, {row[0] for row in self.samples()})
 
     def test_loop_without_history_is_unchanged(self):
         collectors = RealCollectors(self.collectors())
@@ -1484,3 +1499,426 @@ class LoopTest(LinkCase):
         self.flush(link)
         # Do historie jde finální vyhodnocený stav, ne surové INFO kolektoru.
         self.assertEqual([row[4] for row in self.changes(CPU_TEMP_ID)], ["ERROR"])
+
+
+class SnapshotScanRaceTest(LinkCase):
+    """Souběh úvodního prohledání generací a plánovače (M3.4b-1, review)."""
+
+    def setUp(self):
+        super().setUp()
+        self.work, self.published = self.folder / "snapshot-work", self.folder / "snapshot"
+        self.work.mkdir()
+        self.published.mkdir()
+        self.plan_time = None
+
+    def link_with_plan(self, when=None, sync=None, start=True):
+        """Napojení se zapnutými snímky; plán ve výchozím stavu na aktuální čas."""
+        self.plan_time = f"{self.clock.utc():%H:%M}" if when is None else when
+        settings = SnapshotConfig(enabled=True, work_dir=str(self.work), published_dir=str(self.published),
+                                  daily_time=self.plan_time, timezone="UTC")
+        roots, plan, error = prepare_snapshots(settings)
+        self.assertIsNone(error)
+        worker = HistoryWorker(self.db, "development", HOST, app_version="test", boot_id=BOOT,
+                               interval_s=INTERVAL, monotonic=self.clock.monotonic,
+                               utc_now=self.clock.utc, snapshot_roots=roots)
+        link = HistoryLink(worker, sync if sync is not None else Sync(True), output=self.lines.append,
+                           path=self.db, validity_seconds=VALIDITY, timeout=WAIT,
+                           snapshot_enabled=True, plan=plan)
+        self.links.append(link)
+        if start:
+            link.start()
+            self.assertTrue(worker.wait_until(lambda s: s.state != STARTING, WAIT), worker.status())
+        return link
+
+    def today_generation(self):
+        """Vytvoří platnou dnešní generaci prvním zapisovačem a ten pak zastaví."""
+        link = self.link_with_plan()
+        worker = link.worker
+        for _ in range(3):
+            link.record(self.results(), self.clock.monotonic())
+            self.clock.advance(INTERVAL)
+        self.assertTrue(worker.flush(WAIT))
+        self.assertTrue(worker.request_snapshot())
+        self.assertTrue(worker.wait_until(lambda s: s.maintenance.snapshot.generation is not None, WAIT),
+                        worker.status())
+        name = worker.status().maintenance.snapshot.generation
+        link.stop()
+        return name
+
+    def results(self):
+        observed, expires = self.clock.utc(), self.clock.monotonic() + VALIDITY
+        return [CheckResult(CPU_TEMP_ID, State.INFO, "CPU 50", observed, expires, simulated=False,
+                            measurement=Measurement(50.0, "°C"))]
+
+    def blocked_scan(self):
+        """Zdrží prohledání generací uvnitř souborového I/O, dokud test nepustí."""
+        release, entered = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        real = snapshot.generations
+
+        def slow(root):
+            entered.set()
+            release.wait(WAIT)
+            return real(root)
+
+        return mock.patch.object(snapshot, "generations", slow), release, entered
+
+    def test_planner_waits_for_the_scan_and_then_finds_the_day_done(self):
+        # Start po dnešním plánovaném čase, v adresáři je platný dnešní snímek:
+        # dokud prohledání neskončí, plánovač nic nerozhodne; po něm zjistí, že
+        # je plán dne už splněný, a nic nežádá.
+        name = self.today_generation()
+        self.clock.advance(3600)  # start hodinu po plánovaném čase
+        patch, release, entered = self.blocked_scan()
+        with patch:
+            link = self.link_with_plan(when=self.plan_time)
+            self.assertTrue(entered.wait(WAIT))
+            for _ in range(3):  # tři měřicí cykly, zatímco prohledání visí
+                self.assertFalse(link.plan_snapshot(self.clock.monotonic(), self.clock.utc()))
+                self.clock.advance(INTERVAL)
+            status = link.worker.status().maintenance.snapshot
+            self.assertFalse(status.scanned)
+            self.assertEqual(link.planner.requests, 0)
+            # Nedoložený stav se nehlásí jako chybějící snímek.
+            result = link.snapshot_check(self.clock.monotonic(), self.clock.utc())
+            self.assertIs(result.state, State.UNKNOWN)
+            self.assertIn("nezjistil", result.summary)
+            self.assertFalse(release.is_set())  # hlavní vlákno na prohledání nečekalo
+            release.set()
+        self.assertTrue(link.worker.wait_until(lambda s: s.maintenance.snapshot.scanned, WAIT))
+        self.assertEqual(link.worker.status().maintenance.snapshot.generation, name)
+        self.assertFalse(link.plan_snapshot(self.clock.monotonic(), self.clock.utc()))
+        self.assertEqual(link.planner.requests, 0)  # dnešní plán je splněný
+        self.assertEqual(snapshot.generations(self.published), [name])
+
+    def test_scan_completion_is_required_before_the_first_snapshot(self):
+        # Prázdný adresář: plán se vyhodnotí teprve po doloženém prohledání.
+        patch, release, entered = self.blocked_scan()
+        with patch:
+            link = self.link_with_plan()
+            self.assertTrue(entered.wait(WAIT))
+            self.assertFalse(link.plan_snapshot(self.clock.monotonic(), self.clock.utc()))
+            self.assertEqual(link.planner.requests, 0)
+            release.set()
+        self.assertTrue(link.worker.wait_until(lambda s: s.maintenance.snapshot.scanned, WAIT))
+        self.assertTrue(link.plan_snapshot(self.clock.monotonic(), self.clock.utc()))
+        self.assertEqual(link.planner.requests, 1)
+
+    def test_manual_snapshot_before_the_planned_time_does_not_count(self):
+        """Smysl schváleného pravidla: plán splní jen snímek od plánovaného času dál.
+
+        Ruční snímek **před** plánovaným časem plán nesplní (byl by o celý den
+        starší než plánovaná záloha), ruční snímek **po** něm ano.
+        """
+        later = self.clock.utc() + timedelta(hours=2)
+        link = self.link_with_plan(when=f"{later:%H:%M}")
+        worker = link.worker
+        for _ in range(3):
+            link.record(self.results(), self.clock.monotonic())
+            self.clock.advance(INTERVAL)
+        self.assertTrue(worker.flush(WAIT))
+        self.assertTrue(worker.request_snapshot())  # ruční snímek dvě hodiny před plánem
+        self.assertTrue(worker.wait_until(lambda s: s.maintenance.snapshot.generation is not None, WAIT))
+        early = worker.status().maintenance.snapshot.generation
+        self.clock.advance(2 * 3600)  # plánovaný čas nastal
+        self.assertTrue(link.plan_snapshot(self.clock.monotonic(), self.clock.utc()))
+        self.assertTrue(worker.wait_until(
+            lambda s: s.maintenance.snapshot.generation != early, WAIT), worker.status())
+        self.assertEqual(len(snapshot.generations(self.published)), 2)
+        # Ruční snímek po plánovaném čase už dnešní plán splní.
+        second = SnapshotPlanner(link.planner.plan)
+        self.assertFalse(second.due(self.clock.utc(), worker.status().maintenance.snapshot))
+
+
+class SnapshotUnsyncedTest(LinkCase):
+    """Rozdíl mezi nevyžádaným, odmítnutým a selhaným snímkem (M3.4b-1, review)."""
+
+    def setUp(self):
+        super().setUp()
+        self.work, self.published = self.folder / "snapshot-work", self.folder / "snapshot"
+        self.work.mkdir()
+        self.published.mkdir()
+
+    def link_with_plan(self, sync, when=None):
+        settings = SnapshotConfig(enabled=True, work_dir=str(self.work), published_dir=str(self.published),
+                                  daily_time=f"{self.clock.utc():%H:%M}" if when is None else when,
+                                  timezone="UTC")
+        roots, plan, error = prepare_snapshots(settings)
+        self.assertIsNone(error)
+        worker = HistoryWorker(self.db, "development", HOST, app_version="test", boot_id=BOOT,
+                               interval_s=INTERVAL, monotonic=self.clock.monotonic,
+                               utc_now=self.clock.utc, snapshot_roots=roots)
+        link = HistoryLink(worker, sync, output=self.lines.append, path=self.db,
+                           validity_seconds=VALIDITY, timeout=WAIT, snapshot_enabled=True, plan=plan)
+        self.links.append(link)
+        link.start()
+        self.assertTrue(worker.wait_until(lambda s: s.state != STARTING, WAIT), worker.status())
+        return link
+
+    def results(self):
+        observed, expires = self.clock.utc(), self.clock.monotonic() + VALIDITY
+        return [CheckResult(CPU_TEMP_ID, State.INFO, "CPU 50", observed, expires, simulated=False,
+                            measurement=Measurement(50.0, "°C"))]
+
+    def scanned(self, link):
+        """Počká na doložené prohledání generací (souběh řeší SnapshotScanRaceTest)."""
+        self.assertTrue(link.worker.wait_until(lambda s: s.maintenance.snapshot.scanned, WAIT),
+                        link.worker.status())
+        return link
+
+    def ticks(self, link, count):
+        """Několik měřicích cyklů: záznam, plán, kontrola."""
+        for _ in range(count):
+            link.record(self.results(), self.clock.monotonic())
+            link.plan_snapshot(self.clock.monotonic(), self.clock.utc())
+            self.clock.advance(INTERVAL)
+
+    def test_unsynced_clock_asks_for_nothing_and_writes_no_event(self):
+        # Dlouhý výpadek synchronizace: žádný požadavek a žádná událost,
+        # i když měření běží dál každých 10 s.
+        link = self.scanned(self.link_with_plan(Sync(False)))
+        self.ticks(link, 360)  # hodina měření
+        self.assertEqual(link.planner.requests, 0)
+        self.assertTrue(link.worker.flush(WAIT))
+        self.assertEqual(self.events("history.snapshot_skipped"), [])
+        self.assertEqual(self.events("history.snapshot_failed"), [])
+        self.assertEqual(snapshot.generations(self.published), [])
+        # Prázdný adresář je doložený fakt, ne neznámý stav: hlásí se chybějící
+        # generace (nesynchronizovaný čas to nezakrývá a nic se nevydává za OK).
+        result = link.snapshot_check(self.clock.monotonic(), self.clock.utc())
+        self.assertIs(result.state, State.ERROR)
+        self.assertIn("žádná platná generace", result.summary)
+
+    def test_untrusted_clock_is_audited_once_not_every_measurement(self):
+        """Zdroj hlásí synchronizaci, ale čas systému je nedůvěryhodný.
+
+        Plánovač o snímek požádá, zapisovač ho odmítne a událost o přeskočení
+        vznikne **jednou za plánovaný den**, ne při každém měření. Čas události
+        nese `unsynced`, protože doložený není; umístit ji jde podle
+        monotónního času a `boot_id`.
+        """
+        self.clock.set_utc(WRONG)  # před MIN_TRUSTED_UTC
+        link = self.scanned(self.link_with_plan(Sync(True)))
+        self.ticks(link, 120)  # dvacet minut měření
+        self.assertEqual(link.planner.requests, 1)
+        self.assertTrue(link.worker.flush(WAIT))
+        events = self.events("history.snapshot_skipped")
+        self.assertEqual(len(events), 1)
+        ts, quality, severity, data = events[0]
+        self.assertEqual((quality, severity), ("unsynced", "WARNING"))
+        self.assertEqual(data["reason"], "time_unsynced")
+        self.assertEqual(data["boot_id"], BOOT)
+        self.assertIn("mono", data)
+        self.assertEqual(snapshot.generations(self.published), [])
+        self.assertIn("time:", link.worker.status().maintenance.snapshot.last_error)
+
+    def test_started_snapshot_that_fails_is_audited_differently(self):
+        link = self.scanned(self.link_with_plan(Sync(True)))
+        self.ticks(link, 3)
+        self.assertTrue(link.worker.flush(WAIT))
+
+        def refuse(*args, **kwargs):
+            raise snapshot.SnapshotError("verify", "kopie neprošla kontrolou")
+
+        with mock.patch.object(snapshot, "create", refuse):
+            self.assertTrue(link.worker.request_snapshot())
+            self.assertTrue(link.worker.wait_until(
+                lambda s: s.maintenance.snapshot.failures == 1, WAIT), link.worker.status())
+        self.assertTrue(link.worker.flush(WAIT))
+        self.assertEqual(self.events("history.snapshot_skipped"), [])
+        failed = self.events("history.snapshot_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0][1], "synced")  # čas je doložený, snímek selhal
+        self.assertEqual(failed[0][3]["reason"], "verify")
+
+    def test_recovered_clock_takes_the_next_planned_snapshot(self):
+        # Po obnovení důvěryhodného času se plán splní normálně. Plán je na
+        # hodinu, která nastane v obou obdobích, aby rozhodoval jen čas.
+        plan_time = f"{datetime.fromtimestamp(BASE, timezone.utc):%H:%M}"
+        self.clock.set_utc(WRONG)
+        link = self.scanned(self.link_with_plan(Sync(True), when=plan_time))
+        self.ticks(link, 6)
+        self.assertEqual(snapshot.generations(self.published), [])
+        self.assertEqual(link.planner.requests, 1)  # požádáno, zapisovač odmítl
+        self.clock.set_utc(BASE)  # čas se srovnal
+        self.ticks(link, 6)
+        self.assertTrue(link.worker.wait_until(
+            lambda s: s.maintenance.snapshot.generation is not None, WAIT), link.worker.status())
+        self.assertEqual(len(snapshot.generations(self.published)), 1)
+
+
+class SnapshotSetupTest(LinkCase):
+    """Podsekce [history.snapshot] rozhoduje, zda se snímky vůbec připraví (M3.4b-1)."""
+
+    def dirs(self):
+        work, published = self.folder / "snapshot-work", self.folder / "snapshot"
+        work.mkdir(exist_ok=True)
+        published.mkdir(exist_ok=True)
+        return work, published
+
+    def settings(self, **options):
+        roots = options.pop("roots", None)
+        work, published = self.dirs() if roots is None else roots
+        values = {"enabled": True, "work_dir": str(work), "published_dir": str(published),
+                  "daily_time": "02:00", "timezone": "Europe/Prague"}
+        values.update(options)
+        return SnapshotConfig(**values)
+
+    def config(self, snapshot=None, enabled=True):
+        return Config(history=HistoryConfig(enabled=enabled, path=str(self.db),
+                                            snapshot=snapshot if snapshot is not None else SnapshotConfig()))
+
+    def open(self, config):
+        link = open_history(config, app_version="test", output=self.lines.append, sync=Sync(True),
+                            host_id=HOST, boot_id=BOOT)
+        if link is not None:
+            self.links.append(link)
+        return link
+
+    def test_history_off_means_no_snapshots(self):
+        self.assertIsNone(self.open(self.config(enabled=False)))
+
+    def test_snapshots_off_by_default(self):
+        link = self.open(self.config())
+        self.assertFalse(link.snapshot_enabled)
+        self.assertIsNone(link.planner)
+        self.assertIsNone(link.worker._snapshot_roots)
+        self.assertIsNone(link.snapshot_error)
+        state, text = snapshot_state(None, enabled=False)
+        self.assertIs(state, State.NA)
+
+    def test_enabled_snapshots_get_roots_and_plan(self):
+        work, published = self.dirs()
+        link = self.open(self.config(self.settings(roots=(work, published))))
+        self.assertTrue(link.snapshot_enabled)
+        self.assertIsNone(link.snapshot_error)
+        self.assertEqual(link.worker._snapshot_roots, (work, published))
+        self.assertEqual(link.planner.plan.hour, 2)
+        self.assertEqual(str(link.planner.plan.zone), "Europe/Prague")
+
+    def test_missing_directory_is_never_created(self):
+        work, published = self.dirs()
+        published.rmdir()  # správce ho nevytvořil
+        link = self.open(self.config(self.settings(roots=(work, published))))
+        self.assertIsNotNone(link.snapshot_error)
+        self.assertFalse(published.exists())  # aplikace adresář nezaloží
+        self.assertIsNone(link.worker._snapshot_roots)
+        self.assertIsNone(link.planner)
+        # Historie běží dál, jen snímky nevzniknou a kontrola to hlásí.
+        result = link.snapshot_check(self.clock.monotonic(), self.clock.utc())
+        self.assertIs(result.state, State.ERROR)
+        self.assertIn("snímky nelze připravit", result.summary)
+
+    def test_work_inside_published_is_refused(self):
+        work, published = self.dirs()
+        inside = published / "work"
+        inside.mkdir()
+        link = self.open(self.config(self.settings(roots=(inside, published))))
+        self.assertIsNotNone(link.snapshot_error)
+        self.assertIn("nesmí ležet", link.snapshot_error)
+
+    def test_symlinked_directory_is_refused(self):
+        work, published = self.dirs()
+        link_dir = self.folder / "odkaz"
+        link_dir.symlink_to(published)
+        link = self.open(self.config(self.settings(roots=(work, link_dir))))
+        self.assertIsNotNone(link.snapshot_error)
+
+    def test_prepare_returns_nothing_when_disabled(self):
+        self.assertEqual(prepare_snapshots(SnapshotConfig()), (None, None, None))
+
+
+class SnapshotLoopTest(LinkCase):
+    """Denní snímek v měřicí smyčce od začátku do konce (M3.4b-1)."""
+
+    def setUp(self):
+        super().setUp()
+        self.work, self.published = self.folder / "snapshot-work", self.folder / "snapshot"
+        self.work.mkdir()
+        self.published.mkdir()
+
+    def link_with_plan(self, when=None, **options):
+        """Napojení se zapnutými snímky; čas plánu se bere z aktuálního času."""
+        now = self.clock.utc()
+        plan_time = f"{now:%H:%M}" if when is None else when
+        settings = SnapshotConfig(enabled=True, work_dir=str(self.work), published_dir=str(self.published),
+                                  daily_time=plan_time, timezone="UTC")
+        roots, plan, error = prepare_snapshots(settings)
+        self.assertIsNone(error)
+        worker = HistoryWorker(self.db, "development", HOST, app_version="test", boot_id=BOOT,
+                               interval_s=INTERVAL, monotonic=self.clock.monotonic,
+                               utc_now=self.clock.utc, snapshot_roots=roots, **options)
+        link = HistoryLink(worker, Sync(True), output=self.lines.append, path=self.db,
+                           validity_seconds=VALIDITY, timeout=WAIT, snapshot_enabled=True, plan=plan)
+        self.links.append(link)
+        link.start()
+        self.assertTrue(worker.wait_until(lambda s: s.state != STARTING, WAIT), worker.status())
+        return link
+
+    def loop(self, link, collectors, measurements=3):
+        self.clock.stop_at = self.clock.monotonic() + measurements * INTERVAL
+        return run_loop(collectors, CollectorConfig(), AlarmEvaluator(AlarmsConfig()), clock=self.clock,
+                        utc_clock=self.clock.utc, sleep=self.clock.sleep, output=self.lines.append,
+                        history_link=link)
+
+    def test_planned_snapshot_is_created_once_in_the_loop(self):
+        link = self.link_with_plan()
+        results = self.loop(link, RealCollectors(self.collectors()))
+        worker = link.worker
+        self.assertTrue(worker.wait_until(lambda s: s.maintenance.snapshot.generation is not None, WAIT),
+                        worker.status())
+        self.assertTrue(worker.flush(WAIT))
+        snap = worker.status().maintenance.snapshot
+        # Právě jedna generace a jedna auditní událost; druhý den ještě nenastal.
+        self.assertEqual(snapshot.generations(self.published), [snap.generation])
+        self.assertEqual(len(self.events("history.snapshot")), 1)
+        self.assertEqual(link.planner.requests, 1)
+        self.assertEqual([result.id for result in results[-2:]],
+                         ["history.storage", "history.snapshot"])
+        report = snapshot.check_restore(self.published / snap.generation, role="development", host_id=HOST)
+        self.assertTrue(report.ok, report.problems)
+
+    def test_snapshot_check_turns_info_after_the_snapshot(self):
+        link = self.link_with_plan()
+        self.loop(link, RealCollectors(self.collectors()))
+        worker = link.worker
+        self.assertTrue(worker.wait_until(lambda s: s.maintenance.snapshot.generation is not None, WAIT),
+                        worker.status())
+        result = link.snapshot_check(self.clock.monotonic(), self.clock.utc())
+        self.assertIs(result.state, State.INFO)
+        self.assertIn("poslední snímek", result.summary)
+
+    def test_nothing_happens_before_the_planned_time(self):
+        # Plán je za dvě hodiny: ve smyčce nevznikne žádná generace.
+        later = self.clock.utc() + timedelta(hours=2)
+        link = self.link_with_plan(when=f"{later:%H:%M}")
+        self.loop(link, RealCollectors(self.collectors()))
+        self.assertEqual(snapshot.generations(self.published), [])
+        self.assertEqual(link.planner.requests, 0)
+        result = link.snapshot_check(self.clock.monotonic(), self.clock.utc())
+        self.assertIs(result.state, State.ERROR)  # zapnuté snímky bez jediné generace
+        self.assertIn("žádná platná generace", result.summary)
+
+    def test_generations_are_never_deleted(self):
+        link = self.link_with_plan()
+        self.loop(link, RealCollectors(self.collectors()))
+        worker = link.worker
+        self.assertTrue(worker.wait_until(lambda s: s.maintenance.snapshot.generation is not None, WAIT),
+                        worker.status())
+        first = worker.status().maintenance.snapshot.generation
+        digest = snapshot.sha256_file(self.published / first / snapshot.SNAPSHOT_DB)
+        # Ruční snímek o dvě hodiny později: první generace zůstává nedotčená.
+        self.clock.advance(2 * 3600)
+        self.assertTrue(worker.request_snapshot())
+        self.assertTrue(worker.wait_until(
+            lambda s: s.maintenance.snapshot.generation != first, WAIT), worker.status())
+        second = worker.status().maintenance.snapshot.generation
+        self.assertEqual(snapshot.generations(self.published), sorted([first, second]))
+        self.assertEqual(snapshot.sha256_file(self.published / first / snapshot.SNAPSHOT_DB), digest)
+        self.assertEqual(list(self.work.iterdir()), [])  # rozpracované nic nenechává
+
+    def test_stop_during_the_loop_starts_no_new_snapshot(self):
+        link = self.link_with_plan()
+        link.stop()
+        self.assertFalse(link.plan_snapshot(self.clock.monotonic(), self.clock.utc()))
+        self.assertEqual(snapshot.generations(self.published), [])

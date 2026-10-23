@@ -4,6 +4,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .core import is_finite_number
 
@@ -31,7 +32,8 @@ KNOWN_OLED_KEYS = {
 }
 KNOWN_COLLECTOR_KEYS = {"interval_seconds"}
 KNOWN_NETWORK_KEYS = {"interface"}
-KNOWN_HISTORY_KEYS = {"enabled", "path"}
+KNOWN_HISTORY_KEYS = {"enabled", "path", "snapshot"}
+KNOWN_SNAPSHOT_KEYS = {"enabled", "work_dir", "published_dir", "daily_time", "timezone"}
 KNOWN_RULE_KEYS = {"enabled", "warning", "error", "hysteresis", "confirm_count", "clear_count"}
 
 # Názvy síťových rozhraní, se kterými NexusSTAT pracuje: nejvýš 15 znaků jako
@@ -69,6 +71,11 @@ KNOWN_SECTIONS = {"oled", "collector", "network", "alarms", "history"}
 # Konfigurace roli nenastavuje, takže produkční databázi nelze zapnout omylem
 # ani překlepem; `history` roli production v tomto kroku navíc sama odmítá.
 HISTORY_ROLE = "development"
+
+# Denní čas snímku: jediný jednoznačný zápis "HH:MM" ve 24h formátu, vždy dvě
+# číslice (00:00–23:59). Sekundy se nenastavují (plán na sekundu nemá smysl)
+# a pásmo se zadává výslovně, aby čas neurčovalo prostředí procesu.
+DAILY_TIME = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
 
 # Přípona souboru databáze historie. Stejné pravidlo má .gitignore (*.sqlite3),
 # takže ani omylem zadaná cesta v repozitáři nepůjde zaverzovat.
@@ -230,6 +237,85 @@ class AlarmsConfig:
                 raise ConfigError(f"[alarms.{name}] warning − hysteresis musí být vyšší než {low}")
 
 
+def _check_directory_path(name, value):
+    """Absolutní cesta k adresáři, který už existuje a vytvoří ho jen správce.
+
+    Existence a bezpečnost úložiště se tu nekontrolují (mohou se změnit za
+    běhu): to dělá `snapshot.prepare()` před prvním měřením. Tady jde jen
+    o tvar cesty, aby se omylem nepoužila relativní nebo prázdná.
+    """
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{name} musí být neprázdná cesta k adresáři, ne {value!r}")
+    if "\x00" in value:
+        raise ConfigError(f"{name} nesmí obsahovat nulový bajt")
+    if not value.startswith("/"):
+        raise ConfigError(f"{name} musí být absolutní cesta, ne {value!r}")
+
+
+@dataclass(frozen=True)
+class SnapshotConfig:
+    """Volitelné denní snímky historie jako neměnné generace (M3.4b-1, HISTORY.md 9).
+
+    Výchozí stav je vypnuto a žádná cesta nemá výchozí hodnotu: bez výslovně
+    zadaných adresářů se nic nevytváří ani nezveřejňuje, takže se nelze omylem
+    dostat na produkční cestu Nexusu. Zapnutí vyžaduje oba adresáře, denní
+    hodinu a časové pásmo; adresáře musí už existovat (aplikace je nikdy
+    nevytváří) a ověří se před prvním měřením.
+    """
+
+    enabled: bool = False
+    work_dir: str | None = None  # rozpracované generace (mimo zálohu)
+    published_dir: str | None = None  # zveřejněné generace
+    daily_time: str | None = None  # "HH:MM" v zadaném pásmu, např. "02:00"
+    timezone: str | None = None  # název z databáze pásem, např. "Europe/Prague"
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(f"enabled musí být true nebo false, ne {self.enabled!r}")
+        for name in ("work_dir", "published_dir"):
+            value = getattr(self, name)
+            if value is not None:
+                _check_directory_path(name, value)
+        if self.daily_time is not None:
+            self.daily()  # neplatný čas je chyba konfigurace, ne až běhu
+        if self.timezone is not None:
+            self.zone()  # stejně tak neplatné pásmo
+        if not self.enabled:
+            return
+        missing = [name for name in ("work_dir", "published_dir", "daily_time", "timezone")
+                   if getattr(self, name) is None]
+        if missing:
+            raise ConfigError(f"enabled = true vyžaduje {', '.join(missing)}")
+        # Rozpracované generace nesmí ležet tam, kde zveřejněné: jinak by záloha
+        # viděla nehotovou práci. Skutečné cesty (symlinky, mounty) ověří
+        # snapshot.prepare(); tady se pozná jen shodný zápis.
+        if self.work_dir == self.published_dir:
+            raise ConfigError("work_dir a published_dir musí být různé adresáře")
+
+    def daily(self):
+        """Denní čas jako (hodina, minuta); jiný zápis než "HH:MM" je chyba.
+
+        Striktně dvě číslice, dvojtečka, dvě číslice: "2:00", "02:0", "24:00",
+        "02:60", prázdný řetězec ani čas se sekundami neprojdou. Číslo (např.
+        hodina 2) se také odmítne, aby byl zápis v konfiguraci jednoznačný.
+        """
+        if not isinstance(self.daily_time, str):
+            raise ConfigError(f"daily_time musí být text \"HH:MM\", ne {self.daily_time!r}")
+        match = DAILY_TIME.fullmatch(self.daily_time)
+        if match is None:
+            raise ConfigError(f"daily_time musí být čas \"HH:MM\" v rozsahu 00:00–23:59, ne {self.daily_time!r}")
+        return int(match[1]), int(match[2])
+
+    def zone(self):
+        """Časové pásmo jako ZoneInfo; chybějící databáze pásem je chyba konfigurace."""
+        if not isinstance(self.timezone, str) or not self.timezone:
+            raise ConfigError(f"timezone musí být název časového pásma, ne {self.timezone!r}")
+        try:
+            return ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ConfigError(f"timezone {self.timezone!r} nelze použít: {error}") from None
+
+
 @dataclass(frozen=True)
 class HistoryConfig:
     """Volitelné ukládání měření do SQLite historie (M3.3b-1, docs/HISTORY.md 5).
@@ -245,6 +331,7 @@ class HistoryConfig:
 
     enabled: bool = False
     path: str | None = None
+    snapshot: SnapshotConfig = field(default_factory=SnapshotConfig)
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
@@ -253,6 +340,13 @@ class HistoryConfig:
             self._check_path()
         if self.enabled and self.path is None:
             raise ConfigError("enabled = true vyžaduje path k existující databázi historie")
+        if not isinstance(self.snapshot, SnapshotConfig):
+            raise ConfigError("[history.snapshot] musí být SnapshotConfig")
+        # Snímek vzniká ze spojení vlákna zapisovače: bez zapnuté historie není
+        # co snímat, takže zapnuté snímky nad vypnutou historií jsou chyba, ne
+        # tiše ignorovaná volba.
+        if self.snapshot.enabled and not self.enabled:
+            raise ConfigError("[history.snapshot] enabled = true vyžaduje zapnutou historii")
 
     def _check_path(self):
         if not isinstance(self.path, str) or not self.path:
@@ -308,9 +402,16 @@ def network_config_from_dict(section):
 
 
 def history_config_from_dict(section):
-    """Vytvoří HistoryConfig ze slovníku sekce [history]. Bez sekce i bez klíčů = vypnuto."""
+    """Vytvoří HistoryConfig ze slovníku sekce [history] včetně podsekce [history.snapshot]."""
     _check_section("history", section, KNOWN_HISTORY_KEYS)
-    return HistoryConfig(**section)
+    snapshot_section = section.get("snapshot", {})
+    _check_section("history.snapshot", snapshot_section, KNOWN_SNAPSHOT_KEYS)
+    try:
+        snapshot = SnapshotConfig(**snapshot_section)
+    except ConfigError as error:
+        raise ConfigError(f"[history.snapshot] {error}") from error
+    keys = {name: value for name, value in section.items() if name != "snapshot"}
+    return HistoryConfig(**keys, snapshot=snapshot)
 
 
 def alarms_config_from_dict(section):

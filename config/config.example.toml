@@ -60,6 +60,26 @@ clear_count = 2
 enabled = false
 # path = "/home/uzivatel/.local/state/nexusstat/history.sqlite3"
 
+# Denní snímky historie jako neměnné generace (M3.4b-1). Výchozí stav: vypnuto.
+# Zapnutí vyžaduje VŠECHNY čtyři hodnoty a zapnutou historii; žádná cesta nemá
+# výchozí hodnotu a oba adresáře už musí existovat (aplikace je nevytváří):
+#   work_dir       rozpracované generace, mimo zálohovaný adresář
+#   published_dir  zveřejněné generace `<work_dir>` a `published_dir` musí být
+#                  na stejném souborovém systému a různé; symlink, síťové
+#                  úložiště ani úložiště bez atomického přejmenování se odmítnou
+#   daily_time     denní čas "HH:MM" ve 24h formátu (00:00–23:59), vždy dvě
+#                  číslice; sekundy se nenastavují
+#   timezone       název pásma, např. "Europe/Prague"; nikdy se nedovozuje
+#                  z prostředí procesu
+# Na jeden plánovaný den vznikne nejvýš jeden snímek; zmeškaný dnešní čas se
+# dohání jednou, starší dny nikdy. Staré generace se **nemažou**.
+[history.snapshot]
+enabled = false
+# work_dir = "/home/uzivatel/.local/state/nexusstat/snapshot-work"
+# published_dir = "/home/uzivatel/.local/state/nexusstat/snapshot"
+# daily_time = "02:00"
+# timezone = "Europe/Prague"
+
 # --- Budoucí možnosti: zatím NEIMPLEMENTOVÁNO a nenačítá se ---
 # Nápis na první stránce je pevně NEXUS, hodiny jsou vždy 24h.
 # Symboly na stránce NEXUS (trojúhelník / "?") nelze vypnout.

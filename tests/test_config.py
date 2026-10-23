@@ -15,6 +15,7 @@ from nexusstat.config import (
     HistoryConfig,
     NetworkConfig,
     OledConfig,
+    SnapshotConfig,
     alarms_config_from_dict,
     collector_config_from_dict,
     history_config_from_dict,
@@ -371,6 +372,142 @@ class HistoryConfigTest(unittest.TestCase):
         # Roli nelze konfigurovat, takže produkční databázi nelze otevřít omylem.
         self.assertEqual(HISTORY_ROLE, "development")
         self.assertEqual(HISTORY_SUFFIX, ".sqlite3")
+
+
+class SnapshotSectionTest(unittest.TestCase):
+    """Podsekce [history.snapshot]: výchozí stav vypnuto a striktní validace (M3.4b-1)."""
+
+    def make(self, **options):
+        return SnapshotConfig(**options)
+
+    def enabled(self, **options):
+        values = {"enabled": True, "work_dir": "/var/snapshot-work", "published_dir": "/var/snapshot",
+                  "daily_time": "02:00", "timezone": "Europe/Prague"}
+        values.update(options)
+        return SnapshotConfig(**values)
+
+    def test_defaults_are_off_without_any_path(self):
+        config = SnapshotConfig()
+        self.assertFalse(config.enabled)
+        self.assertIsNone(config.work_dir)
+        self.assertIsNone(config.published_dir)
+        self.assertIsNone(config.daily_time)
+        self.assertIsNone(config.timezone)
+        self.assertEqual(HistoryConfig().snapshot, config)
+
+    def test_enabling_requires_all_values(self):
+        for missing in ("work_dir", "published_dir", "daily_time", "timezone"):
+            with self.subTest(missing=missing):
+                with self.assertRaises(ConfigError) as caught:
+                    self.enabled(**{missing: None})
+                self.assertIn(missing, str(caught.exception))
+
+    def test_paths_must_be_absolute(self):
+        for value in ("snapshot", "", "~/snapshot", "./x"):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError):
+                    self.make(work_dir=value)
+
+    def test_path_with_null_byte_is_refused(self):
+        with self.assertRaises(ConfigError):
+            self.make(published_dir="/var/snap\x00shot")
+
+    def test_work_and_published_must_differ(self):
+        with self.assertRaises(ConfigError):
+            self.enabled(work_dir="/var/snapshot", published_dir="/var/snapshot")
+
+    def test_daily_time_accepts_only_hh_mm(self):
+        for value, parsed in {"00:00": (0, 0), "02:00": (2, 0), "03:15": (3, 15), "23:59": (23, 59)}.items():
+            with self.subTest(value=value):
+                self.assertEqual(self.make(daily_time=value).daily(), parsed)
+
+    def test_invalid_daily_time_is_refused(self):
+        for value in ("24:00", "23:60", "25:30", "-1:00", "02:0", "2:00", "0200", "02.00",
+                      "02:00:00", " 02:00", "02:00 ", "", "ráno", 2, 2.5, True, None if False else "2:5"):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError):
+                    self.make(daily_time=value)
+
+    def test_timezone_must_be_explicit_and_known(self):
+        for value in ("Mars/Olympus", "", 2, "/etc/localtime"):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigError):
+                    self.make(timezone=value)
+        self.assertEqual(str(self.make(timezone="UTC").zone()), "UTC")
+        self.assertEqual(str(self.enabled().zone()), "Europe/Prague")
+
+    def test_values_may_be_prepared_while_disabled(self):
+        # Vypnuté snímky s připravenými hodnotami jsou platná konfigurace.
+        config = self.make(work_dir="/var/w", published_dir="/var/p", daily_time="03:15", timezone="UTC")
+        self.assertFalse(config.enabled)
+
+    def test_snapshots_need_history_enabled(self):
+        with self.assertRaises(ConfigError) as caught:
+            HistoryConfig(enabled=False, snapshot=self.enabled())
+        self.assertIn("zapnutou historii", str(caught.exception))
+        # Se zapnutou historií je stejná podsekce v pořádku.
+        config = HistoryConfig(enabled=True, path="/tmp/h.sqlite3", snapshot=self.enabled())
+        self.assertTrue(config.snapshot.enabled)
+
+    def test_unknown_keys_are_refused(self):
+        with self.assertRaises(ConfigError) as caught:
+            history_config_from_dict({"snapshot": {"enabled": False, "hour": 2}})
+        self.assertIn("history.snapshot", str(caught.exception))
+        self.assertIn("hour", str(caught.exception))
+
+    def test_section_must_be_a_table(self):
+        with self.assertRaises(ConfigError):
+            history_config_from_dict({"snapshot": 2})
+
+    def test_errors_name_the_section(self):
+        with self.assertRaises(ConfigError) as caught:
+            history_config_from_dict({"snapshot": {"daily_time": "99:99"}})
+        self.assertIn("[history.snapshot]", str(caught.exception))
+
+
+class SnapshotFileTest(unittest.TestCase):
+    """Načtení [history.snapshot] z TOML (M3.4b-1)."""
+
+    def load_text(self, text):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(text, encoding="utf-8")
+            return load_config(path)
+
+    def test_full_section_from_file(self):
+        config = self.load_text(
+            "[history]\nenabled = true\npath = \"/var/lib/h.sqlite3\"\n\n"
+            "[history.snapshot]\nenabled = true\nwork_dir = \"/var/lib/snapshot-work\"\n"
+            "published_dir = \"/var/lib/snapshot\"\ndaily_time = \"03:15\"\ntimezone = \"Europe/Prague\"\n")
+        snapshot = config.history.snapshot
+        self.assertTrue(snapshot.enabled)
+        self.assertEqual(snapshot.work_dir, "/var/lib/snapshot-work")
+        self.assertEqual(snapshot.published_dir, "/var/lib/snapshot")
+        self.assertEqual((snapshot.daily_time, snapshot.timezone), ("03:15", "Europe/Prague"))
+        self.assertEqual(snapshot.daily(), (3, 15))
+
+    def test_missing_section_keeps_snapshots_off(self):
+        config = self.load_text("[history]\nenabled = false\n")
+        self.assertFalse(config.history.snapshot.enabled)
+
+    def test_invalid_section_stops_before_measuring(self):
+        # Neplatná konfigurace je chyba načtení, ne až chyba při běhu.
+        for text in ("[history.snapshot]\nenabled = true\n",
+                     "[history]\nenabled = false\n\n[history.snapshot]\nenabled = true\n"
+                     "work_dir = \"/a\"\npublished_dir = \"/b\"\ndaily_time = \"02:00\"\ntimezone = \"UTC\"\n",
+                     "[history.snapshot]\ndaily_time = \"25:00\"\n",
+                     "[history.snapshot]\ndaily_time = 2\n",
+                     "[history.snapshot]\ntimezone = \"Nowhere/Nothing\"\n",
+                     "[history.snapshot]\nwork_dir = \"relativni\"\n"):
+            with self.subTest(text=text):
+                with self.assertRaises(ConfigError):
+                    self.load_text(text)
+
+    def test_example_config_keeps_snapshots_off(self):
+        snapshot = load_config(EXAMPLE_CONFIG).history.snapshot
+        self.assertFalse(snapshot.enabled)
+        self.assertIsNone(snapshot.work_dir)
+        self.assertIsNone(snapshot.published_dir)
 
 
 class LoadFileTest(unittest.TestCase):

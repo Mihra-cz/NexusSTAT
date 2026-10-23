@@ -8,6 +8,7 @@ Chyby SQLite se vyvolávají ve vlákně zapisovače obalem spojení nebo skute�
 (zámek jiného spojení, max_page_count, práva souboru).
 """
 
+import errno
 import hashlib
 import json
 import math
@@ -28,6 +29,7 @@ from pathlib import Path
 
 from nexusstat import history, snapshot
 from nexusstat.core import CheckResult, Measurement, State
+from nexusstat.history_link import snapshot_state
 from nexusstat import history_worker
 from nexusstat.history_worker import (
     AGGREGATION_INTERVAL_SECONDS,
@@ -231,6 +233,20 @@ class WorkerTest(unittest.TestCase):
         worker.wake()
         time.sleep(0.05)  # dát vláknu příležitost (kdyby chybně zapsalo, je to vidět)
         self.assertEqual(worker.status().commits, commits)
+
+    def roots(self):
+        """Adresáře generací snímků v dočasném adresáři testu."""
+        work, published = self.folder / "snapshot-work", self.folder / "snapshot"
+        work.mkdir(exist_ok=True)
+        published.mkdir(exist_ok=True)
+        return work, published
+
+    def fill(self, worker, count=30):
+        """Zapíše několik měření, aby měl snímek co kopírovat."""
+        for _ in range(count):
+            self.submit(worker)
+            self.clock.advance(10)
+        self.assertTrue(worker.flush(WAIT), worker.status())
 
     def query(self, sql, params=()):
         with history.open_reader(self.db) as reader:
@@ -1223,18 +1239,6 @@ class StarvationTest(WorkerTest):
 
 class SnapshotWorkerTest(WorkerTest):
     """Snímky staví výhradně vlákno zapisovače (M3.4a)."""
-
-    def roots(self):
-        work, published = self.folder / "snapshot-work", self.folder / "snapshot"
-        work.mkdir(exist_ok=True)
-        published.mkdir(exist_ok=True)
-        return work, published
-
-    def fill(self, worker, count=30):
-        for _ in range(count):
-            self.submit(worker)
-            self.clock.advance(10)
-        self.assertTrue(worker.flush(WAIT), worker.status())
 
     def test_without_roots_no_snapshot_is_requested(self):
         worker = self.make()
@@ -2247,6 +2251,308 @@ now[0] += 10
 worker.submit(result(), now[0], True)  # nezapsané měření
 os._exit(81)  # pád procesu bez stop()
 """
+
+
+class SnapshotStartupTest(WorkerTest):
+    """Obnova stavu snímků po restartu procesu (M3.4b-1, HISTORY.md 9.3).
+
+    Vlákno zapisovače jednou za běh přečte adresář generací a najde poslední
+    prokazatelně platnou; hlavní vlákno adresář nečte nikdy.
+    """
+
+    def snap(self, worker, previous=None):
+        """Vyžádá snímek a vrátí stav po jeho dokončení (čeká na novou generaci)."""
+        self.assertTrue(worker.request_snapshot())
+        self.settle(worker, lambda s: s.maintenance.snapshot.generation not in (None, previous),
+                    "čekám na snímek")
+        return worker.status().maintenance.snapshot
+
+    def scanned(self, worker):
+        self.settle(worker, lambda s: s.maintenance.snapshot.scanned, "čekám na prohledání generací")
+        return worker.status().maintenance.snapshot
+
+    def restore_mode(self, path):
+        """Vrátí práva adresáře, aby šel uklidit (pojistka i při selhání testu)."""
+        try:
+            os.chmod(path, 0o755)
+        except OSError:
+            pass
+
+    def restart(self, roots):
+        """Zavře zapisovač a spustí nový nad stejnými adresáři (nový proces by udělal totéž)."""
+        self.workers[-1].stop(timeout=WAIT)
+        return self.make(snapshot_roots=roots)
+
+    def test_last_valid_generation_is_found_after_restart(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        first = self.snap(worker)
+        status = self.scanned(self.restart((work, published)))
+        self.assertEqual(status.generation, first.generation)
+        self.assertEqual(status.utc, first.utc)  # čas z ověřeného záznamu generace
+        self.assertEqual(status.bytes, first.bytes)
+        self.assertEqual((status.generations, status.invalid), (1, 0))
+        self.assertIsNone(status.scan_error)
+
+    def test_partial_directory_is_never_a_valid_generation(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        first = self.snap(worker)
+        # Rozpracovaná generace se "najde" jen jako adresář, ne jako generace.
+        partial = published / f".{first.generation}.partial"
+        partial.mkdir()
+        for name in (snapshot.SNAPSHOT_DB, snapshot.SNAPSHOT_RECORD):
+            (partial / name).write_bytes((published / first.generation / name).read_bytes())
+        (published / first.generation / snapshot.SNAPSHOT_RECORD).unlink()  # platná už není
+        status = self.scanned(self.restart((work, published)))
+        self.assertEqual(status.generations, 1)  # jen jméno generace, nikdy .partial
+        self.assertIsNone(status.utc)
+        self.assertEqual(status.invalid, 1)
+        self.assertTrue(partial.is_dir())  # nic se nemaže
+
+    def test_damaged_newer_generation_stays_traceable(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        older = self.snap(worker)
+        self.clock.advance(120)
+        newer = self.snap(worker, older.generation)
+        self.assertNotEqual(older.generation, newer.generation)
+        digest = snapshot.sha256_file(published / older.generation / snapshot.SNAPSHOT_DB)
+        (published / newer.generation / snapshot.SNAPSHOT_RECORD).write_text("{", encoding="utf-8")
+        new_worker = self.restart((work, published))
+        status = self.scanned(new_worker)
+        # Použije se starší platná generace, poškozená novější zůstane dohledatelná.
+        self.assertEqual(status.generation, older.generation)
+        self.assertEqual(status.utc, older.utc)
+        self.assertEqual((status.generations, status.invalid), (2, 1))
+        self.assertEqual(status.invalid_name, newer.generation)
+        self.assertTrue(new_worker.flush(WAIT))
+        events = self.events("history.snapshot_invalid")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][2], "WARNING")
+        self.assertEqual(events[0][3]["generations"], [newer.generation])
+        self.assertEqual(events[0][3]["used"], older.generation)
+        # Starší generace se nepřepsala ani nesmazala a obě jsou pořád na místě.
+        self.assertEqual(snapshot.sha256_file(published / older.generation / snapshot.SNAPSHOT_DB), digest)
+        self.assertEqual(snapshot.generations(published), sorted([older.generation, newer.generation]))
+
+    def test_unreadable_generation_directory_is_not_an_empty_one(self):
+        """Chyba čtení adresáře generací nesmí vypadat jako prázdný adresář."""
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        first = self.snap(worker)
+        self.workers[-1].stop(timeout=WAIT)
+        self.addCleanup(self.restore_mode, published)
+        os.chmod(published, 0o000)
+        new_worker = self.make(snapshot_roots=(work, published))
+        self.settle(new_worker, lambda s: s.maintenance.snapshot.scan_error is not None,
+                    "čekám na chybu čtení adresáře")
+        status = new_worker.status().maintenance.snapshot
+        self.assertIn("path", status.scan_error)
+        # Stav zůstává nedoložený: plánovač se nemá o co opřít a diagnostika
+        # hlásí chybu úložiště, ne chybějící snímek.
+        self.assertFalse(status.scanned)
+        self.assertEqual((status.generations, status.invalid), (0, 0))
+        self.assertIsNone(status.utc)
+        state, text = snapshot_state(new_worker.status(), enabled=True, now_utc=BASE)
+        self.assertIs(state, State.ERROR)
+        self.assertIn("nelze přečíst", text)
+        self.assertNotIn("žádná platná generace", text)
+        # Po odstupu se pokus zopakuje a po opravě práv najde platnou generaci.
+        self.restore_mode(published)
+        self.advance(new_worker, history_worker.SCAN_RETRY_SECONDS)
+        self.settle(new_worker, lambda s: s.maintenance.snapshot.scanned, "čekám na opakované prohledání")
+        status = new_worker.status().maintenance.snapshot
+        self.assertEqual(status.generation, first.generation)
+        self.assertIsNone(status.scan_error)
+
+    def test_unreadable_generation_is_invalid_not_a_scan_failure(self):
+        # Jedna nečitelná generace nesmí zablokovat celé prohledání.
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        older = self.snap(worker)
+        self.clock.advance(120)
+        newer = self.snap(worker, older.generation)
+        self.workers[-1].stop(timeout=WAIT)
+        broken = published / newer.generation
+        self.addCleanup(self.restore_mode, broken)
+        os.chmod(broken, 0o000)
+        status = self.scanned(self.make(snapshot_roots=(work, published)))
+        self.assertIsNone(status.scan_error)  # adresář generací se přečíst dal
+        self.assertEqual((status.generations, status.invalid), (2, 1))
+        self.assertEqual(status.invalid_name, newer.generation)
+        self.assertEqual(status.generation, older.generation)
+
+    def test_generation_belongs_to_the_moment_the_attempt_started(self):
+        """Kopie přes půlnoc nezmění den, kterému snímek patří.
+
+        Jméno generace i `snapshot_utc` jsou časem **začátku** pokusu, takže
+        snímek zahájený ve 23:59:30 zůstává snímkem svého dne, i když se
+        zveřejní až po půlnoci (plánovač pak nevynechá další den, 9.2).
+        """
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        start = int(datetime(2027, 1, 15, 23, 59, 30, tzinfo=timezone.utc).timestamp())
+        self.clock.set_utc(start)
+        real = snapshot.copy_database
+
+        def slow_copy(connection, target, moment, pages=None, progress=None):
+            self.clock.advance(60)  # kopírování přeteče do dalšího dne
+            return real(connection, target, moment, pages, progress)
+
+        with mock.patch.object(snapshot, "copy_database", slow_copy):
+            status = self.snap(worker)
+        self.assertEqual(status.utc, start)
+        self.assertEqual(status.generation, "20270115T235930Z")
+        self.assertEqual(snapshot.generations(published), ["20270115T235930Z"])
+        generation = snapshot.load_generation(published / status.generation)
+        self.assertEqual(generation.record.snapshot_utc, start)
+        # Čas dokončení je jiný den, ale v záznamu ani ve jménu se neobjeví.
+        self.assertGreater(self.clock.utc().timestamp(), start + 30)
+
+    def test_failed_attempt_keeps_the_known_generation(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        first = self.snap(worker)
+
+        def refuse(*args, **kwargs):
+            raise snapshot.SnapshotError("verify", "kopie neprošla kontrolou")
+
+        with mock.patch.object(snapshot, "create", refuse):
+            self.assertTrue(worker.request_snapshot())
+            self.settle(worker, lambda s: s.maintenance.snapshot.failures == 1, "čekám na selhání")
+        status = worker.status().maintenance.snapshot
+        self.assertEqual(status.generation, first.generation)  # informace o platném snímku zůstala
+        self.assertEqual(status.utc, first.utc)
+        self.assertIn("verify", status.last_error)
+        self.assertEqual(snapshot.generations(published), [first.generation])
+
+    def test_missing_live_database_is_never_created(self):
+        work, published = self.roots()
+        for path in (self.db, *history.companion_paths(self.db)):
+            if path.exists():
+                path.unlink()
+        worker = self.make(snapshot_roots=(work, published),
+                           opener=lambda: history.open_writer(self.db, "test", HOST))
+        self.settle(worker, lambda s: s.error_kind is not None, "čekám na odmítnutí chybějící databáze")
+        self.assertFalse(self.db.exists())  # aplikace databázi nikdy nezaloží
+        self.assertEqual(snapshot.generations(published), [])
+
+
+class SnapshotAuditTest(WorkerTest):
+    """Auditní události o snímcích (M3.4b-1, HISTORY.md 9.2 krok 8)."""
+
+    def test_successful_snapshot_is_audited(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        self.assertTrue(worker.request_snapshot())
+        self.settle(worker, lambda s: s.maintenance.snapshot.generation is not None, "čekám na snímek")
+        self.assertTrue(worker.flush(WAIT))
+        events = self.events("history.snapshot")
+        self.assertEqual(len(events), 1)
+        ts, quality, severity, data = events[0]
+        status = worker.status()
+        snap = status.maintenance.snapshot
+        self.assertEqual((quality, severity), ("synced", "INFO"))
+        self.assertEqual(data["generation"], snap.generation)
+        self.assertEqual(data["bytes"], snap.bytes)
+        self.assertEqual(data["snapshot_utc"], snap.utc)
+        # Zveřejnění a potvrzení události jsou dva různé údaje.
+        self.assertIsNotNone(snap.event_seq)
+        self.assertGreaterEqual(status.confirmed_seq, snap.event_seq)
+
+    def test_failed_snapshot_is_audited_and_writing_continues(self):
+        """Výpadek disku při snímku nesmí zastavit zápis historie (nález M3.4b-1)."""
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        commits = worker.status().commits
+
+        def no_space(*args, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(snapshot, "create", no_space):
+            self.assertTrue(worker.request_snapshot())
+            self.settle(worker, lambda s: s.maintenance.snapshot.failures == 1, "čekám na selhání snímku")
+        status = worker.status()
+        self.assertEqual(status.state, RUNNING)  # zapisovač běží dál
+        self.assertIsNone(status.error_kind)
+        self.assertIn("io", status.maintenance.snapshot.last_error)
+        self.clock.advance(10)
+        self.submit(worker, temp_state=State.WARNING, temp=75.0)
+        self.assertTrue(worker.flush(WAIT))  # měření se dál zapisuje
+        self.assertGreater(worker.status().commits, commits)
+        events = self.events("history.snapshot_failed")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][2], "ERROR")
+        self.assertEqual(events[0][3]["reason"], "io")
+        self.assertEqual(snapshot.generations(published), [])
+
+    def test_skipped_snapshot_is_audited(self):
+        work, published = self.roots()
+        self.clock.set_utc(WRONG)
+        worker = self.make(snapshot_roots=(work, published), synced=False)
+        self.assertTrue(worker.request_snapshot())
+        self.settle(worker, lambda s: s.maintenance.snapshot.last_error is not None, "čekám na přeskočení")
+        self.clock.set_utc(BASE)
+        self.submit(worker)
+        self.assertTrue(worker.flush(WAIT))
+        events = self.events("history.snapshot_skipped")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][2], "WARNING")
+        self.assertEqual(events[0][3]["reason"], "time_unsynced")
+        self.assertEqual(snapshot.generations(published), [])
+
+    def test_stopped_snapshot_is_audited_as_cancelled(self):
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker, 60)
+        entered = threading.Event()
+        real = snapshot.copy_database
+
+        def slow_copy(connection, target, moment, pages=None, progress=None):
+            entered.set()
+            time.sleep(0.2)  # dost času, aby mezitím přišlo stop()
+            return real(connection, target, moment, 1, progress)
+
+        with mock.patch.object(snapshot, "copy_database", slow_copy):
+            self.assertTrue(worker.request_snapshot())
+            self.assertTrue(entered.wait(WAIT))
+            report = worker.stop(timeout=WAIT)
+        self.assertTrue(report.completed, report)
+        events = self.events("history.snapshot_stopped")
+        self.assertEqual(len(events), 1)  # poslední zápis při stop() událost dopíše
+        self.assertEqual(events[0][2], "INFO")
+        self.assertEqual(snapshot.generations(published), [])
+
+    def test_published_generation_survives_an_unwritten_event(self):
+        """Selhání zápisu události není selhání už zveřejněné generace."""
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker)
+        self.faults.add(lambda sql: sql.lstrip().startswith("INSERT INTO event"),
+                        fail(sqlite_error(sqlite3.OperationalError, "SQLITE_IOERR", "disk I/O error")), times=1)
+        self.assertTrue(worker.request_snapshot())
+        self.settle(worker, lambda s: s.error_kind == "io", "čekám na selhání zápisu události")
+        snap = worker.status().maintenance.snapshot
+        status = worker.status()
+        # Generace leží na disku a diagnostika ji zná, i když událost čeká.
+        self.assertEqual(snapshot.generations(published), [snap.generation])
+        self.assertIsNotNone(snap.utc)
+        self.assertEqual(snap.failures, 0)
+        self.assertLess(status.confirmed_seq, snap.event_seq)
+        self.assertFalse(self.events("history.snapshot"))
+        self.advance(worker, 60)  # po odstupu se událost dopíše
+        self.settle(worker, lambda s: s.confirmed_seq >= snap.event_seq, "čekám na potvrzení události")
+        self.assertEqual(len(self.events("history.snapshot")), 1)
 
 
 def _doc_block(name):

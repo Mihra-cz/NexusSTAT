@@ -16,7 +16,7 @@ Agregaci ani retenci tento krok nespouští (M3.3b-2).
 import math
 from pathlib import Path
 
-from . import clock_sync, history, history_worker
+from . import clock_sync, history, history_worker, snapshot, snapshot_plan
 from .config import HISTORY_ROLE
 from .core import CheckResult, State
 # Jediná definice kontrol cest a úložiště je ve storage.py (používá je i snapshot.py);
@@ -34,7 +34,14 @@ from .storage import (  # noqa: F401
 from .history_worker import DEGRADED, FAILED, STARTING, STOPPED, MAX_RESULT_BYTES, HistoryWorker
 
 HISTORY_STORAGE_ID = "history.storage"
+HISTORY_SNAPSHOT_ID = "history.snapshot"
 LABEL = "HISTORY"  # krátký název pro STATUS a displej (docs/HISTORY.md 8)
+SNAPSHOT_LABEL = "HIST SNAPSHOT"
+
+# Stáří posledního snímku podle docs/HISTORY.md 9.3. Hranice jsou včetně:
+# přesně 26 h je ještě INFO, přesně 50 h ještě WARNING.
+SNAPSHOT_INFO_SECONDS = 26 * 3600
+SNAPSHOT_WARNING_SECONDS = 50 * 3600
 STOP_TIMEOUT_SECONDS = history_worker.STOP_TIMEOUT_SECONDS
 
 # Druhy ztrát, při kterých data skutečně zmizela. Zkrácený text mezi ně nepatří:
@@ -156,6 +163,98 @@ def storage_state(status, *, queue_full=False, stalled=False, time_synced=None, 
                         f"{pending}; údržba: {maintenance}")
 
 
+def _hours(seconds):
+    return f"{seconds / 3600:.1f} h"
+
+
+def _snapshot_notes(snap, status, plan_failures):
+    """Rozdělí údaje na doložené závady a na informace, které jen patří do textu.
+
+    Závada zhoršuje stav (poškozená generace v adresáři, selhávající
+    plánování). Nepotvrzená auditní událost závada není: v běžném provozu se
+    zapíše s další dávkou a zveřejněná generace na ní nezávisí.
+    """
+    problems, notes = [], []
+    if snap.invalid:
+        # Starší platná generace se použít smí, ale poškození novější se nesmí ztratit.
+        problems.append(f"neověřitelné generace: {snap.invalid} (nejnovější {snap.invalid_name})")
+    if plan_failures:
+        problems.append(f"plánování snímku selhalo ({plan_failures}×)")
+    if snap.event_seq is not None and status is not None and status.confirmed_seq < snap.event_seq:
+        notes.append("událost o snímku zatím není potvrzená v databázi")
+    return problems, notes
+
+
+def snapshot_state(status, *, enabled, now_utc=None, prepare_error=None, plan_failures=0, next_run=None):
+    """Stav a popis kontroly `history.snapshot` (docs/HISTORY.md 9.3).
+
+    Počítá se jen z neměnného snímku stavu v paměti: hlavní vlákno kvůli
+    diagnostice neotevírá SQLite ani nečte adresář generací. Stáří roste i
+    tehdy, když se žádný pokus nespustí (zaseknutý zapisovač), protože se
+    počítá od času posledního úspěšného snímku, ne od posledního pokusu.
+    UNKNOWN se používá jen tam, kde se stáří ani stav doložit nedá, a nikdy
+    nepřekryje doloženou závadu.
+    """
+    if not enabled:
+        return State.NA, "vypnuto"  # záměrně vypnuté snímky, ne závada
+    if prepare_error is not None:
+        # Snímky jsou zapnuté, ale adresáře nelze použít: nic nevznikne.
+        return State.ERROR, f"snímky nelze připravit: {prepare_error}"
+    if status is None:
+        return State.UNKNOWN, "stav zapisovače historie není k dispozici"
+    snap = status.maintenance.snapshot
+    problems, notes = _snapshot_notes(snap, status, plan_failures)
+    plan = "" if next_run is None else f"; příští plán {next_run:%Y-%m-%d %H:%M} UTC"
+    extra = ("; " + ", ".join(problems + notes)) if problems or notes else ""
+    if snap.scan_error is not None:
+        return State.ERROR, f"adresář generací nelze přečíst ({snap.scan_error}){extra}"
+    if snap.scanned and snap.utc is None:
+        return State.ERROR, f"žádná platná generace snímku{extra}"
+    age = None
+    if snap.utc is not None and now_utc is not None and status.time_base == "synced":
+        age = now_utc - snap.utc
+    last = "" if snap.generation is None else f", poslední {snap.generation}"
+    if age is not None and age < 0:
+        # Čas snímku je v budoucnosti: hodiny se posunuly zpět. Netvrdí se, že
+        # je snímek aktuální, ani že chybí.
+        return State.WARNING, (f"čas posledního snímku je {_hours(-age)} v budoucnosti{last}; "
+                               f"hodiny se posunuly zpět{extra}")
+    if snap.failures:
+        # Doložený neúspěšný pokus: WARNING, dokud je předchozí snímek ještě
+        # použitelný, jinak ERROR. Neznámé stáří závadu nepřekrývá.
+        reason = f"poslední pokus o snímek selhal ({snap.failures}×: {snap.last_error})"
+        if age is None:
+            return State.WARNING, f"{reason}; stáří snímku nelze určit{last}{extra}{plan}"
+        if age > SNAPSHOT_WARNING_SECONDS:
+            return State.ERROR, f"{reason}; snímek je {_hours(age)} starý{last}{extra}"
+        return State.WARNING, f"{reason}; snímek je {_hours(age)} starý{last}{extra}{plan}"
+    if age is None:
+        if not snap.scanned:
+            return State.UNKNOWN, f"zapisovač zatím nezjistil existující generace{extra}"
+        return State.UNKNOWN, (f"stáří snímku nelze určit (čas není doložený){last}{extra}")
+    if age > SNAPSHOT_WARNING_SECONDS:
+        return State.ERROR, f"poslední snímek je {_hours(age)} starý (nad 50 h){last}{extra}"
+    if age > SNAPSHOT_INFO_SECONDS:
+        return State.WARNING, f"poslední snímek je {_hours(age)} starý (nad 26 h){last}{extra}{plan}"
+    if problems:
+        # Aktuální snímek s poškozenou novější generací není v pořádku.
+        return State.WARNING, f"poslední snímek je {_hours(age)} starý{last}{extra}{plan}"
+    return State.INFO, f"poslední snímek je {_hours(age)} starý{last}{extra}{plan}"
+
+
+def snapshot_result(status, observed_utc, expires_monotonic, **state_args):
+    """CheckResult kontroly `history.snapshot` ze snímku stavu (bez SQLite).
+
+    Stejně jako `history.storage` se tento výsledek do historie nikdy
+    nepředává: jeho stav se mění podle stavu snímků, takže by se kontrola
+    zapisovala do vlastní historie (zpětná vazba, docs/HISTORY.md 9.3).
+    """
+    state, text = snapshot_state(status, **state_args)
+    details = {"snapshots": "off" if state is State.NA else "on"}
+    return CheckResult(HISTORY_SNAPSHOT_ID, state, f"{SNAPSHOT_LABEL}: {text}", observed_utc,
+                       expires_monotonic, simulated=False, details=details)
+
+
 def _aggregation_lag(status, now_utc):
     """Zpoždění hranice hotových 5min oken za aktuálním časem, nebo None.
 
@@ -224,13 +323,20 @@ class HistoryLink:
     """
 
     def __init__(self, worker, sync=None, *, output=print, path=None,
-                 validity_seconds=None, timeout=STOP_TIMEOUT_SECONDS):
+                 validity_seconds=None, timeout=STOP_TIMEOUT_SECONDS,
+                 snapshot_enabled=False, plan=None, snapshot_error=None):
         self.worker = worker
         self.sync = sync if sync is not None else clock_sync.ClockSync()
         self.path = path
         self.validity_seconds = validity_seconds
         self.timeout = timeout
         self.submit_failures = 0
+        # Snímky historie (M3.4b-1): `plan` je denní plán z konfigurace,
+        # `snapshot_error` důvod, proč je zapnuté snímky nelze připravit.
+        self.snapshot_enabled = snapshot_enabled
+        self.snapshot_error = snapshot_error
+        self.planner = None if plan is None else snapshot_plan.SnapshotPlanner(plan)
+        self.plan_failures = 0
         self._output = output
         self._synced = None
         self._started = False
@@ -300,6 +406,55 @@ class HistoryLink:
                               time_synced=self._synced, submit_failures=self.submit_failures,
                               source=self.sync_source, now_utc=math.floor(observed_utc.timestamp()),
                               snapshot_running=snapshot_running)
+
+    def plan_snapshot(self, now, observed_utc):
+        """Požádá o denní snímek, když nastal plánovaný čas; vrací True při požádání.
+
+        Rozhoduje se jen z doloženě synchronizovaného času (`None` ani `False`
+        nestačí) a jen z neměnného snímku stavu: hlavní vlákno nečte SQLite ani
+        adresáře. Snímek sám staví vlákno zapisovače a čekající měření mají
+        přednost; při ukončování se nový snímek nezačíná (`request_snapshot`
+        po `stop()` odmítne a plán se nepovažuje za vyřízený).
+        """
+        if self.planner is None or self._stopped or self._synced is not True:
+            return False
+        try:
+            status = self.worker.status()
+            if not self.planner.due(observed_utc, status.maintenance.snapshot):
+                return False
+            if not self.worker.request_snapshot():
+                return False
+            self.planner.note_requested(observed_utc)
+            self._output(f"Historie: vyžádán denní snímek (plán {self.planner.attempted:%Y-%m-%d %H:%M} UTC).")
+            return True
+        except Exception as error:
+            # Plánování nesmí zastavit měření; selhání se započítá a ohlásí.
+            self.plan_failures += 1
+            if self.plan_failures == 1:
+                self._output(f"Historie: plánování snímku selhalo ({type(error).__name__}: {error}); "
+                             "měření pokračuje.")
+            return False
+
+    def snapshot_check(self, now, observed_utc):
+        """Kontrola `history.snapshot` ze snímku stavu zapisovače."""
+        expires = now + (self.validity_seconds or 0)
+        try:
+            status = None if not self.snapshot_enabled else self.worker.status()
+            next_run = self._next_run(status, observed_utc)
+        except Exception as error:
+            return CheckResult(HISTORY_SNAPSHOT_ID, State.UNKNOWN,
+                               f"{SNAPSHOT_LABEL}: stav snímků nelze přečíst "
+                               f"({type(error).__name__}: {error})", observed_utc, expires, simulated=False)
+        return snapshot_result(status, observed_utc, expires, enabled=self.snapshot_enabled,
+                               now_utc=math.floor(observed_utc.timestamp()),
+                               prepare_error=self.snapshot_error, plan_failures=self.plan_failures,
+                               next_run=next_run)
+
+    def _next_run(self, status, observed_utc):
+        """Čas příštího plánovaného snímku, nebo None (bez plánu či bez doloženého času)."""
+        if self.planner is None or status is None or self._synced is not True:
+            return None
+        return self.planner.next_run(observed_utc, status.maintenance.snapshot)
 
     def _stalled(self, status, now):
         """True, když se nejstarší nepotvrzená zapisovatelná práce dlouho nepotvrdila.
@@ -382,23 +537,50 @@ def _open_writer(path, host_id, mounts=None):
     return database
 
 
-def open_history(config, *, app_version, output=print, sync=None, host_id=None, boot_id=None, opener=None):
+def prepare_snapshots(settings, mounts=None):
+    """Ověří adresáře snímků podle `[history.snapshot]`; vrací (roots, plan, chyba).
+
+    Volá se **před prvním měřením**, aby se neplatné nastavení poznalo hned a
+    aby se nic nevytvářelo: adresáře musí už existovat (`snapshot.prepare`
+    kontroluje symlinky, lokální úložiště, shodný souborový systém a atomické
+    zveřejnění). Vypnuté snímky vrací (None, None, None); nepoužitelné
+    adresáře nezastaví historii, jen se nic nesnímá a kontrola to ohlásí.
+    """
+    if not settings.enabled:
+        return None, None, None
+    try:
+        roots = snapshot.prepare(settings.work_dir, settings.published_dir, mounts)
+        plan = snapshot_plan.DailyPlan(*settings.daily(), settings.zone())
+    except (snapshot.SnapshotError, OSError, ValueError) as error:
+        return None, None, str(error)
+    return roots, plan, None
+
+
+def open_history(config, *, app_version, output=print, sync=None, host_id=None, boot_id=None, opener=None,
+                 mounts=None):
     """Napojení historie podle sekce [history]; vypnutá historie vrací None.
 
     Databázi tu nic neotevírá (to dělá až vlákno zapisovače) a nic ji
     nevytváří. `HistoryError` nebo `OSError` znamená, že historii nelze ani
     připravit (např. nečitelné /etc/machine-id); volající pokračuje v měření
     bez historie.
+
+    Snímky (`[history.snapshot]`) se připraví tady, tedy ještě před prvním
+    měřením; jejich selhání historii nezastaví (kontrola `history.snapshot`).
     """
     if not config.history.enabled:
         return None
     path = Path(config.history.path)
     host = host_id if host_id is not None else history.local_host_id()
+    settings = config.history.snapshot
+    roots, plan, snapshot_error = prepare_snapshots(settings, mounts)
     worker = HistoryWorker(
         path, HISTORY_ROLE, host, app_version=app_version,
         interval_s=config.collector.interval_seconds,
         boot_id=boot_id if boot_id is not None else clock_sync.read_boot_id(),
         opener=opener if opener is not None else (lambda: _open_writer(path, host)),
+        snapshot_roots=roots,
     )
     return HistoryLink(worker, sync, output=output, path=path,
-                       validity_seconds=config.collector.validity_seconds)
+                       validity_seconds=config.collector.validity_seconds,
+                       snapshot_enabled=settings.enabled, plan=plan, snapshot_error=snapshot_error)
