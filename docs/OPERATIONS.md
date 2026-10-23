@@ -70,7 +70,7 @@ python3 tools/sqlite_history_benchmark.py --quick
 
 Simulátor kreslí i stránku SERVICES: ve scénáři s fiktivními stavy a značkou `SIM`, v režimu `--live` bez kolektorů služeb: NEXUS, NAS a BACKUP jsou `UNKNOWN` na SERVICES (`UNKN`) i ve STATUS (`NAS NO DATA`) a stránka NEXUS ukazuje `?`; AnimeDB je `N/A`. Snímky ukládej mimo repozitář (např. do `/tmp`).
 
-### Živý simulátor OLED (v0.5)
+### Živý simulátor OLED a RGB LED (v0.5, RGB-1)
 
 Jen na vývojovém notebooku s grafickým prostředím. Potřebuje Pillow a tkinter. Na vývojovém notebooku je od 2026-10-19 nainstalovaný systémový balíček `python3-tk` 3.12.3 se závislostmi `libtk8.6`, `tk8.6-blt2.5` a `blt` (Tk 8.6.14); na jiném počítači `sudo apt install python3-tk`, systémová instalace jen po schválení. `PIL.ImageTk` (`python3-pil.imagetk`) potřeba není: obraz se do okna předává jako PNG.
 
@@ -82,10 +82,15 @@ PYTHONPATH=src python3 -m nexusstat.preview
 PYTHONPATH=src python3 -m nexusstat.preview --scenario many --scale 6 --config config/config.example.toml
 ```
 
+```bash
+PYTHONPATH=src python3 -m nexusstat.preview --scenario rgb_acknowledged
+```
+
 - Ovládání: „Stisk“, mezerník nebo Enter = krátký stisk fyzického tlačítka (skutečná logika `OledController`); nabídka scénářů; rychlost 1×/5×/10× (jen simulace); Esc, křížek nebo Ctrl+C v terminálu okno čistě zavřou (žádná vlákna ani procesy na pozadí).
+- RGB (RGB-1): pod displejem jsou čtyři simulované LED (vždy stejná barva, počet bliknutí = kategorie) a pod nimi popis signálu, jasu a potvrzených závad. „Potvrdit WARNING/ERROR“ potvrdí všechny aktivní `WARNING`/`ERROR`, „Zrušit potvrzení“ je vrátí (jen pro zkoušení) a posuvník „Jas LED %“ nastaví 5–100 % (výchozí 20 %); nic se neukládá. Jednorázové přehrání potvrzené závady je vidět po probuzení OLED, např. `--scenario rgb_acknowledged` a pak Stisk; přepnutí scénáře při rozsvíceném OLED probuzení není. Při 5×/10× LED neblikají a ukazují barvu vzoru trvale. Tlumený jas je na monitoru zobrazený s gama korekcí; skutečné LED se ověří až na hardwaru.
 - Displej je anglicky (texty z `oled_text.py`), ovládání okna česky.
 - Pod displejem je režim (SLEEP / CAROUSEL – stránka / STATUS – stránka x/y) a zdroj dat: „SIMULACE: fiktivní data“ nebo „LIVE: měření tohoto NOTEBOOKU, ne Nexusu“.
-- Scénáře: 1 Vše v pořádku, 2 WARNING (teplota), 3 ERROR a CRITICAL, 4 UNKNOWN (neplatná, chybějící a po 20/40 s zastaralá data), 5 Více problémů (2 stránky STATUS), 6 Nenapojené služby (NEXUS, NAS, BACKUP `UNKNOWN`, AnimeDB `N/A`), 7–11 NETWORK (v0.6): linka DOWN, bez IPv4, nízký provoz, vysoký provoz, neplatná a po 20 s zastaralá data. Změna scénáře začne data, paměť alarmů i okno kolotoče znovu; rozsvícený displej zůstane rozsvícený od stránky NEXUS.
+- Scénáře: 1 Vše v pořádku, 2 WARNING (teplota), 3 ERROR a CRITICAL, 4 UNKNOWN (neplatná, chybějící a po 20/40 s zastaralá data), 5 Více problémů (2 stránky STATUS), 6 Nenapojené služby (NEXUS, NAS, BACKUP `UNKNOWN`, AnimeDB `N/A`), 7–11 NETWORK (v0.6): linka DOWN, bez IPv4, nízký provoz, vysoký provoz, neplatná a po 20 s zastaralá data, 12–17 RGB (NAS WARNING, AnimeDB ERROR, zálohy ERROR, několik závad, CRITICAL a WARNING, potvrzená závada). Změna scénáře začne data, paměť alarmů, potvrzení LED i okno kolotoče znovu; rozsvícený displej zůstane rozsvícený od stránky NEXUS.
 - LIVE: `SystemMonitor`, `NetworkMonitor` (rozhraní z `[network]`) a `AlarmEvaluator` (prahy z `--config`) v intervalu `[collector]`, vždy 1×, bez značky `SIM`. Měření běží v okně (typicky jednotky ms); zaseknuté čtení `/` by okno zablokovalo stejně jako `nexusstat.run`. První vzorek CPU je `UNKNOWN`.
 - Bez tkinter skončí příkaz kódem 2 se zprávou, bez grafického displeje kódem 1.
 
@@ -121,7 +126,7 @@ Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje d
 
 ## RGB LED a potvrzení závad (schválený návrh 2026-10-23, neimplementováno)
 
-Dnes nic z toho neběží: na Nexusu LED ovládá Pironman a NexusSTAT nemá ovladač RGB, web ani uložená potvrzení. Požadavky a rozhodnutí jsou v `REQUIREMENTS.md`, datové vazby v `ARCHITECTURE.md`. Budoucí význam LED pro správce:
+Na Nexusu nic z toho neběží: LED ovládá Pironman a NexusSTAT nemá ovladač RGB, web ani trvale uložená potvrzení. Na notebooku lze chování vyzkoušet v živém náhledu (RGB-1, viz Živý simulátor OLED a RGB LED). Požadavky a rozhodnutí jsou v `REQUIREMENTS.md`, datové vazby v `ARCHITECTURE.md`. Budoucí význam LED pro správce:
 
 | LED | Význam |
 | --- | --- |

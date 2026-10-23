@@ -1,13 +1,15 @@
-"""Živý grafický simulátor OLED 128 × 64 pro vývojový počítač (tkinter).
+"""Živý grafický simulátor OLED 128 × 64 a čtyř RGB LED pro vývojový počítač (tkinter).
 
 Spuštění:
   PYTHONPATH=src python3 -m nexusstat.preview [--scenario NÁZEV] [--scale 4|6] [--config SOUBOR]
 
 Obraz kreslí výhradně render.render_screen(); simulátor jen řídí čas,
-tlačítko, scénáře a zvětšení. Nepřistupuje k hardwaru displeje ani GPIO
-a nic neposílá do sítě (LIVE síť jen čte jako network_monitor).
-Stavová logika (PreviewSession) nepotřebuje tkinter ani grafický displej,
-takže ji testy ověřují bez X serveru; tkinter se načte až při otevření okna.
+tlačítko, scénáře a zvětšení. LED jsou samostatná plocha pod displejem
+a jejich barvu určuje rgb.py, do bitmapy OLED se nekreslí. Nepřistupuje
+k hardwaru displeje, LED, SPI ani GPIO a nic neposílá do sítě (LIVE síť jen
+čte jako network_monitor). Stavová logika (PreviewSession) nepotřebuje
+tkinter ani grafický displej, takže ji testy ověřují bez X serveru; tkinter
+se načte až při otevření okna.
 """
 
 import argparse
@@ -19,6 +21,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import rgb
 from .alarms import AlarmEvaluator
 from .config import Config, ConfigError, load_config
 from .core import CheckResult, Measurement, State, active_problems
@@ -44,10 +47,16 @@ from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, ME
 SPEEDS = (1, 5, 10)
 # Celočíselné zvětšení, aby každý pixel OLED zůstal ostrým čtvercem.
 SCALES = (4, 6)
-# Obnova okna. Při 10× trvá stránka kolotoče 1 s, takže 0,1 s stačí.
-TICK_MS = 100
+# Obnova okna. Stránce kolotoče by stačilo 0,1 s, ale fáze blikání CRITICAL
+# trvá jen 0,25 s, takže po 0,1 s by svit kolísal o celou obnovu.
+TICK_MS = 50
 
 LIVE = "live"
+
+# Zhasnutá LED je na obrazovce tmavá s obrysem, aby bylo vidět, kde je.
+LED_OFF_FILL = "#141414"
+LED_OUTLINE = "#505050"
+LED_COUNT = 4
 
 
 # --- Fiktivní scénáře -------------------------------------------------------
@@ -185,6 +194,47 @@ def scenario_net_invalid(sim):
     ]
 
 
+# Scénáře pro RGB: systém, síť a služby jako ve scénáři 1, závady jen tam,
+# kde je uvádí název. Počet bliknutí určuje rgb.category_of(), ne scénář.
+def scenario_rgb_nas_warning(sim):
+    results = scenario_ok(sim)
+    # service.nas sleduje dostupnost, proto i varování mluví o dostupnosti.
+    results[5] = sim(NAS_ID, State.WARNING, "NAS: krátkodobé výpadky dostupnosti")
+    return results
+
+
+def scenario_rgb_animedb_error(sim):
+    # Jen v simulaci je AnimeDB nasazená a sledovaná; na Nexusu je N/A.
+    results = scenario_ok(sim)
+    results[7] = sim(ANIMEDB_ID, State.ERROR, "AnimeDB neodpovídá")
+    return results
+
+
+def scenario_rgb_backup_error(sim):
+    results = scenario_ok(sim)
+    results[6] = sim(BACKUP_ID, State.ERROR, "Záloha starší 3 dny")
+    return results
+
+
+def scenario_rgb_multi(sim):
+    # Dvě ERROR a dvě WARNING bez CRITICAL: automaticky bliká jen červeně 3 a 4
+    # (ERROR má přednost); po potvrzení přehraje probuzení OLED i oranžové 1 a 2.
+    results = scenario_ok(sim)
+    results[1] = sim(CPU_TEMP_ID, State.WARNING, "Teplota CPU 74 °C", deg(74))
+    results[5] = sim(NAS_ID, State.WARNING, "NAS: krátkodobé výpadky dostupnosti")
+    results[6] = sim(BACKUP_ID, State.ERROR, "Záloha starší 3 dny")
+    results[7] = sim(ANIMEDB_ID, State.ERROR, "AnimeDB neodpovídá")
+    return results
+
+
+def scenario_rgb_critical(sim):
+    # CRITICAL má přednost i před nepotvrzenou WARNING.
+    results = scenario_ok(sim)
+    results[1] = sim(CPU_TEMP_ID, State.WARNING, "Teplota CPU 74 °C", deg(74))
+    results[5] = sim(NAS_ID, State.CRITICAL, "NAS nedostupný")
+    return results
+
+
 # Pořadí odpovídá nabídce v okně.
 SCENARIOS = {
     "ok": ("1 Vše v pořádku", scenario_ok),
@@ -198,8 +248,16 @@ SCENARIOS = {
     "net_low": ("9 NETWORK: nízký provoz", scenario_net_low),
     "net_high": ("10 NETWORK: vysoký provoz", scenario_net_high),
     "net_invalid": ("11 NETWORK: neplatná a zastaralá data", scenario_net_invalid),
+    "rgb_nas_warning": ("12 RGB: NAS WARNING (2 bliknutí)", scenario_rgb_nas_warning),
+    "rgb_animedb_error": ("13 RGB: AnimeDB ERROR (3 bliknutí)", scenario_rgb_animedb_error),
+    "rgb_backup_error": ("14 RGB: zálohy ERROR (4 bliknutí)", scenario_rgb_backup_error),
+    "rgb_multi": ("15 RGB: několik závad (ERROR 3, 4; WARNING 1, 2)", scenario_rgb_multi),
+    "rgb_critical": ("16 RGB: CRITICAL a WARNING", scenario_rgb_critical),
+    "rgb_acknowledged": ("17 RGB: potvrzená závada (zálohy ERROR)", scenario_rgb_backup_error),
     LIVE: ("LIVE: měření tohoto notebooku", None),
 }
+# Scénáře, ve kterých je závada potvrzená hned od spuštění.
+PREACKNOWLEDGED = {"rgb_acknowledged"}
 
 
 class SessionClock:
@@ -242,6 +300,8 @@ class PreviewSession:
         self._time_start = self.clock.now()
         self._utc_start = self.utc_clock()
         self._wall_start = self.wall_clock()
+        # Jas je místní nastavení okna: přežije změnu scénáře, nikam se nezapisuje.
+        self.brightness = rgb.BRIGHTNESS_DEFAULT
         self.controller = None
         self.set_scenario(scenario)
 
@@ -250,10 +310,11 @@ class PreviewSession:
         return self.scenario == LIVE
 
     def set_scenario(self, name):
-        """Přepne scénář. Data, paměť alarmů i okno kolotoče začnou znovu.
+        """Přepne scénář. Data, paměť alarmů, potvrzení i okno kolotoče začnou znovu.
 
         Rozsvícený displej zůstane rozsvícený, ale od stránky NEXUS s novým
-        oknem; zhasnutý zůstane zhasnutý. Nic se nemíchá s předchozím scénářem.
+        oknem; zhasnutý zůstane zhasnutý. Nic se nemíchá s předchozím scénářem,
+        ani potvrzení závady: patří jen ke scénáři, ve kterém vzniklo.
         """
         if name not in SCENARIOS:
             raise ValueError(f"neznámý scénář {name!r}")
@@ -270,9 +331,12 @@ class PreviewSession:
         now = self.clock.now()
         self.started_at = now
         self.controller = OledController(self.config.oled)
+        self.leds = rgb.RgbLeds(self.config.alarms, self.brightness)
         if awake:
             self.controller.press(now, 0)
         self._refresh(now)
+        if name in PREACKNOWLEDGED:
+            self.leds.acks.acknowledge(self.monitored, now)
 
     def set_speed(self, speed):
         if self.is_live:
@@ -308,6 +372,9 @@ class PreviewSession:
         else:
             observed_utc = self.utc_at(now)
             measured = self._scenario_results(now)
+        # Skutečně monitorované kontroly pro LED: služby, které doplnění níže
+        # přidá jen kvůli chybějícímu kolektoru, bílou blokovat nemají.
+        self.monitored = measured
         self.results = complete_service_results(measured, observed_utc, now + self.validity)
         self.next_refresh = now + self.interval
 
@@ -319,7 +386,37 @@ class PreviewSession:
         """Krátký stisk tlačítka: skutečná logika OledController."""
         now = self.clock.now()
         self._refresh_if_due(now)
+        # Probouzecí stisk se pozná až po uplatnění časových limitů: stisk po
+        # uplynutí okna kolotoče také probouzí (press() je uplatní stejně).
+        self.controller.update(now)
+        asleep = self.controller.mode is Mode.SLEEP
         self.controller.press(now, len(active_problems(self.results, now)))
+        if asleep and self.controller.mode is not Mode.SLEEP:
+            self.leds.wake(self.monitored, now)
+
+    def led_frame(self):
+        """Barva čtyř LED v aktuálním simulovaném čase; obraz OLED se tím nemění."""
+        now = self.clock.now()
+        self._refresh_if_due(now)
+        self.controller.update(now)
+        # Při zrychlení by blikání bylo rychlejší, než okno vykreslí (a rychlejší
+        # než 3 Hz): barva vzoru se ukáže trvale a popis říká, co by blikalo.
+        steady = self.clock.speed > 1
+        return self.leds.frame(self.monitored, self.controller.mode is not Mode.SLEEP, now, steady)
+
+    def acknowledge(self):
+        """„Beru na vědomí“: potvrdí aktivní WARNING a ERROR. CheckResult se nemění."""
+        now = self.clock.now()
+        self._refresh_if_due(now)
+        return self.leds.acks.acknowledge(self.monitored, now)
+
+    def clear_acknowledgements(self):
+        """Zruší potvrzení (jen pro zkoušení v simulátoru)."""
+        self.leds.acks.clear()
+
+    def set_brightness(self, percent):
+        self.leds.set_brightness(percent)
+        self.brightness = percent
 
     def tick(self):
         """Volá se pravidelně z okna: obnoví data, uplatní časové limity a vrátí obraz 128 × 64."""
@@ -348,6 +445,30 @@ class PreviewSession:
                     "Služby bez kolektoru UNKNOWN, AnimeDB N/A. Čas 1×.")
         return f"SIMULACE: fiktivní data (značka SIM), čas {self.clock.speed}×."
 
+    def rgb_text(self):
+        """Popis pod LED: co právě ukazují, jaký je jas a co je potvrzené."""
+        signal = self.leds.signal
+        text = f"RGB, jas {self.brightness} %: {rgb.describe(signal) if signal else 'zhasnuto'}"
+        if self.clock.speed > 1 and signal is not None and signal.kind in rgb.BLINKING:
+            text += " (při zrychlení barva trvale, bez blikání)"
+        acknowledged = ", ".join(f"{check_id} {record.state.value}"
+                                 for check_id, record in sorted(self.leds.acks.records.items()))
+        return f"{text}\nPotvrzeno: {acknowledged or 'nic'}"
+
+
+def led_fill(frame):
+    """Barva LED na obrazovce jako #rrggbb.
+
+    Tlumený jas je s gama korekcí (2,2): lineárních 20 % by na monitoru vypadalo
+    skoro černě, kdežto skutečnou LED oko vnímá jasněji. Skutečný vzhled LED
+    se ověří až na hardwaru.
+    """
+    if not frame.lit:
+        return LED_OFF_FILL
+    gain = frame.level ** (1 / 2.2)
+    red, green, blue = (round(channel * gain) for channel in frame.color)
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
 
 def scale_frame(image, scale):
     """Celočíselné zvětšení metodou NEAREST: pixely zůstanou ostré, bez vyhlazení."""
@@ -369,7 +490,7 @@ def run_window(session, scale):
     import tkinter as tk  # jen pro okno; stavová logika ho nepotřebuje
 
     root = tk.Tk()
-    root.title("NexusSTAT – simulátor OLED 128 × 64 (notebook)")
+    root.title("NexusSTAT – simulátor OLED 128 × 64 a RGB LED (notebook)")
     root.configure(padx=10, pady=10)
 
     # Plocha OLED: jen obraz z render_screen(), nic dalšího se do ní nekreslí.
@@ -380,6 +501,21 @@ def run_window(session, scale):
     source_text = tk.StringVar()
     tk.Label(root, textvariable=mode_text, font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(8, 0))
     tk.Label(root, textvariable=source_text, wraplength=128 * scale, justify="left").pack(anchor="w")
+
+    # Čtyři LED pod displejem jako samostatná plocha: do bitmapy OLED se nekreslí
+    # a svítí vždy všechny stejně (počet bliknutí je kód kategorie, ne číslo LED).
+    led_size = led_gap = 6 * scale
+    margin = 4
+    leds = tk.Canvas(root, width=LED_COUNT * led_size + (LED_COUNT - 1) * led_gap + 2 * margin,
+                     height=led_size + 2 * margin, highlightthickness=0)
+    leds.pack(after=display, pady=(8, 0))
+    led_items = []
+    for index in range(LED_COUNT):
+        left = margin + index * (led_size + led_gap)
+        led_items.append(leds.create_oval(left, margin, left + led_size, margin + led_size,
+                                          fill=LED_OFF_FILL, outline=LED_OUTLINE, width=2))
+    rgb_text = tk.StringVar()
+    tk.Label(root, textvariable=rgb_text, wraplength=128 * scale, justify="left").pack(after=leds, anchor="w")
 
     controls = tk.Frame(root)
     controls.pack(fill="x", pady=(8, 0))
@@ -401,7 +537,19 @@ def run_window(session, scale):
         button.pack(side="left")
         speed_buttons.append(button)
 
-    state = {"after_id": None, "frame": None, "photo": None}
+    # Potvrzení a jas jen v paměti okna: nic se neukládá ani nezapisuje do konfigurace.
+    rgb_controls = tk.Frame(root)
+    rgb_controls.pack(fill="x", pady=(4, 0))
+    tk.Button(rgb_controls, text="Potvrdit WARNING/ERROR", takefocus=0,
+              command=lambda: acknowledge()).pack(side="left")
+    tk.Button(rgb_controls, text="Zrušit potvrzení", takefocus=0,
+              command=lambda: clear_acknowledgements()).pack(side="left", padx=8)
+    tk.Label(rgb_controls, text="Jas LED %").pack(side="left")
+    brightness_var = tk.IntVar(value=session.brightness)
+    tk.Scale(rgb_controls, from_=rgb.BRIGHTNESS_MIN, to=rgb.BRIGHTNESS_MAX, orient="horizontal",
+             variable=brightness_var, takefocus=0, command=lambda value: set_brightness(value)).pack(side="left")
+
+    state = {"after_id": None, "frame": None, "photo": None, "led": None}
 
     def update_controls():
         for button in speed_buttons:
@@ -417,6 +565,19 @@ def run_window(session, scale):
         update_controls()
         refresh(schedule=False)
 
+    def acknowledge():
+        session.acknowledge()
+        refresh(schedule=False)
+
+    def clear_acknowledgements():
+        session.clear_acknowledgements()
+        refresh(schedule=False)
+
+    def set_brightness(value):
+        # Scale předává text, např. "37".
+        session.set_brightness(int(float(value)))
+        refresh(schedule=False)
+
     def refresh(schedule=True):
         try:
             frame = session.tick()
@@ -425,8 +586,14 @@ def run_window(session, scale):
                 state["frame"] = frame.tobytes()
                 state["photo"] = tk.PhotoImage(data=png_data(scale_frame(frame, scale)))
                 display.configure(image=state["photo"])
+            fill = led_fill(session.led_frame())
+            if fill != state["led"]:
+                state["led"] = fill
+                for item in led_items:
+                    leds.itemconfigure(item, fill=fill)
             mode_text.set(session.describe())
             source_text.set(session.source_text())
+            rgb_text.set(session.rgb_text())
         except Exception as error:  # chyba se ukáže v okně, simulátor běží dál
             mode_text.set(f"Chyba: {type(error).__name__}: {error}")
         if schedule:

@@ -135,6 +135,8 @@ Body 1–17 popisují implementovanou v0.6 s pěti stránkami NEXUS, SYSTEM, DIS
 - Scénáře s fiktivními daty (`simulated=True`, značka `SIM`): vše v pořádku, WARNING, ERROR a CRITICAL, UNKNOWN/zastaralá/chybějící data, více problémů (≥ 2 stránky STATUS), nenapojené služby. Změna scénáře nesmí míchat alarmy ani časy.
 - Volitelný LIVE režim: read-only měření notebooku přes `SystemMonitor`, `NetworkMonitor` (v0.6) a `AlarmEvaluator`, bez `SIM`, ve skutečném čase, jasně označený jako notebook, ne Nexus; nenapojené služby `UNKNOWN`, AnimeDB `N/A`.
 - Síťové scénáře (v0.6, `SIM`): linka DOWN, bez IPv4, nízký provoz, vysoký provoz, neplatná a zastaralá data; všechny scénáře používají skutečný `render_screen()`.
+- Čtyři simulované RGB LED (RGB-1): samostatná plocha pod displejem, do bitmapy OLED se nekreslí; barvu určuje `rgb.py` podle sekce RGB LED a potvrzování závad. Ovládání „Potvrdit WARNING/ERROR“ (potvrdí všechny aktivní), „Zrušit potvrzení“ a jas 5–100 % (výchozí 20 %), vše jen v paměti okna bez zápisu konfigurace. Potvrzení patří ke scénáři a změnou scénáře zaniká. Scénáře RGB: NAS WARNING, AnimeDB ERROR, zálohy ERROR, několik závad, CRITICAL a WARNING, potvrzená závada.
+- Při zrychlení 5×/10× by blikání bylo rychlejší, než okno vykreslí (a rychlejší než 3 Hz): LED ukazují barvu vzoru trvale a popis to uvádí; logika včetně délky přehrání běží dál v simulovaném čase.
 - Testy bez grafického displeje; stávající testy bez tkinter i Pillow.
 
 ## Tlačítko a kritické funkce
@@ -143,9 +145,9 @@ Body 1–17 popisují implementovanou v0.6 s pěti stránkami NEXUS, SYSTEM, DIS
 - Návrh krátkého/dlouhého stisku pro řízené vypnutí je **neuzavřený do HW testů**. Dlouhé 10s gesto reboot se **neimplementuje**, může kolidovat s hardwarovým vypnutím.
 - Ovládání tlačítka při přechodu ověřit proti `systemd-logind` a přítomnosti exkluzivního `evdev` grabu.
 
-## RGB LED a potvrzování závad (schválený návrh 2026-10-23, zatím neimplementováno)
+## RGB LED a potvrzování závad (schválený návrh 2026-10-23; lokálně jen rozhodovací logika a simulace v náhledu)
 
-Schválené chování čtyř RGB LED WS2812 ve vazbě na OLED a na budoucí potvrzování závad v lokálním webu. **Nic z toho není implementováno:** neexistuje ovladač RGB, web ani uložená potvrzení a na Nexusu LED dál ovládá Pironman. NexusSTAT je jednoduchá náhrada softwaru Pironman 5 a stavový panel domácího serveru, ne další alarmový systém: signalizace vychází jen z existujících výsledků `CheckResult` po `AlarmEvaluator`u a kvůli RGB nevznikají žádné nové alarmy. Oddělení rozhodovací logiky od ovladače popisuje `ARCHITECTURE.md` (RGB signalizace a potvrzení závad); rozhodnutí správce jsou shrnutá na konci sekce.
+Schválené chování čtyř RGB LED WS2812 ve vazbě na OLED a na budoucí potvrzování závad v lokálním webu. **Implementováno je jen lokálně na notebooku (RGB-1):** rozhodovací logika `rgb.py` a čtyři simulované LED v živém náhledu s potvrzením v paměti okna. Neexistuje ovladač RGB, web ani trvale uložená potvrzení a na Nexusu LED dál ovládá Pironman. NexusSTAT je jednoduchá náhrada softwaru Pironman 5 a stavový panel domácího serveru, ne další alarmový systém: signalizace vychází jen z existujících výsledků `CheckResult` po `AlarmEvaluator`u a kvůli RGB nevznikají žádné nové alarmy. Oddělení rozhodovací logiky od ovladače popisuje `ARCHITECTURE.md` (RGB signalizace a potvrzení závad); rozhodnutí správce jsou shrnutá na konci sekce.
 
 ### Normální stav
 

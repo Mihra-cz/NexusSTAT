@@ -22,9 +22,10 @@ from nexusstat.fan_monitor import LABELS as FAN_LABELS, FanMonitor
 from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
 from nexusstat.oled import UNKNOWN_SYMBOL, Mode, home_symbol
 from nexusstat.oled_text import network_rows, page_rows, service_rows
-from nexusstat.preview import LIVE, SCENARIOS, SPEEDS, PreviewSession, SessionClock, main
+from nexusstat import rgb
+from nexusstat.preview import LED_OFF_FILL, LIVE, SCENARIOS, SPEEDS, PreviewSession, SessionClock, led_fill, main
 from nexusstat.run import Collectors, live_monitor
-from nexusstat.services import BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, SERVICE_LABELS
+from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, SERVICE_LABELS
 from nexusstat.system_monitor import CPU_TEMP_ID, LABELS as SYSTEM_LABELS, SystemMonitor
 
 try:
@@ -234,7 +235,9 @@ class StatusTest(unittest.TestCase):
 class ScenarioTest(unittest.TestCase):
     def test_scenarios_and_live(self):
         self.assertEqual(list(SCENARIOS), ["ok", "warning", "error", "unknown", "many", "unconnected", "net_down",
-                                           "net_no_ipv4", "net_low", "net_high", "net_invalid", LIVE])
+                                           "net_no_ipv4", "net_low", "net_high", "net_invalid", "rgb_nas_warning",
+                                           "rgb_animedb_error", "rgb_backup_error", "rgb_multi", "rgb_critical",
+                                           "rgb_acknowledged", LIVE])
 
     def test_fictitious_values_are_simulated(self):
         for name in SCENARIOS:
@@ -263,6 +266,13 @@ class ScenarioTest(unittest.TestCase):
             "net_low": set(),
             "net_high": set(),
             "net_invalid": {State.UNKNOWN},
+            "rgb_nas_warning": {State.WARNING},
+            "rgb_animedb_error": {State.ERROR},
+            "rgb_backup_error": {State.ERROR},
+            "rgb_multi": {State.ERROR, State.WARNING},
+            "rgb_critical": {State.CRITICAL, State.WARNING},
+            # Potvrzení stav závady nemění: ERROR zůstává ERROR.
+            "rgb_acknowledged": {State.ERROR},
         }
         for name, states in expected.items():
             session, _ = make_session(name)
@@ -493,6 +503,163 @@ class FrameTest(unittest.TestCase):
         self.assertLessEqual(set(decoded.getdata()), {0, 255})  # jen černá a bílá, žádné vyhlazení
 
 
+def led_signal(session):
+    """Signál, který LED právě přehrávají (po jednom překreslení)."""
+    session.led_frame()
+    return session.leds.signal
+
+
+class RgbSessionTest(unittest.TestCase):
+    """Čtyři simulované LED vedle OLED: co uvidíme v okně, se simulovaným časem."""
+
+    def test_normal_state_dark_asleep_white_awake(self):
+        session, real = make_session("ok")
+        self.assertFalse(session.led_frame().lit)
+        session.press()
+        frame = session.led_frame()
+        self.assertEqual((frame.color, frame.level), (rgb.WHITE, 0.1))  # polovina výchozích 20 %
+        real.advance(300)  # OLED usne a bílá zhasne
+        self.assertFalse(session.led_frame().lit)
+        self.assertIs(mode_page(session)[0], Mode.SLEEP)
+
+    def test_rgb_scenarios_blink_their_categories(self):
+        expected = {
+            "warning": ((State.WARNING, 1),),
+            "rgb_nas_warning": ((State.WARNING, 2),),
+            "rgb_animedb_error": ((State.ERROR, 3),),
+            "rgb_backup_error": ((State.ERROR, 4),),
+            "rgb_multi": ((State.ERROR, 3), (State.ERROR, 4)),  # ERROR má přednost před WARNING 1 a 2
+        }
+        for name, steps in expected.items():
+            for awake in (False, True):
+                with self.subTest(scenario=name, awake=awake):
+                    session, _ = make_session(name)
+                    if awake:
+                        session.press()
+                    self.assertEqual(led_signal(session), rgb.Signal(rgb.CODES, steps))
+
+    def test_critical_always_wins(self):
+        for name in ("error", "many", "rgb_critical"):
+            with self.subTest(scenario=name):
+                session, _ = make_session(name)
+                session.press()
+                self.assertEqual(led_signal(session).kind, rgb.CRITICAL)
+                session.acknowledge()
+                self.assertEqual(led_signal(session).kind, rgb.CRITICAL)  # potvrzení CRITICAL neumlčí
+
+    def test_acknowledge_goes_dark_but_fault_stays(self):
+        session, real = make_session("rgb_backup_error")
+        session.press()
+        before = list(session.results)
+        self.assertEqual(session.acknowledge(), [BACKUP_ID])
+        self.assertEqual(session.results, before)  # CheckResult se nemění
+        real.advance(3.3)  # rozehraná skupina čtyř bliknutí se dohraje
+        self.assertEqual(led_signal(session), rgb.Signal(rgb.OFF, reason="potvrzená závada trvá"))
+        now = session.clock.now()
+        self.assertEqual([(p.id, p.state) for p in active_problems(session.results, now)], [(BACKUP_ID, State.ERROR)])
+        self.assertEqual(home_symbol(session.results, now), "!")  # OLED závadu dál ukazuje
+
+    def test_wake_replays_acknowledged_fault_once(self):
+        session, real = make_session("rgb_acknowledged")
+        self.assertEqual(led_signal(session).kind, rgb.OFF)  # spí a závada je potvrzená
+        session.press()
+        self.assertEqual(led_signal(session), rgb.Signal(rgb.REPLAY, ((State.ERROR, 4),)))
+        real.advance(rgb.pass_length(((State.ERROR, 4),)) + 0.1)
+        self.assertEqual(led_signal(session), rgb.Signal(rgb.OFF, reason="potvrzená závada trvá"))  # ne bílá
+        # Další stisky (STATUS a návrat) mají dosavadní význam a nic nepřehrávají.
+        session.press()
+        self.assertIs(session.controller.mode, Mode.STATUS)
+        session.press()
+        self.assertIs(session.controller.mode, Mode.CAROUSEL)
+        self.assertEqual(led_signal(session).kind, rgb.OFF)
+        # Po uspání a novém probuzení se kód přehraje znovu.
+        real.advance(300)
+        session.press()
+        self.assertEqual(led_signal(session).kind, rgb.REPLAY)
+
+    def test_multi_replay_plays_errors_then_warnings(self):
+        session, _ = make_session("rgb_multi")
+        self.assertEqual(set(session.acknowledge()), {CPU_TEMP_ID, NAS_ID, BACKUP_ID, ANIMEDB_ID})
+        session.press()
+        self.assertEqual(led_signal(session).steps,
+                         ((State.ERROR, 3), (State.ERROR, 4), (State.WARNING, 1), (State.WARNING, 2)))
+
+    def test_clear_acknowledgements_restores_blinking(self):
+        session, _ = make_session("rgb_acknowledged")
+        self.assertEqual(led_signal(session).kind, rgb.OFF)
+        session.clear_acknowledgements()
+        self.assertEqual(led_signal(session), rgb.Signal(rgb.CODES, ((State.ERROR, 4),)))
+
+    def test_switching_scenario_never_carries_acknowledgement(self):
+        session, _ = make_session("rgb_backup_error")
+        session.acknowledge()
+        session.set_scenario("rgb_animedb_error")
+        self.assertEqual(session.leds.acks.records, {})
+        self.assertEqual(led_signal(session).kind, rgb.CODES)
+        session.set_scenario("rgb_backup_error")
+        self.assertEqual(led_signal(session), rgb.Signal(rgb.CODES, ((State.ERROR, 4),)))
+
+    def test_unknown_versus_real_ok(self):
+        # Sledovaná kontrola bez platných dat: žádná bílá, ale ani blikání.
+        session, _ = make_session("unknown")
+        session.press()
+        self.assertEqual(led_signal(session), rgb.Signal(rgb.OFF, reason="chybí platná data (UNKNOWN)"))
+        # Služby bez kolektoru (dnešní stav Nexusu) bílou neblokují; OLED přitom ukazuje "?".
+        session, _ = make_session("unconnected")
+        session.press()
+        self.assertEqual(led_signal(session).kind, rgb.LIGHT)
+        self.assertEqual(home_symbol(session.results, session.clock.now()), UNKNOWN_SYMBOL)
+
+    def test_live_uses_only_collector_results(self):
+        FakeMonitor.fail = False
+        session, real = make_session(LIVE)
+        session.press()
+        # Doplněné služby jsou UNKNOWN, ale nejsou to aktivní kolektory: bílá svítí.
+        self.assertEqual(led_signal(session).kind, rgb.LIGHT)
+        FakeMonitor.fail = True
+        try:
+            real.advance(10)  # selhání kolektoru = UNKNOWN: bílá zhasne, nic nebliká
+            self.assertEqual(led_signal(session).kind, rgb.OFF)
+        finally:
+            FakeMonitor.fail = False
+
+    def test_brightness_is_local_and_survives_scenario_switch(self):
+        session, _ = make_session("rgb_critical")
+        session.set_brightness(100)
+        self.assertEqual(session.led_frame().rgb(), (255, 0, 0))
+        session.set_scenario("ok")
+        session.press()
+        self.assertEqual(session.led_frame().rgb(), (128, 128, 128))  # bílá na polovině
+        for value in (4, 101, 20.5, True):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    session.set_brightness(value)
+        self.assertEqual(session.brightness, 100)
+
+    def test_accelerated_time(self):
+        session, real = make_session("rgb_acknowledged")
+        session.press()
+        real.advance(0.6)  # 1×: tma mezi bliknutími
+        self.assertFalse(session.led_frame().lit)
+
+        session, real = make_session("rgb_acknowledged")
+        session.set_speed(10)
+        session.press()
+        real.advance(0.06)  # 0,6 s simulovaného času: barva trvale, bez blikání
+        self.assertEqual(session.led_frame().color, rgb.RED)
+        self.assertIn("bez blikání", session.rgb_text())
+        real.advance(0.53)  # 5,9 s: jednorázové přehrání (5,2 s) skončilo i ve zrychleném čase
+        self.assertFalse(session.led_frame().lit)
+        self.assertEqual(mode_page(session), (Mode.CAROUSEL, "NEXUS"))  # OLED časování beze změny
+
+    def test_led_fill_on_screen(self):
+        self.assertEqual(led_fill(rgb.DARK), LED_OFF_FILL)
+        self.assertEqual(led_fill(rgb.LedFrame(rgb.RED, 1.0)), "#ff0000")
+        dim_white = led_fill(rgb.LedFrame(rgb.WHITE, 0.025))  # bílá při nejnižším jasu 5 %
+        self.assertNotEqual(dim_white, LED_OFF_FILL)
+        self.assertEqual(len({dim_white[1:3], dim_white[3:5], dim_white[5:7]}), 1)  # šedá, ne barevná
+
+
 # --- Falešný tkinter: ověří zapojení okna bez X serveru a bez nainstalovaného tkinter ---
 
 def fake_tkinter(script):
@@ -557,8 +724,21 @@ def fake_tkinter(script):
         def __init__(self, data):
             self.data = data
 
+    class Canvas(Widget):
+        def __init__(self, master=None, **options):
+            super().__init__(master, **options)
+            self.items = {}
+
+        def create_oval(self, *coords, **options):
+            self.items[len(self.items) + 1] = dict(options, coords=coords)
+            return len(self.items)
+
+        def itemconfigure(self, item, **options):
+            self.items[item].update(options)
+
     module.Tk, module.Label, module.Frame, module.Button = Tk, Widget, Widget, Widget
     module.OptionMenu, module.Radiobutton, module.PhotoImage = Widget, Widget, PhotoImage
+    module.Canvas, module.Scale = Canvas, Widget
     module.StringVar = module.IntVar = Var
     return module, created
 
@@ -632,6 +812,47 @@ class WindowWiringTest(unittest.TestCase):
             mode_label = created["widgets"][2]
             self.assertIn("chyba kreslení", mode_label.options["textvariable"].get())
             self.assertEqual(len(root.scheduled), 1)  # další obnova je naplánovaná
+            root.protocols["WM_DELETE_WINDOW"]()
+
+        self.run_window(script)
+
+    def test_leds_are_separate_from_oled(self):
+        def script(root, created, session, real):
+            display = created["widgets"][1]
+            canvas = next(w for w in created["widgets"] if hasattr(w, "items"))
+            menu = next(w for w in created["widgets"] if "command" in w.options and len(w.args) > 2)
+
+            def control(text):
+                return next(w for w in created["widgets"] if w.options.get("text") == text)
+
+            def fills():
+                return {item["fill"] for item in canvas.items.values()}
+
+            self.assertEqual(len(canvas.items), 4)
+            self.assertEqual(fills(), {preview.LED_OFF_FILL})  # spí a vše OK
+            root.bindings["<space>"](None)  # probuzení: všechny čtyři tlumeně bíle
+            self.assertEqual(fills(), {preview.led_fill(rgb.LedFrame(rgb.WHITE, 0.1))})
+            # OLED je dál jen obraz z render_screen, 128 × 64 zvětšený 4×; LED v něm nejsou.
+            now = session.clock.now()
+            expected = preview.scale_frame(render.render_screen(session.controller, now, session.results,
+                                                                session.wall_time(now)), 4)
+            image = Image.open(io.BytesIO(base64.b64decode(display.options["image"].data)))
+            self.assertEqual(image.size, (512, 256))
+            self.assertEqual(image.tobytes(), expected.convert("L").tobytes())
+
+            menu.options["command"](SCENARIOS["rgb_backup_error"][0])
+            self.assertEqual(fills(), {preview.led_fill(rgb.LedFrame(rgb.RED, 0.2))})
+            control("Potvrdit WARNING/ERROR").options["command"]()
+            self.assertIn("service.backup ERROR", session.rgb_text())
+            real.advance(3.3)  # skupina se dohraje, pak tma
+            self.run_scheduled(root)
+            self.assertEqual(fills(), {preview.LED_OFF_FILL})
+            control("Zrušit potvrzení").options["command"]()
+            self.assertEqual(fills(), {preview.led_fill(rgb.LedFrame(rgb.RED, 0.2))})
+            scale = next(w for w in created["widgets"] if w.options.get("from_") == rgb.BRIGHTNESS_MIN)
+            self.assertEqual((scale.options["to"], scale.options["variable"].get()), (100, 20))
+            scale.options["command"]("100")
+            self.assertEqual(session.brightness, 100)
             root.protocols["WM_DELETE_WINDOW"]()
 
         self.run_window(script)
