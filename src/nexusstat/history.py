@@ -17,6 +17,7 @@ schéma a SQL jsou v konstantách a jejich shodu s dokumentací hlídá
 tests/test_history.py.
 """
 
+import errno
 import fcntl
 import functools
 import hashlib
@@ -24,6 +25,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -75,6 +77,24 @@ READER_BUSY_TIMEOUT_MS = 5000
 # Pomocné soubory SQLite vedle databáze. Cizí -wal nebo -journal by se mohl
 # použít na nový soubor se stejným jménem, proto vytvoření skončí, když existují.
 COMPANION_SUFFIXES = ("-wal", "-shm", "-journal")
+
+# Klíče v tabulce meta. Schéma v1 je nemění: meta je volná dvojice klíč–hodnota
+# (stejně jako retained_since.*), takže evidence obnovy a převzetí nevyžaduje
+# migraci. `snapshot_utc` zapisuje **jen** snímek (9.2); v živé databázi proto
+# znamená obnovu ze snímku (9.6).
+ROLE_KEY = "role"
+HOST_KEY = "host_id"
+CREATED_KEY = "created_utc"
+SNAPSHOT_KEY = "snapshot_utc"
+RESTORED_SNAPSHOT_KEY = "restored.snapshot_utc"
+RESTORED_RECORDED_KEY = "restored.recorded_utc"
+RESTORED_GENERATION_KEY = "restored.generation"
+ADOPTED_HOST_KEY = "adopted.from_host_id"
+ADOPTED_UTC_KEY = "adopted.utc"
+ADOPTED_SOURCE_KEY = "adopted.source"
+
+# Jméno generace snímku (9.2): jediná definice, snapshot.py ji přebírá.
+SNAPSHOT_GENERATION_FORMAT = "%Y%m%dT%H%M%SZ"
 
 # Schéma v1: doslovná kopie bloku <!-- sql:ddl --> z docs/HISTORY.md 3.2.
 SCHEMA_SQL = """\
@@ -353,6 +373,55 @@ def _verify(conn, path, role=None, host_id=None):
         raise HistoryError("host", f"{path} patří jinému stroji (host_id {meta['host_id']})")
 
 
+def snapshot_generation(snapshot_utc):
+    """Jméno generace, ze které snímek pochází (čas snímku v UTC)."""
+    return datetime.fromtimestamp(snapshot_utc, timezone.utc).strftime(SNAPSHOT_GENERATION_FORMAT)
+
+
+def restored_state(path, role=None, host_id=None):
+    """Stav obnovy zjištěný **jen čtením**, bez otevření pro zápis.
+
+    Vrací čas snímku, nebo None. Slouží zapisovači k rozhodnutí, jestli má
+    databázi vůbec otevřít pro zápis: otevření pro zápis totiž nastaví
+    `journal_mode = wal`, a to je změna souboru. Bez doloženého času se tedy
+    obnovená databáze neotevírá vůbec (HISTORY.md 9.6).
+    """
+    path = Path(path)
+    _check_header(path)
+    conn = _connect_reader(path)
+    try:
+        _verify(conn, path, role, host_id)
+        return restored_marker(conn, path)
+    except sqlite3.DatabaseError as error:
+        raise HistoryError("corrupt", f"databázi {path} nelze ověřit: {error}") from None
+    finally:
+        conn.close()
+
+
+def restored_marker(conn, path):
+    """Čas snímku z `meta.snapshot_utc`, nebo None pro běžný start (9.6).
+
+    Značku zapisuje jen snímek, takže v živé databázi znamená obnovu ze
+    snímku. Nečitelná nebo nevěrohodná značka (čas před `MIN_TRUSTED_UTC`
+    nebo starší než vytvoření databáze) je **nejasný stav**: zápis se odmítne
+    a rozhodne správce. Čte se na témže spojení jako ostatní ověření, takže
+    rozhoduje potvrzený stav databáze (včetně obsahu WAL).
+    """
+    rows = dict(conn.execute("SELECT key, value FROM meta WHERE key IN (?, ?)", (SNAPSHOT_KEY, CREATED_KEY)))
+    raw = rows.get(SNAPSHOT_KEY)
+    if raw is None:
+        return None
+    try:
+        moment, created = int(raw), int(rows[CREATED_KEY])
+    except (TypeError, ValueError, KeyError):
+        raise HistoryError("restored", f"{path} má nečitelnou značku {SNAPSHOT_KEY} ({raw!r}); "
+                                       "zápis se odmítá, rozhodne správce") from None
+    if moment < MIN_TRUSTED_UTC or moment < created:
+        raise HistoryError("restored", f"{path} má nevěrohodnou značku {SNAPSHOT_KEY} = {moment} "
+                                       f"(databáze vytvořena {created}); zápis se odmítá, rozhodne správce")
+    return moment
+
+
 def _uri(path, mode):
     # URI s mode=rw nebo mode=ro: SQLite soubor nikdy nevytvoří. as_uri() kóduje
     # zvláštní znaky v cestě.
@@ -521,6 +590,18 @@ def open_writer(path, role, host_id, quick_check=True):
     _check_host_id(host_id)
     path = Path(path)
     _check_header(path)
+    # Pomocné soubory před otevřením. Databáze v režimu `delete` (typicky
+    # obnovený snímek) **nemůže mít vlastní** -wal ani -shm, takže jejich původ
+    # nelze určit: `PRAGMA journal_mode = wal` při konfiguraci spojení by cizí
+    # WAL přehrálo do obnovené historie (ověřeno měřením). Zápis se proto odmítne
+    # a rozhodne správce (9.6 krok 2). Databáze ve WAL své pomocné soubory mít
+    # má, takže běžné zotavení po pádu zůstává nedotčené.
+    companions = tuple(name.name for name in companion_paths(path) if os.path.lexists(name))
+    if companions and file_journal_mode(path) == "delete":
+        raise HistoryError("companions",
+                           f"vedle {path.name} v režimu delete jsou pomocné soubory "
+                           f"({', '.join(companions)}); jejich původ nelze určit a jejich obsah by se "
+                           "mohl přehrát do databáze. Zápis se odmítá, rozhodne správce")
     lock = _acquire_lock(path)
     try:
         _remove_publication_alias(path)
@@ -539,6 +620,9 @@ def open_writer(path, role, host_id, quick_check=True):
             _configure_writer(conn, path)
             if quick_check and conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise HistoryError("corrupt", f"databáze {path} neprošla quick_check")
+            # Obnovu ze snímku pozná zapisovač ještě **před prvním zápisem**;
+            # nejasný stav skončí tady a soubor se nezmění.
+            restored = restored_marker(conn, path)
             _set_no_checkpoint_on_close(conn, False)
         except sqlite3.DatabaseError as error:
             conn.close()
@@ -549,7 +633,8 @@ def open_writer(path, role, host_id, quick_check=True):
     except BaseException:
         os.close(lock)
         raise
-    return HistoryDatabase(path, conn, readonly=False, lock=lock)
+    return HistoryDatabase(path, conn, readonly=False, lock=lock, restored_utc=restored,
+                           companions=companions)
 
 
 def _set_no_checkpoint_on_close(conn, enabled):
@@ -624,10 +709,14 @@ def open_reader(path, role=None, host_id=None):
 class HistoryDatabase:
     """Otevřená databáze historie: spojení, druh přístupu a bezpečné zavření."""
 
-    def __init__(self, path, connection, readonly, lock=None):
+    def __init__(self, path, connection, readonly, lock=None, restored_utc=None, companions=()):
         self.path = Path(path)
         self.connection = connection
         self.readonly = readonly
+        # Čas snímku, ze kterého byla databáze obnovena (None = běžný start),
+        # a pomocné soubory nalezené před otevřením (u obnovy mají být prázdné).
+        self.restored_utc = restored_utc
+        self.companions = tuple(companions)
         self._lock = lock
 
     def close(self):
@@ -1288,6 +1377,7 @@ class HistoryRecorder:
         self.database = database
         self.run_id = None
         self.high_water = None
+        self.restored = None  # čas snímku, pokud tento běh evidoval obnovu (9.6)
         self.last_batch = 0
         self.rejected = Counter()  # odmítnuté vzorky podle důvodu (skutečná ztráta, HISTORY.md 5.4)
         self.duplicates = 0  # totéž měření znovu nebo už uložený vzorek; není ztráta
@@ -1308,7 +1398,15 @@ class HistoryRecorder:
         self._aggregation_stopped = None  # popis konfliktu agregace; do konce běhu se neagreguje
 
     def start_run(self, app_version, interval_s, now_utc, boot_id=None, ts_quality="synced"):
-        """Zahájí běh: uzavře nečisté běhy, zjistí horní mez, zapíše process.start. Vrací run_id."""
+        """Zahájí běh: uzavře nečisté běhy, zjistí horní mez, zapíše process.start. Vrací run_id.
+
+        U databáze obnovené ze snímku (`meta.snapshot_utc`, 9.6) se ve **téže
+        transakci** zapíše jednorázová událost `history.restored` místo běžného
+        `process.unclean_stop`, uloží se evidence obnovy do `meta` a značka se
+        odstraní. Opakovaný start proto událost nezdvojí a pád před potvrzením
+        nechá značku na místě, takže se obnova rozpozná znovu. Evidenci nelze
+        zapsat s nedoloženým časem: pak se zápis odmítne a opakuje se později.
+        """
         if self.run_id is not None:
             raise HistoryError("run", f"běh {self.run_id} už je zahájený")
         if not isinstance(app_version, str) or not app_version:
@@ -1320,9 +1418,16 @@ class HistoryRecorder:
         _check_quality(ts_quality)
         started = _utc_seconds(now_utc)
         ts_quality = _trusted_quality(started, ts_quality)
+        if self.database.restored_utc is not None and ts_quality != "synced":
+            # Obnova se eviduje jen s doloženým časem (jinak by událost nesla
+            # vymyšlené UTC). Nic se nezapisuje a volající to zkusí znovu.
+            raise HistoryError("restored_wait", f"{self.database.path} byla obnovena ze snímku; "
+                                                "evidence obnovy čeká na doložený čas")
         conn = self.database.connection
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # Rozhoduje stav v transakci: značka mohla zmizet (už evidováno) i přibýt.
+            restored = restored_marker(conn, self.database.path)
             unclean = conn.execute("SELECT id, started_utc, last_write_utc FROM run "
                                    "WHERE stopped_utc IS NULL ORDER BY id").fetchall()
             conn.execute(CLOSE_UNCLEAN_RUNS_SQL)
@@ -1331,7 +1436,37 @@ class HistoryRecorder:
             run_id = conn.execute("INSERT INTO run (started_utc, app_version, interval_s, boot_id) VALUES (?, ?, ?, ?)",
                                   (started, app_version, interval_s, boot_id)).lastrowid
             events = []
-            for old_id, old_started, last_write in unclean:
+            if restored is not None:
+                # Obnovený snímek: běh otevřený ve snímku se uzavřel jako nečistý
+                # (CLOSE_UNCLEAN_RUNS_SQL) a mezeru popisuje tato jedna událost
+                # místo běžné dvojice unclean_stop + unknown_gap (9.6). Horní
+                # mez dat ve snímku je `high`, dolní mez další historie je teď.
+                generation = snapshot_generation(restored)
+                # Dvě události s rozdělenou úlohou, aby se stejná ztráta nepočítala
+                # dvakrát: `history.restored` nese **původ** (ze které generace a
+                # kterých běhů se obnovovalo), `history.unknown_gap` **hranice**
+                # neznámého úseku — stejný schválený mechanismus jako po nečistém
+                # ukončení (5.5, 7.1). `process.unclean_stop` se nahrazuje (9.6).
+                events.append(Event(started, ts_quality, "history.restored", "WARNING",
+                                    f"historie obnovena ze snímku {generation}",
+                                    data={"snapshot_utc": restored, "generation": generation,
+                                          "runs": [row[0] for row in unclean],
+                                          "companions": list(self.database.companions)}))
+                events.append(Event(started, ts_quality, "history.unknown_gap", "WARNING",
+                                    f"neznámá mezera mezi snímkem {generation} a obnovou",
+                                    # `after` je nejnovější zapsaný vzorek ve snímku (horní mez
+                                    # dat, 4.1); bez něj se dolní hranice nedomýšlí.
+                                    data={"reason": "restored", "after": high,
+                                          "until": None if ts_quality == "unsynced" else started,
+                                          "snapshot_utc": restored,
+                                          "runs": [row[0] for row in unclean]}))
+                conn.execute("DELETE FROM meta WHERE key = ?", (SNAPSHOT_KEY,))
+                conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                 [(RESTORED_SNAPSHOT_KEY, str(restored)),
+                                  (RESTORED_RECORDED_KEY, str(started)),
+                                  (RESTORED_GENERATION_KEY, generation)])
+            for old_id, old_started, last_write in unclean if restored is None else ():
                 after = last_write
                 if after is None:
                     # Bez vzorku je hranicí jen start běhu, a to jen s důvěryhodným časem (process.start).
@@ -1353,11 +1488,17 @@ class HistoryRecorder:
         except sqlite3.Error as error:
             _rollback(conn)
             raise HistoryError("write", f"běh nelze zahájit: {error}", _sqlite_name(error)) from None
+        except HistoryError:
+            _rollback(conn)  # nejasná značka obnovy: nic se nezapsalo
+            raise
         except BaseException:
             _rollback(conn)  # i Ctrl+C nebo chyba programu: nic rozepsaného, zámek zápisu uvolněn
             raise
         self.run_id, self.high_water = run_id, high
         self._gate = SampleGate(high, done_until)
+        # Evidence je potvrzená: další otevření téhož souboru už značku nenajde.
+        self.database.restored_utc = None
+        self.restored = restored
         return run_id
 
     def begin_batch(self):
@@ -1942,3 +2083,440 @@ def _rollback(conn):
             conn.execute("ROLLBACK")
         except sqlite3.Error:
             pass
+
+
+# --- M3.4b-2: read-only popis databáze a ruční převzetí (docs/HISTORY.md 9.6) -----
+
+# Dočasné jméno při převzetí: .history.sqlite3.<náhodné>.adopting
+ADOPT_SUFFIX = ".adopting"
+# Zkrácený otisk otisku stroje do výpisu: samotné host_id se nikdy netiskne.
+FINGERPRINT_CHARS = 16
+
+
+def host_fingerprint(host_id):
+    """Nevratný otisk uloženého `host_id` pro výpis (nikdy samotná hodnota)."""
+    if not isinstance(host_id, str) or not host_id:
+        return None
+    return hashlib.sha256(host_id.encode("ascii", "replace")).hexdigest()[:FINGERPRINT_CHARS]
+
+
+@dataclass(frozen=True)
+class DatabaseInfo:
+    """Stav databáze historie zjištěný **jen čtením** (příkaz `info`)."""
+
+    path: str
+    exists: bool
+    bytes: int | None = None
+    role: str | None = None
+    schema_version: int | None = None
+    schema_matches: bool | None = None
+    fingerprint: str | None = None  # otisk meta.host_id
+    local_fingerprint: str | None = None  # otisk tohoto stroje
+    same_machine: bool | None = None
+    created_utc: int | None = None
+    snapshot_utc: int | None = None  # neevidovaná značka obnovy (čeká na start)
+    restored: Mapping = field(default_factory=dict)  # evidence dřívější obnovy
+    adopted: Mapping = field(default_factory=dict)  # evidence dřívějšího převzetí
+    companions: tuple = ()  # existující -wal, -shm, -journal
+    journal_mode: str | None = None
+    integrity: str | None = None  # None = neprověřeno (viz integrity_checked)
+    integrity_checked: bool = False
+    foreign_keys: int | None = None
+    runs: int | None = None
+    last_run: Mapping | None = None
+    counts: Mapping = field(default_factory=dict)
+    openable: bool = False  # vhodná k otevření zapisovačem na tomto stroji
+    needs_adopt: bool = False  # jen jiný stroj: potřebuje ruční převzetí
+    problems: tuple = ()
+
+
+def file_journal_mode(path):
+    """Režim žurnálu z hlavičky souboru: "wal", "delete", nebo None.
+
+    Čte se z bajtu 18 (write version), protože `PRAGMA journal_mode` na
+    spojení `immutable=1` hlásí `delete` i u databáze ve WAL. Hodnota 1 pokrývá
+    všechny rollback režimy; NexusSTAT z nich používá jen `delete` (samostatný
+    snímek), takže se tak i pojmenuje.
+    """
+    try:
+        with open(path, "rb") as file:
+            header = file.read(HEADER_SIZE)
+    except OSError:
+        return None
+    if len(header) < HEADER_SIZE:
+        return None
+    return {1: "delete", 2: "wal"}.get(header[18])
+
+
+def _info_connection(path, immutable):
+    """Spojení pro `info`: nikdy nezapisuje a neprovede checkpoint ani při zavření.
+
+    Výchozí je **běžné spojení jen pro čtení** (`mode=ro`, `query_only`), které
+    zamyká, pozná změnu souboru za běhu a u čekajícího rollbacku to přizná.
+    Absence `-wal` **nedokazuje**, že databáze není živá (soubor v režimu
+    `delete` se zapisuje bez WAL), a `immutable=1` by zámky i detekci změn
+    vypnulo a horký `-journal` ignorovalo — pak by `info` mohlo hlásit
+    nedokončený stav jako v pořádku. `immutable=1` se proto použije jen na
+    **výslovné tvrzení správce** (`--immutable`) o prokazatelně neměnné kopii.
+
+    Vedlejší účinek pravdivě: u databáze ve **WAL** smí SQLite vedle souboru
+    vytvořit prázdné `-wal` a `-shm` (index WAL je nutný i pro čtení); obsah
+    databáze se nemění a checkpoint se neprovede. U databáze v režimu `delete`
+    a při `immutable=1` nevznikne žádný soubor.
+    """
+    if not immutable:
+        return _connect_reader(path)
+    try:
+        return sqlite3.connect(f"{_uri(path, 'ro')}&immutable=1", uri=True, isolation_level=None)
+    except sqlite3.Error as error:
+        raise HistoryError("path", f"databázi {path} nelze otevřít pro čtení: {error}") from None
+
+
+def database_info(path, *, host_id=None, machine_id_path=DEFAULT_MACHINE_ID_PATH, integrity=True,
+                  immutable=False):
+    """Popíše databázi historie bez jakékoli změny (`info`, HISTORY.md 9.6).
+
+    Nikdy nevytváří novou databázi, nemění existující ani neprovádí
+    checkpoint. Chybějící, cizí, poškozený soubor i novější schéma se vrací
+    jako `problems`, ne jako výjimka: příkaz má o souboru říct, co se dá.
+
+    `immutable=True` je **tvrzení volajícího**, že soubor se nemůže měnit
+    (např. generace snímku na read-only médiu). SQLite pak nezamyká, změnu
+    nepozná a čekající rollback ignoruje, proto se to nikdy nedovozuje
+    z absence `-wal`. S existujícím `-wal` se taková kombinace odmítne, aby
+    výpis nevydával obsah bez potvrzených dat za úplný.
+    """
+    path = Path(path)
+    problems = []
+    local = None
+    try:
+        local = local_host_id(machine_id_path) if host_id is None else host_id
+    except (HistoryError, OSError) as error:
+        problems.append(f"otisk tohoto stroje nelze zjistit: {error}")
+    local_print = host_fingerprint(local)
+    companions = tuple(name.name for name in companion_paths(path) if os.path.lexists(name))
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = None
+    try:
+        _check_header(path)
+    except HistoryError as error:
+        problems.append(str(error))
+        return DatabaseInfo(str(path), path.is_file(), size, local_fingerprint=local_print,
+                            companions=companions, problems=tuple(problems))
+    if immutable and any(name.endswith("-wal") for name in companions):
+        problems.append("immutable=1 nelze použít: vedle databáze je -wal, jehož potvrzená data by "
+                        "výpis přehlédl")
+        return DatabaseInfo(str(path), True, size, local_fingerprint=local_print,
+                            companions=companions, problems=tuple(problems))
+    try:
+        conn = _info_connection(path, immutable)
+    except HistoryError as error:
+        problems.append(str(error))
+        return DatabaseInfo(str(path), True, size, local_fingerprint=local_print,
+                            companions=companions, problems=tuple(problems))
+    try:
+        return _read_info(conn, path, size, companions, local, local_print, problems, integrity)
+    except sqlite3.DatabaseError as error:
+        problems.append(f"databázi nelze přečíst: {error}")
+        if any(name.endswith("-journal") for name in companions):
+            # Horký rollback žurnál: čtení ho nesmí dokončit (to je zápis).
+            problems.append("vedle databáze je rollback žurnál: čeká nedokončené zotavení, které "
+                            "čtení provést nesmí. Rozhodne správce (9.6 krok 2)")
+        return DatabaseInfo(str(path), True, size, local_fingerprint=local_print,
+                            companions=companions, problems=tuple(problems))
+    finally:
+        conn.close()
+
+
+def _read_info(conn, path, size, companions, local, local_print, problems, integrity):
+    """Údaje z otevřeného spojení jen pro čtení; chyby se hlásí jako problémy."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    schema_matches = _schema_rows(conn) == expected_schema()
+    if not schema_matches:
+        problems.append(f"schéma se liší od schématu v{SCHEMA_VERSION}")
+    meta = dict(conn.execute("SELECT key, value FROM meta"))
+    role = meta.get(ROLE_KEY)
+    stored = meta.get(HOST_KEY)
+    created = _as_int(meta.get(CREATED_KEY))
+    marker = _as_int(meta.get(SNAPSHOT_KEY))
+    for key in (ROLE_KEY, HOST_KEY, CREATED_KEY):
+        if key not in meta:
+            problems.append(f"chybí meta.{key}")
+    if role is not None and role not in ROLES:
+        problems.append(f"neznámá role {role!r}")
+    if role in ROLES and role not in ALLOWED_ROLES:
+        problems.append(f"role {role} se v tomto kroku neotevírá (jen {', '.join(ALLOWED_ROLES)})")
+    same = None if stored is None or local is None else stored == local
+    if same is False:
+        problems.append("databáze patří jinému stroji; potřebuje ruční převzetí (adopt)")
+    if marker is not None:
+        problems.append(f"obsahuje značku {SNAPSHOT_KEY} = {marker}: obnova ze snímku se zaeviduje "
+                        "při příštím startu zapisovače")
+    if companions:
+        problems.append(f"vedle databáze jsou pomocné soubory: {', '.join(companions)}")
+    checked = None
+    violations = None
+    if integrity:
+        checked = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if checked != "ok":
+            problems.append(f"integrity_check: {checked}")
+        violations = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+        if violations:
+            problems.append(f"porušení cizích klíčů: {violations}")
+    else:
+        # Neprověřená integrita se nikdy nevydává za ověřenou (ani v závěru).
+        problems.append("integrita nebyla ověřena (--no-integrity): o poškození souboru se nic netvrdí")
+    mode = file_journal_mode(path)  # z hlavičky: immutable=1 hlásí delete i u WAL
+    counts, last_run, runs = {}, None, None
+    if schema_matches:
+        for table in SCHEMA_TABLES:
+            counts[table] = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        runs = counts["run"]
+        row = conn.execute("SELECT id, started_utc, stopped_utc, clean_stop, last_write_utc, last_batch, "
+                           "app_version, boot_id FROM run ORDER BY id DESC LIMIT 1").fetchone()
+        if row is not None:
+            last_run = dict(zip(("id", "started_utc", "stopped_utc", "clean_stop", "last_write_utc",
+                                 "last_batch", "app_version", "boot_id"), row))
+    openable = bool(schema_matches and same and role in ALLOWED_ROLES and checked in (None, "ok")
+                    and not violations and version == SCHEMA_VERSION)
+    needs_adopt = bool(schema_matches and same is False and role in ALLOWED_ROLES
+                       and checked in (None, "ok") and not violations)
+    return DatabaseInfo(
+        str(path), True, size, role, version, schema_matches, host_fingerprint(stored), local_print,
+        same, created, marker,
+        {key: value for key, value in meta.items() if key.startswith("restored.")},
+        {key: value for key, value in meta.items() if key.startswith("adopted.")},
+        companions, mode, checked, bool(integrity), violations, runs, last_run, counts, openable,
+        needs_adopt, tuple(problems))
+
+
+def _as_int(value):
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _probe_writer_lock(path):
+    """Zjistí, zda databázi právě nezapisuje jiný proces; nic nevytváří.
+
+    Soubor zámku se **nezakládá**: když neexistuje, žádný zapisovač neběží
+    (vytvořil by si ho). Existující zámek se zkusí získat nevýhradně na okamžik
+    a hned uvolnit, takže se stav jen ověří.
+    """
+    lock = lock_path(path)
+    try:
+        descriptor = os.open(lock, os.O_RDWR | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise HistoryError("path", f"zámek {lock} nelze otevřít: {error}") from None
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except BlockingIOError:
+        raise HistoryError("locked", f"databázi {path} právě zapisuje jiný proces; "
+                                     "převzetí se nedělá za běhu") from None
+    except OSError as error:
+        raise HistoryError("path", f"zámek {lock} nelze ověřit: {error}") from None
+    finally:
+        os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class AdoptReport:
+    """Výsledek ručního převzetí databáze na jiném stroji."""
+
+    source: str
+    target: str
+    role: str
+    from_fingerprint: str | None
+    to_fingerprint: str | None
+    adopted_utc: int
+    snapshot_utc: int | None  # ze které generace databáze pochází, je-li známo
+    verified: bool
+    events: int
+
+
+def _adopt_source_state(source):
+    """Úplné ověření vstupu převzetí; vrací (role, původní host_id, značka obnovy)."""
+    companions = [name for name in companion_paths(source) if os.path.lexists(name)]
+    if companions:
+        raise HistoryError("exists", f"vedle {source} jsou pomocné soubory "
+                                     f"({', '.join(name.name for name in companions)}); "
+                                     "převzetí potřebuje samostatný soubor po čistém ukončení")
+    conn = sqlite3.connect(f"{_uri(source, 'ro')}&immutable=1", uri=True, isolation_level=None)
+    try:
+        _verify(conn, source)  # identita a schéma bez role a stroje: ty se teprve zjišťují
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+        role = meta.get(ROLE_KEY)
+        if role not in ALLOWED_ROLES:
+            raise HistoryError("role", f"{source} má roli {role!r}; převzetí je v tomto kroku jen pro "
+                                       f"{', '.join(ALLOWED_ROLES)}")
+        checked = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if checked != "ok":
+            raise HistoryError("corrupt", f"{source} neprošel integrity_check: {checked}")
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise HistoryError("integrity", f"{source} má {len(violations)} porušení cizích klíčů")
+    except sqlite3.DatabaseError as error:
+        raise HistoryError("corrupt", f"{source} nelze ověřit: {error}") from None
+    finally:
+        conn.close()
+    return role, meta.get(HOST_KEY), _as_int(meta.get(SNAPSHOT_KEY))
+
+
+def adopt_database(source, target, *, host_id=None, machine_id_path=DEFAULT_MACHINE_ID_PATH,
+                   now_utc=None, mounts=None):
+    """Ruční převzetí obnovené databáze na tomto stroji (HISTORY.md 9.6 krok 4).
+
+    Spouští se **jen výslovným příkazem** `adopt`, nikdy automaticky. Vstupní
+    soubor se nemění: výsledek vzniká jako kopie v dočasném souboru a zveřejní
+    se přejmenováním, které **nepřepíše existující cíl**. Podmínky: offline
+    databáze (žádný živý zapisovač), role `test` nebo `development`, žádné
+    zbylé `-wal`/`-shm`/`-journal`, úspěšná úplná kontrola identity a integrity
+    a důvěryhodný systémový čas. Mění se jen `meta.host_id`; původní identita
+    i původ obnovy zůstávají v `meta` a v události `history.adopted`.
+
+    **Hranice garancí (co se skutečně dokazuje):** zámek `.lock` zachytí jen
+    zapisovače NexusSTAT — cizí program pracující přímo se SQLite ho
+    nerespektuje. Proto se navíc (1) odmítnou `-wal`/`-shm`, které u otevřené
+    databáze ve WAL vždy existují, (2) odmítne se `-journal` (nedokončené
+    zotavení), (3) ověří se SHA-256 vstupu **před i po kopii**, takže zápis
+    během čtení se pozná a převzetí se odmítne, a (4) výsledek se úplně ověří
+    a po zveřejnění ještě nezávisle otevře. Výhradní přístup tím **dokázaný
+    není**: `adopt` zůstává operací, kterou správce provádí nad souborem,
+    o kterém ví, že je offline. Vstup se ale nemění za žádných okolností, takže
+    nejhorším následkem souběhu je odmítnuté nebo zahozené převzetí.
+    """
+    from . import storage  # jen tady: storage nepotřebuje nic z history
+
+    check_sqlite()
+    source, target = Path(source), Path(target)
+    local = local_host_id(machine_id_path) if host_id is None else host_id
+    _check_host_id(local)
+    moment = int(time.time()) if now_utc is None else now_utc
+    if isinstance(moment, bool) or not isinstance(moment, int) or moment < MIN_TRUSTED_UTC:
+        raise HistoryError("time", f"systémový čas {moment} není důvěryhodný; převzetí se nedělá")
+    if source.resolve() == target.resolve():
+        raise HistoryError("exists", "cíl převzetí musí být jiný soubor než vstup")
+    if not target.parent.is_dir():
+        raise HistoryError("path", f"adresář {target.parent} neexistuje; vytvořit ho musí správce")
+    for existing in [target, *companion_paths(target)]:
+        if os.path.lexists(existing):
+            raise HistoryError("exists", f"{existing} už existuje a nepřepíše se")
+    try:
+        storage.check_local_path(source, mounts)
+        storage.check_directory(target.parent, "adresář pro převzatou databázi", mounts)
+    except storage.StorageError as error:
+        raise HistoryError("path", str(error)) from None
+    if not storage.supports_rename_noreplace(target.parent):
+        raise HistoryError("path", f"{target.parent} neumí přejmenování bez přepsání cíle "
+                                   "(renameat2 RENAME_NOREPLACE); převzetí se nezveřejňuje")
+    _check_header(source)
+    _probe_writer_lock(source)
+    role, previous, snapshot_utc = _adopt_source_state(source)
+    if previous == local:
+        raise HistoryError("host", f"{source} už patří tomuto stroji; převzetí není potřeba")
+
+    prefix, suffix = f".{target.name}.", ADOPT_SUFFIX
+    descriptor, temporary = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=target.parent)
+    os.close(descriptor)
+    temporary = Path(temporary)
+    try:
+        before = _file_digest(source)
+        shutil.copyfile(source, temporary)
+        if _file_digest(source) != before:
+            # Někdo do vstupu během kopie zapsal: kopie může být nekonzistentní.
+            raise HistoryError("busy", f"{source} se během kopírování změnil; databáze není offline "
+                                       "a převzetí se nedělá")
+        events = _adopt_write(temporary, role, previous, local, moment, source.name)
+        if any(os.path.lexists(name) for name in companion_paths(temporary)):
+            raise HistoryError("adopt", f"po úpravě zůstaly pomocné soubory {temporary}; nezveřejněno")
+        _check_standalone(temporary, role, local)
+        _fsync(temporary)
+        try:
+            storage.rename_noreplace(temporary, target)
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                raise HistoryError("exists", f"{target} mezitím vznikl a nepřepíše se") from None
+            raise HistoryError("adopt", f"převzatou databázi nelze zveřejnit: {error}") from None
+        _fsync(target.parent)
+    finally:
+        for own in [temporary, *companion_paths(temporary)]:
+            own.unlink(missing_ok=True)
+    verified = _adopt_verify(target, role, local, previous, moment, events)
+    return AdoptReport(str(source), str(target), role, host_fingerprint(previous),
+                       host_fingerprint(local), moment, snapshot_utc, verified, events)
+
+
+def _file_digest(path):
+    """SHA-256 souboru: doklad, že se vstup během čtení nezměnil."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        while chunk := file.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _adopt_write(path, role, previous, local, moment, source_name):
+    """Jedna transakce nad kopií: nová identita, evidence původu a událost."""
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        _verify(conn, path, role, previous)  # kopie musí být týž soubor jako ověřený vstup
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE meta SET value = ? WHERE key = ?", (local, HOST_KEY))
+        conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                         [(ADOPTED_HOST_KEY, previous or ""), (ADOPTED_UTC_KEY, str(moment)),
+                          (ADOPTED_SOURCE_KEY, source_name)])
+        event = Event(moment, "synced", "history.adopted", "WARNING",
+                      f"databáze převzata na tomto stroji ze souboru {source_name}",
+                      data={"from_host_id": previous, "to_host_id": local, "role": role,
+                            "source": source_name})
+        conn.execute(INSERT_EVENT_SQL, event.row(None))  # run_id NULL = mimo běh procesu
+        conn.execute("COMMIT")
+        events = conn.execute("SELECT count(*) FROM event WHERE kind = 'history.adopted'").fetchone()[0]
+        # Režim se nepřepíná: výsledek zůstává samostatný soubor jako snímek, ze
+        # kterého vznikl (journal_mode = delete). Do WAL ho převede až první
+        # zapisovač (_configure_writer), takže vedle převzaté databáze nezůstane
+        # žádný -wal ani -shm, které postup obnovy 9.6 výslovně zakazuje.
+    except sqlite3.Error as error:
+        _rollback(conn)
+        raise HistoryError("adopt", f"převzetí nelze zapsat: {error}", _sqlite_name(error)) from None
+    except BaseException:
+        _rollback(conn)
+        raise
+    finally:
+        conn.close()  # poslední spojení provede checkpoint a smaže -wal a -shm
+    return events
+
+
+def _adopt_verify(target, role, local, previous, moment, events):
+    """Nezávislé otevření zveřejněné databáze: platí jen to, co se v ní skutečně čte."""
+    with open_reader(target, role, local) as database:
+        conn = database.connection
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+        rows = conn.execute("SELECT count(*) FROM event WHERE kind = 'history.adopted' AND ts = ?",
+                            (moment,)).fetchone()[0]
+        checked = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    return bool(meta.get(HOST_KEY) == local and meta.get(ADOPTED_HOST_KEY) == (previous or "")
+                and meta.get(ADOPTED_UTC_KEY) == str(moment) and rows == 1
+                and events >= 1 and checked == "ok")
+
+
+def main(argv=None):
+    """Příkazy správce (`python3 -m nexusstat.history info|adopt|generations`).
+
+    Zpracování a výpis má `history_cli`; import je až tady, aby knihovna
+    historie nezávisela na příkazové řádce.
+    """
+    from .history_cli import main as command_line
+
+    return command_line(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

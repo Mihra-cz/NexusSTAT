@@ -75,9 +75,15 @@ STOP_TIMEOUT_SECONDS = 10  # HISTORY.md 5.5
 MAX_WAIT_SECONDS = 10  # vlákno se probudí nejméně jednou za 10 s (HISTORY.md 5.2)
 FINAL_ATTEMPTS = 2  # pokusy o poslední zápis při zastavení (bez čekání na odstup)
 # Odstup opakování podle druhu chyby (HISTORY.md 5.3): (první, nejvyšší) v sekundách; zdvojnásobuje se.
-BACKOFF = {"busy": (5, 60), "full": (60, 600), "io": (60, 600), "locked": (60, 600), "path": (60, 600)}
+# "time": obnovená databáze čeká na doložený čas (M3.4b-2). Krátký odstup, protože
+# synchronizace obvykle dorazí za sekundy; měření mezitím čekají ve frontách.
+BACKOFF = {"busy": (5, 60), "full": (60, 600), "io": (60, 600), "locked": (60, 600), "path": (60, 600),
+           "time": (10, 60)}
 FATAL_KINDS = frozenset({"corrupt", "integrity", "identity"})
-_IDENTITY = frozenset({"foreign", "schema", "role", "host", "alias", "sqlite", "settings"})
+# "restored": nejasná značka obnovy (nečitelná, nevěrohodná) = zásah správce.
+# "restored": nejasná značka obnovy; "companions": pomocné soubory neurčitého původu.
+_IDENTITY = frozenset({"foreign", "schema", "role", "host", "alias", "sqlite", "settings", "restored",
+                       "companions"})
 _TRANSIENT_OPEN = ("SQLITE_IOERR", "SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_CANTOPEN", "SQLITE_READONLY", "SQLITE_PERM")
 # Druh známé ztráty -> událost, která ji zapíše (HISTORY.md 5.4). after_stop se jen počítá.
 LOSS_EVENTS = {"queue_full": "history.gap", "time_unsynced": "history.gap",
@@ -153,6 +159,8 @@ def classify(error):
         return "io" if name.startswith(_TRANSIENT_OPEN) else "corrupt"
     if error.reason in ("locked", "path"):
         return error.reason  # jiný zapisovač nebo chybějící soubor či právo: čekat, nikdy nevytvářet
+    if error.reason == "restored_wait":
+        return "time"  # evidence obnovy čeká na doložený čas: přechodné, zápis se zkusí znovu
     if error.reason in _IDENTITY:
         return "identity"
     return "integrity"  # batch, run: porušené pořadí dávek nebo stav běhu
@@ -1259,8 +1267,33 @@ class HistoryWorker:
             self._retain_at = max(self._retain_at, now + delay)
             self._cond.notify_all()
 
+    def _restored_wait(self):
+        """True, když je databáze obnovená ze snímku a chybí doložený čas.
+
+        Zjišťuje se **jen čtením**, protože otevření pro zápis nastaví
+        `journal_mode = wal`, a to je změna souboru: odmítnutý pokus proto
+        nesmí dojít dál. Chybu čtení tu neřešíme — tu nahlásí samo otevření.
+        """
+        with self._cond:
+            if self._offset is not None:
+                return False
+        try:
+            marker = history.restored_state(self._path, self._role, self._host_id)
+        except (history.HistoryError, OSError):
+            return False  # stav nelze zjistit: rozhodne otevření databáze
+        if marker is None:
+            return False
+        with self._cond:
+            self._set_failure("time", history.HistoryError(
+                "restored_wait", f"{self._path} byla obnovena ze snímku "
+                                 f"{history.snapshot_generation(marker)}; "
+                                 "evidence obnovy čeká na doložený čas (databáze se neotevírá)"))
+        return True
+
     def _open(self):
         """Otevře databázi (a při prvním otevření zahájí běh); vrací True při úspěchu."""
+        if self._recorder is None and self._restored_wait():
+            return False  # obnovená databáze bez doloženého času: neotevírá se vůbec
         try:
             database = self._opener()
         except history.HistoryError as error:
@@ -1270,6 +1303,23 @@ class HistoryWorker:
         if self._recorder is None:
             recorder = history.HistoryRecorder(database)
             quality = "synced" if self._start_synced else "unsynced"
+            if database.restored_utc is not None:  # pojistka pro souběh (viz _restored_wait)
+                # Obnovená databáze (9.6): evidenci obnovy nelze zapsat
+                # s nedoloženým časem, takže se **nic** nezapisuje a pokus se
+                # zopakuje. Měření mezitím čekají ve frontách jako při každé
+                # přechodné chybě; diagnostika důvod uvádí.
+                with self._cond:
+                    trusted = self._offset is not None
+                if not trusted:
+                    self._database = database
+                    self._close_database()
+                    with self._cond:
+                        self._set_failure("time", history.HistoryError(
+                            "restored_wait", f"{database.path} byla obnovena ze snímku "
+                                             f"{history.snapshot_generation(database.restored_utc)}; "
+                                             "evidence obnovy čeká na doložený čas"))
+                    return False
+                quality = "synced"
             try:
                 run_id = recorder.start_run(self._app_version, self._interval_s, self._utc_now(), self._boot_id, quality)
             except history.HistoryError as error:

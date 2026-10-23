@@ -29,7 +29,7 @@ from pathlib import Path
 
 from nexusstat import history, snapshot
 from nexusstat.core import CheckResult, Measurement, State
-from nexusstat.history_link import snapshot_state
+from nexusstat.history_link import snapshot_state, storage_state
 from nexusstat import history_worker
 from nexusstat.history_worker import (
     AGGREGATION_INTERVAL_SECONDS,
@@ -2553,6 +2553,76 @@ class SnapshotAuditTest(WorkerTest):
         self.advance(worker, 60)  # po odstupu se událost dopíše
         self.settle(worker, lambda s: s.confirmed_seq >= snap.event_seq, "čekám na potvrzení události")
         self.assertEqual(len(self.events("history.snapshot")), 1)
+
+
+class RestoredWorkerTest(WorkerTest):
+    """Vlákno zapisovače nad databází obnovenou ze snímku (M3.4b-2, HISTORY.md 9.6)."""
+
+    def restore(self):
+        """Nahradí dočasnou databázi kopií jejího snímku (postup správce z 9.6)."""
+        work, published = self.roots()
+        worker = self.make(snapshot_roots=(work, published))
+        self.fill(worker, 3)
+        self.assertTrue(worker.request_snapshot())
+        self.settle(worker, lambda s: s.maintenance.snapshot.generation is not None, "čekám na snímek")
+        name = worker.status().maintenance.snapshot.generation
+        worker.stop(timeout=WAIT)
+        for path in (self.db, *history.companion_paths(self.db)):
+            path.unlink(missing_ok=True)
+        self.db.write_bytes((published / name / snapshot.SNAPSHOT_DB).read_bytes())
+        return name
+
+    def restored_events(self):
+        return self.events("history.restored")
+
+    def test_writer_records_the_restore_once_and_keeps_measuring(self):
+        name = self.restore()
+        worker = self.make()  # start s doloženým časem
+        self.settle(worker, lambda s: s.state == RUNNING, "čekám na otevření obnovené databáze")
+        self.clock.advance(10)
+        self.submit(worker, temp_state=State.WARNING, temp=75.0)
+        self.assertTrue(worker.flush(WAIT))
+        events = self.restored_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][2], "WARNING")
+        self.assertEqual(events[0][3]["generation"], name)
+        self.assertEqual(self.events("process.unclean_stop"), [])  # místo běžné dvojice
+        self.assertIsNone(worker.status().error_kind)
+        self.assertGreater(worker.status().confirmed_measurements, 0)  # měření pokračuje
+
+    def test_restore_waits_for_a_trusted_time_without_writing(self):
+        self.restore()
+        worker = self.make(synced=False)  # bez doloženého času
+        self.settle(worker, lambda s: s.error_kind == "time", "čekám na odložení evidence obnovy")
+        status = worker.status()
+        self.assertEqual(status.state, DEGRADED)
+        self.assertIn("čeká na doložený čas", status.last_error)
+        self.assertEqual(self.query("SELECT count(*) FROM run"), [(1,)])  # jen běh ze snímku
+        self.assertEqual(self.restored_events(), [])
+        state, text = storage_state(status, time_synced=False, source="test")
+        self.assertIs(state, State.WARNING)  # pravdivá diagnostika, ne OK ani ERROR
+        self.assertIn("time", text)
+        # Po doložení času se evidence zapíše a zápis pokračuje.
+        self.submit(worker, synced=True)
+        self.advance(worker, 60)
+        self.settle(worker, lambda s: s.state == RUNNING, "čekám na obnovený zápis")
+        self.assertTrue(worker.flush(WAIT))
+        self.assertEqual(len(self.restored_events()), 1)
+
+    def test_unclear_marker_stops_the_writer_for_the_administrator(self):
+        self.restore()
+        raw = sqlite3.connect(self.db)
+        raw.execute("UPDATE meta SET value = 'nesmysl' WHERE key = ?", (history.SNAPSHOT_KEY,))
+        raw.commit()
+        raw.close()
+        worker = self.make()
+        self.settle(worker, lambda s: s.state == FAILED, "čekám na odmítnutí nejasného stavu")
+        status = worker.status()
+        self.assertEqual(status.error_kind, "identity")
+        self.assertIn("rozhodne správce", status.last_error)
+        state, text = storage_state(status)
+        self.assertIs(state, State.ERROR)
+        self.assertEqual(self.query("SELECT count(*) FROM run"), [(1,)])  # nic se nezapsalo
 
 
 def _doc_block(name):

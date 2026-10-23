@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +35,7 @@ SNAPSHOT_RECORD = "history-snapshot.json"
 RECORD_VERSION = 1
 
 # Jméno generace je čas snímku v UTC; pořadí jmen je pořadí generací.
-GENERATION_FORMAT = "%Y%m%dT%H%M%SZ"
+GENERATION_FORMAT = history.SNAPSHOT_GENERATION_FORMAT  # jediná definice je v history.py
 GENERATION_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z")
 WORK_PREFIX = "."
 WORK_SUFFIX = ".partial"
@@ -476,3 +477,95 @@ def check_restore(generation_path, *, role=None, host_id=None):
     return RestoreReport(record.generation, not problems, record.snapshot_utc, record.bytes, record.sha256,
                          MappingProxyType(dict(checked["rows"])), checked["integrity"], 0,
                          checked["journal_mode"], MappingProxyType(counts), tuple(problems))
+
+
+# --- M3.4b-2: návrh správy starých generací (jen read-only výpočet) ---------------
+
+# Výchozí **návrh** retence generací, ne schválená hodnota: týden denních snímků
+# a nic mladšího než 48 h (zálohovací úloha ještě nemusela proběhnout).
+# Mazání generací není implementované a aktivace vyžaduje samostatné schválení
+# po ověření provozního Resticu a testu obnovy (docs/HISTORY.md 9.7).
+KEEP_GENERATIONS = 7
+MIN_KEEP_SECONDS = 2 * 86400
+
+
+@dataclass(frozen=True)
+class GenerationState:
+    """Jedna generace tak, jak ji vidí read-only plán."""
+
+    name: str
+    valid: bool
+    snapshot_utc: int | None = None
+    bytes: int | None = None
+    problem: str | None = None
+
+
+@dataclass(frozen=True)
+class RetentionPlan:
+    """Plán správy generací spočítaný **jen čtením** (dry-run).
+
+    `deletable` je vždy prázdná: tento krok žádnou generaci nemaže a žádnou
+    cestu k mazání neobsahuje. `candidates` říká, co by šlo smazat, až bude
+    mazání schválené; `blockers` říká, proč se nemaže teď.
+    """
+
+    generations: tuple
+    keep: int
+    min_keep_seconds: int
+    protected: Mapping
+    candidates: tuple
+    blockers: tuple
+    deletable: tuple = ()
+    newest_valid: str | None = None
+
+
+def retention_candidates(published_root, *, now_utc, keep=KEEP_GENERATIONS,
+                         min_keep_seconds=MIN_KEEP_SECONDS, restorable=None,
+                         backup_verified=False, mounts=None):
+    """Read-only plán: které generace jsou chráněné a které by byly kandidáty.
+
+    Nikdy nic nemaže ani neotevírá pro zápis; generace jen čte a ověřuje
+    (`load_generation`). Chráněné jsou vždy: poslední platná generace, poslední
+    známá obnovitelná generace (`restorable`, výsledek testu obnovy), generace
+    mladší než `min_keep_seconds`, nejnovějších `keep` platných generací
+    a **každá** generace, kterou nelze ověřit (o poškozené nebo nedokončené
+    rozhoduje správce, ne automat). Dokud není doložený výsledek zálohy
+    (`backup_verified`), je plán zablokovaný: generaci, kterou možná právě
+    čte nebo ještě nezazálohoval Restic, nelze bezpečně vybrat.
+    """
+    root = Path(published_root)
+    blockers = []
+    try:
+        storage.check_directory(root, "adresář generací snímků", mounts)
+    except storage.StorageError as error:
+        # Neověřitelná nebo změněná cesta: nic se nenavrhuje ani nepočítá.
+        return RetentionPlan((), keep, min_keep_seconds, MappingProxyType({}), (),
+                             (f"path: {error}",))
+    states, protected = [], {}
+    for name in generations(root):
+        try:
+            generation = load_generation(root / name)
+        except (SnapshotError, OSError) as error:
+            states.append(GenerationState(name, False, problem=str(error)))
+            protected[name] = "neověřitelná generace: rozhodne správce"
+            continue
+        states.append(GenerationState(name, True, generation.record.snapshot_utc, generation.record.bytes))
+    valid = [state for state in states if state.valid]
+    newest = valid[-1].name if valid else None
+    if newest is not None:
+        protected.setdefault(newest, "poslední platná generace")
+    if restorable is not None and any(state.name == restorable for state in states):
+        protected.setdefault(restorable, "poslední známá obnovitelná generace")
+    for state in valid:
+        if state.snapshot_utc is not None and now_utc - state.snapshot_utc < min_keep_seconds:
+            protected.setdefault(state.name, f"mladší než {min_keep_seconds // 3600} h")
+    for state in valid[-keep:] if keep > 0 else ():
+        protected.setdefault(state.name, f"v počtu {keep} uchovávaných generací")
+    candidates = tuple(state.name for state in valid if state.name not in protected)
+    if not backup_verified:
+        # Restic se v tomto kroku nečte: jeho běh, přerušení ani výsledek na NAS
+        # nejsou doložené, takže se nesmaže nic (docs/HISTORY.md 9.7).
+        blockers.append("backup_unverified: výsledek zálohy není doložený, generace se nemažou")
+    blockers.append("not_implemented: mazání generací není implementované (M3.4b-2 je jen návrh)")
+    return RetentionPlan(tuple(states), keep, min_keep_seconds, MappingProxyType(dict(protected)),
+                         candidates, tuple(blockers), (), newest)
