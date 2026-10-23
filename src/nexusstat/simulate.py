@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .config import Config, load_config
 from .core import CheckResult, Measurement, State, active_problems
+from .fan_monitor import CPU_FAN_ID, DEVICE, FAN_ON, FAN_STATE, RPM, SOURCE, SOURCE_RPM
 from .network_monitor import (
     ADDRESS,
     BYTES_PER_SECOND,
@@ -69,6 +70,9 @@ def sample_results(observed_utc):
         sim(CPU_USAGE_ID, State.INFO, "CPU 23 %", value=Measurement(23, PERCENT)),
         sim(CPU_TEMP_ID, State.INFO, "Teplota CPU 48 °C", value=Measurement(48, CELSIUS)),
         sim(MEMORY_ID, State.INFO, "RAM 24 % z 7,9 GiB", value=Measurement(24, PERCENT)),
+        # Ventilátor CPU: doložené otáčky (čtvrtý řádek SYSTEM, zobrazí se "ON 3200").
+        sim(CPU_FAN_ID, State.INFO, "Ventilátor CPU ON (3200 RPM)", value=Measurement(3200, RPM),
+            details={FAN_STATE: FAN_ON, SOURCE: SOURCE_RPM, DEVICE: "pwmfan"}),
         sim(DISK_ROOT_ID, State.INFO, "Disk / 31 % z 117 GiB", value=Measurement(31, PERCENT)),
         # Fiktivní hodnoty pro stránku NETWORK (stejná id a details jako kolektor).
         sim(LINK_ID, State.INFO, "Síť eth0 UP", details={**eth0, LINK: LINK_UP}),

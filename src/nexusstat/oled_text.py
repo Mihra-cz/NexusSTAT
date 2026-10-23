@@ -13,6 +13,7 @@ KB/s a MB/s (výslovně zadané pro stránku NETWORK).
 import hashlib
 
 from .core import ALERT_STATES, State, effective
+from .fan_monitor import CPU_FAN_ID, FAN_ON, FAN_STATE, SOURCE, SOURCE_REQUEST
 from .network_monitor import ADDRESS, BYTES_PER_SECOND, INTERFACE, IPV4_ID, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
 from .services import BACKUP_ID, NAS_ID, SERVICE_LABELS
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
@@ -35,6 +36,7 @@ CHECK_NAMES = {
     CPU_USAGE_ID: "CPU",
     CPU_TEMP_ID: "CPU TEMP",
     MEMORY_ID: "RAM",
+    CPU_FAN_ID: "CPU FAN",
     DISK_ROOT_ID: "ROOT",
     # Síť: nejvýš 6 znaků, aby se ve STATUS vešlo i "NET RX NO DATA" (15 znaků).
     LINK_ID: "LINK",
@@ -75,9 +77,13 @@ STALE = "STALE"  # výsledek prošel a nový nepřišel (BACKUP OVERDUE je jiná
 
 # Které výsledky (podle id) ukazují stránky s hodnotami, řádek po řádku.
 PAGE_CHECKS = {
-    "SYSTEM": (CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID),
+    "SYSTEM": (CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID, CPU_FAN_ID),
     "DISK": (DISK_ROOT_ID,),
 }
+
+# Předpona stavu, který je znám jen z požadavku řízení. Displej tím nikdy
+# netvrdí, že se ventilátor otáčí (REQUIREMENTS.md 85).
+REQUEST_PREFIX = "REQ"
 
 # Stránka NETWORK. Řádek linky má místo názvu jméno rozhraní; když rozhraní
 # neznáme (žádné nenalezeno, data chybí nebo prošla), zůstane obecné LINK.
@@ -145,10 +151,37 @@ def value_text(result, now):
     return STATE_TEXT[current.state]
 
 
+def fan_value(result, now):
+    """Hodnota řádku CPU FAN: jednoduchý stav, u měřených otáček s číslem.
+
+    `ON 3200` jsou doložené otáčky s doplňujícím číslem, `OFF` doložené stání,
+    `REQ ON` a `REQ OFF` stav známý **jen z požadavku řízení** (žádné tvrzení
+    o otáčení). `UNKN` je nečitelný, nejednoznačný nebo prošlý údaj, `N/A`
+    znamená, že prokazatelný zdroj na stroji není.
+    """
+    if result is None:
+        return STATE_TEXT[State.UNKNOWN]
+    current = effective(result, now)
+    state = current.details.get(FAN_STATE)
+    if state is None:
+        # Bez stavu v details (prošlý výsledek, chyba, chybějící zdroj) rozhoduje stav kontroly.
+        return STATE_TEXT[current.state]
+    if current.details.get(SOURCE) == SOURCE_REQUEST:
+        return f"{REQUEST_PREFIX} {state}"
+    if state == FAN_ON and current.measurement is not None:
+        return f"{state} {current.measurement.value:.0f}"
+    return state
+
+
 def page_rows(page, results, now):
     """Řádky stránek SYSTEM a DISK: (název, hodnota) v pevném pořadí podle id."""
     by_id = {result.id: result for result in results}
-    return [(check_name(check_id), value_text(by_id.get(check_id), now)) for check_id in PAGE_CHECKS.get(page, ())]
+    rows = []
+    for check_id in PAGE_CHECKS.get(page, ()):
+        # Řádek CPU FAN ukazuje stav z details (ON/OFF), ostatní číselnou hodnotu.
+        value = fan_value(by_id.get(check_id), now) if check_id == CPU_FAN_ID else value_text(by_id.get(check_id), now)
+        rows.append((check_name(check_id), value))
+    return rows
 
 
 def detail_text(result, key, missing):

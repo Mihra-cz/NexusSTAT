@@ -150,7 +150,8 @@ class ValueTextTest(unittest.TestCase):
             result(MEMORY_ID, State.INFO, 24.4, "%"),
             result(DISK_ROOT_ID, State.WARNING, 91.0, "%"),
         ]
-        self.assertEqual(page_rows("SYSTEM", results, 10), [("CPU", "23%"), ("CPU TEMP", "88°C"), ("RAM", "24%")])
+        self.assertEqual(page_rows("SYSTEM", results, 10),
+                         [("CPU", "23%"), ("CPU TEMP", "88°C"), ("RAM", "24%"), ("CPU FAN", "UNKN")])
         self.assertEqual(page_rows("DISK", results, 10), [("ROOT", "91%")])
         self.assertEqual(page_rows("NEXUS", results, 10), [])
 
@@ -575,7 +576,8 @@ class RenderedTextTest(unittest.TestCase):
         image = Image.new("1", (128, 64))
         render.draw_value_page(image, "SYSTEM", page_rows("SYSTEM", controller_results, 0), False)
         expected = Image.new("1", (128, 64))
-        render.draw_value_page(expected, "SYSTEM", [("CPU", "UNKN"), ("CPU TEMP", "88°C"), ("RAM", "UNKN")], False)
+        render.draw_value_page(expected, "SYSTEM",
+                               [("CPU", "UNKN"), ("CPU TEMP", "88°C"), ("RAM", "UNKN"), ("CPU FAN", "UNKN")], False)
         self.assertEqual(image.tobytes(), expected.tobytes())
 
 

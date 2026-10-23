@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .core import CheckResult, State, is_finite_number
+from .fan_monitor import CPU_FAN_ID, RPM
 from .network_monitor import BYTES_PER_SECOND, INTERFACE, RX_RATE_ID, TX_RATE_ID
 from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
 
@@ -935,6 +936,9 @@ SERIES = {
     CPU_USAGE_ID: SeriesSpec(PERCENT),
     CPU_TEMP_ID: SeriesSpec(CELSIUS),
     MEMORY_ID: SeriesSpec(PERCENT),
+    # Ventilátor CPU (M4-1): jen naměřené otáčky. Stav z požadavku řízení
+    # žádnou číselnou řadu nemá (otáčky se neodhadují).
+    CPU_FAN_ID: SeriesSpec(RPM),
     DISK_ROOT_ID: SeriesSpec(PERCENT),
     RX_RATE_ID: SeriesSpec(BYTES_PER_SECOND, INTERFACE),
     TX_RATE_ID: SeriesSpec(BYTES_PER_SECOND, INTERFACE),

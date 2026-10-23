@@ -46,10 +46,13 @@ CLOCK_SCALE = 2
 # Záhlaví stránek SYSTEM, DISK, NETWORK, SERVICES a STATUS: nadpis nahoře, pod ním čára.
 HEADER_LINE_Y = 13
 
-# SYSTEM a DISK: až 3 řádky po 15 px (inkoust 17–58 px), název vlevo,
-# hodnota tučně vpravo jako stav na stránce SERVICES.
+# SYSTEM a DISK: do 3 řádků rozteč 15 px (inkoust 17–58 px), název vlevo,
+# hodnota tučně vpravo jako stav na stránce SERVICES. Od čtyř řádků (SYSTEM
+# s CPU FAN) se použije rozteč stránky SERVICES, jinak by poslední řádek
+# nevyšel na 64 px; stránka DISK s jedním řádkem zůstává beze změny.
 VALUE_ROW_TOP = 16
 VALUE_ROW_STEP = 15
+VALUE_ROWS_COMPACT = 4
 VALUE_MAX_WIDTH = 72  # 9 tučných znaků; nesmyslně dlouhé číslo se zkrátí, název zůstane
 LABEL_GAP = 4  # nejméně volných sloupců mezi názvem a hodnotou
 
@@ -211,8 +214,11 @@ def draw_header(image, title, simulated, right_text=None):
 def draw_value_page(image, title, rows, simulated):
     """Stránky SYSTEM a DISK: řádky (název, hodnota), hodnoty pod sebou zarovnané vpravo."""
     draw = draw_header(image, title, simulated)
+    compact = len(rows) >= VALUE_ROWS_COMPACT
+    top = SERVICES_ROW_TOP if compact else VALUE_ROW_TOP
+    step = SERVICES_ROW_STEP if compact else VALUE_ROW_STEP
     for row, (label, value) in enumerate(rows):
-        y = VALUE_ROW_TOP + row * VALUE_ROW_STEP
+        y = top + row * step
         value_left = draw_right(draw, fit_text(value, font(TITLE_FONT), VALUE_MAX_WIDTH), font(TITLE_FONT), y)
         draw.text((0, y), fit_text(label, font(TEXT_FONT), value_left - LABEL_GAP), font=font(TEXT_FONT), fill=1)
 

@@ -19,6 +19,7 @@ from nexusstat.core import CheckResult, Measurement, State, active_problems, eff
 from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol
 from nexusstat.oled_text import page_rows
 from nexusstat.config import Config, HistoryConfig, NetworkConfig, SnapshotConfig
+from nexusstat.fan_monitor import LABELS as FAN_LABELS, FanMonitor
 from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
 from nexusstat.run import (COLLECTOR_FAILURE, Collectors, Stopper, failed_results, failure_name,
                           format_line, live_monitor, main, run_loop, start_history)
@@ -257,7 +258,8 @@ class ExpiryTest(unittest.TestCase):
         # Během zaseknutí by displej ukazoval jen to, co víme: od 30 s UNKNOWN.
         self.assertIs(overall_state(first, START + 29.9), State.INFO)
         self.assertIs(overall_state(first, START + 30), State.UNKNOWN)
-        self.assertEqual(page_rows("SYSTEM", first, START + 40), [("CPU", "UNKN"), ("CPU TEMP", "UNKN"), ("RAM", "UNKN")])
+        self.assertEqual(page_rows("SYSTEM", first, START + 40),
+                         [("CPU", "UNKN"), ("CPU TEMP", "UNKN"), ("RAM", "UNKN"), ("CPU FAN", "UNKN")])
 
 
 class CollectorFailureTest(unittest.TestCase):
@@ -392,13 +394,13 @@ class CollectorsTest(unittest.TestCase):
 
     def test_live_monitor_reads_system_and_configured_network(self):
         monitor = live_monitor(Config(collector=CollectorConfig(interval_seconds=5), network=NetworkConfig("end0")))
-        system, network = monitor.monitors
+        system, fan, network = monitor.monitors
         self.assertIsInstance(system, SystemMonitor)
         self.assertIsInstance(network, NetworkMonitor)
         self.assertEqual(network.interface, "end0")
         self.assertEqual((system.validity_seconds, network.validity_seconds, monitor.validity_seconds), (15, 15, 15))
         self.assertFalse(monitor.simulated)  # skutečné zdroje, nic se při vytvoření nečte
-        self.assertIsNone(live_monitor(Config()).monitors[1].interface)  # výchozí: automatický výběr
+        self.assertIsNone(live_monitor(Config()).monitors[2].interface)  # výchozí: automatický výběr
 
 
 class TerminationTest(unittest.TestCase):
@@ -501,7 +503,8 @@ class OledCompatibilityTest(unittest.TestCase):
         controller.press(START + 21, problem_count=len(active_problems(results, START + 21)))
         controller.update(START + 31)
         self.assertEqual(controller.current_page(START + 31), "SYSTEM")
-        self.assertEqual(page_rows("SYSTEM", results, START + 31), [("CPU", "5%"), ("CPU TEMP", "48°C"), ("RAM", "24%")])
+        self.assertEqual(page_rows("SYSTEM", results, START + 31),
+                         [("CPU", "5%"), ("CPU TEMP", "48°C"), ("RAM", "24%"), ("CPU FAN", "UNKN")])
         self.assertIsNone(home_symbol(results, START + 31))
 
         # Další měření nepřišlo: po třech intervalech hodnoty zmizí a STATUS ukáže UNKNOWN.
@@ -846,13 +849,13 @@ class MainTest(unittest.TestCase):
         self.assertEqual(monitor.validity_seconds, 30)
         self.assertFalse(any(rule.enabled for rule, _ in evaluator.rules.values()))
         # Smyčka měří systém i síť, rozhraní se vybírá automaticky.
-        self.assertEqual(list(monitor.labels), list(LABELS) + list(NETWORK_LABELS))
-        self.assertIsNone(monitor.monitors[1].interface)
+        self.assertEqual(list(monitor.labels), list(LABELS) + list(FAN_LABELS) + list(NETWORK_LABELS))
+        self.assertIsNone(monitor.monitors[2].interface)
 
     def test_network_interface_from_config(self):
         run_loop_mock, _ = self.run_main(["--config", self.write_config('[network]\ninterface = "eth0"\n')])
         monitor, _, _ = run_loop_mock.call_args.args
-        self.assertEqual(monitor.monitors[1].interface, "eth0")
+        self.assertEqual(monitor.monitors[2].interface, "eth0")
 
     def test_alarm_rules_from_config(self):
         text = "[alarms.disk_root]\nenabled = true\nwarning = 85\nerror = 95\nhysteresis = 3\n"

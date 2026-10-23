@@ -27,6 +27,7 @@ from unittest import mock
 
 from nexusstat import history
 from nexusstat.core import CheckResult, Measurement, State
+from nexusstat.fan_monitor import CPU_FAN_ID, RPM
 from nexusstat.history import ClockState, Event, HistoryError, HistoryRecorder, PendingSample, QueueState
 from nexusstat.network_monitor import BYTES_PER_SECOND, INTERFACE, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
 from nexusstat.system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
@@ -774,7 +775,11 @@ class WriterContractTest(RecorderTest):
     def test_catalog_has_only_collector_series(self):
         self.assertEqual({check_id: (spec.unit, spec.subject_key) for check_id, spec in history.SERIES.items()}, {
             CPU_USAGE_ID: (PERCENT, None), CPU_TEMP_ID: (CELSIUS, None), MEMORY_ID: (PERCENT, None),
-            DISK_ROOT_ID: (PERCENT, None), RX_RATE_ID: (BYTES_PER_SECOND, INTERFACE), TX_RATE_ID: (BYTES_PER_SECOND, INTERFACE)})
+            DISK_ROOT_ID: (PERCENT, None), RX_RATE_ID: (BYTES_PER_SECOND, INTERFACE),
+            TX_RATE_ID: (BYTES_PER_SECOND, INTERFACE),
+            # Ventilátor CPU (M4-1): jen naměřené otáčky; stav z požadavku řízení
+            # žádnou číselnou řadu nemá.
+            CPU_FAN_ID: (RPM, None)})
 
     def test_start_run_records_run_and_event(self):
         info = history.run_info(self.database.connection, self.run_id)

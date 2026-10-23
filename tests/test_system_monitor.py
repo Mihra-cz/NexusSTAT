@@ -408,7 +408,10 @@ class CoreAndOledIntegrationTest(FixtureCase):
     def test_value_pages(self):
         results = self.collect_twice(now=100)
         # Displej ukazuje číselnou hodnotu zaokrouhlenou stejně jako summary, anglicky.
-        self.assertEqual(page_rows("SYSTEM", results, 100), [("CPU", "20%"), ("CPU TEMP", "55°C"), ("RAM", "25%")])
+        # Kolektor systému ventilátor neměří: jeho řádek zůstává UNKN, dokud
+        # výsledky nepřijdou od FanMonitor (M4-1).
+        self.assertEqual(page_rows("SYSTEM", results, 100),
+                         [("CPU", "20%"), ("CPU TEMP", "55°C"), ("RAM", "25%"), ("CPU FAN", "UNKN")])
         self.assertEqual(page_rows("DISK", results, 100), [("ROOT", "21%")])
 
     def test_valid_values_give_no_symbol_and_no_problems(self):
@@ -442,7 +445,8 @@ class CoreAndOledIntegrationTest(FixtureCase):
         self.assertEqual(len(active_problems(results, expired_at)), 4)
 
     def test_missing_results_show_unkn(self):
-        self.assertEqual(page_rows("SYSTEM", [], 0), [("CPU", "UNKN"), ("CPU TEMP", "UNKN"), ("RAM", "UNKN")])
+        self.assertEqual(page_rows("SYSTEM", [], 0),
+                         [("CPU", "UNKN"), ("CPU TEMP", "UNKN"), ("RAM", "UNKN"), ("CPU FAN", "UNKN")])
 
     def test_collector_problems_drive_status_paging(self):
         results = self.monitor().collect(0, OBSERVED)  # jediný problém: první vzorek CPU

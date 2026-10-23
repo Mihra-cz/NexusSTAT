@@ -18,7 +18,7 @@ Vychází z požadavků v `REQUIREMENTS.md` (Historie a databáze SQLite) a ze s
 | `network.link` | `UP`/`DOWN`, rozhraní (`details`) | změny → `check_change` |
 | `network.ipv4` | adresa (`details`) | změny → `check_change` (jen lokálně, nikdy veřejně) |
 | `service.nexus`, `service.nas`, `service.backup`, `service.animedb` | jen stav (`UNKNOWN`, `N/A`, budoucí `OK`…) | změny → `check_change` |
-| budoucí CPU FAN | otáčky RPM, stupeň chlazení `cur_state`; `ON`/`OFF` | číselné řady + změny stavu |
+| `system.cpu_fan` (M4-1) | `ON`/`OFF` v `details` (`source` = `rpm`/`request`); RPM jen s tachometrem | změny stavu + číselná řada, je-li co měřit |
 | budoucí STORAGE | % obsazení, volné bajty po mountech; dostupnost mountu | číselné řady (objekt = mount) + změny stavu |
 | budoucí NAS | dostupnost, případně odezva v ms | změny stavu + číselná řada |
 | budoucí Restic | stáří poslední zálohy v s, výsledek | číselná řada + změny stavu |
@@ -1246,7 +1246,7 @@ Rozhraní pro budoucí jediný zapisovač z M3.3; schéma v1 se nezměnilo.
 | `finish_run(now_utc, ts_quality)` | čisté ukončení (`stopped_utc`, `clean_stop = 1`, zbývající souhrn ztrát, `process.stop`); opakované volání nic nezdvojí |
 | `run_info()`, `high_water()` | evidence běhu a horní mez i přes spojení jen pro čtení |
 
-- **Katalog** (`SERIES`): `system.cpu_usage` a `system.memory` a `disk.root` (%), `system.cpu_temp` (°C), `network.rx_rate` a `network.tx_rate` (B/s, objekt = `details["interface"]`). Řada (`metric`) vznikne až s prvním přijatým vzorkem, a to v transakci dávky.
+- **Katalog** (`SERIES`): `system.cpu_usage` a `system.memory` a `disk.root` (%), `system.cpu_temp` (°C), `network.rx_rate` a `network.tx_rate` (B/s, objekt = `details["interface"]`), od M4-1 navíc `system.cpu_fan` (RPM). Řada (`metric`) vznikne až s prvním přijatým vzorkem, a to v transakci dávky. Stav ventilátoru známý jen z požadavku řízení **žádnou číselnou řadu nemá** (otáčky se neodhadují); zapíše se jen jako změna stavu v `details` (R4).
 - **Hodnoty:** 0 je 0, `UNKNOWN` je `NULL`, chybějící výsledek nic, `N/A` jen změnu stavu. Mimo pravidla 4.1 se vzorek nezapíše a započítá také jako `unknown_series` (číslo kontroly mimo katalog), `no_subject` (síť bez rozhraní), `missing_value`, `invalid_value` (NaN, nekonečno), `unit_mismatch` (jiná jednotka než katalog nebo než uložená řada) a `simulated`.
 - **Horní mez** (`run.last_write_utc`) = nejnovější vzorek, který běh skutečně vložil. Vzorek odmítnutý pravidly přijetí, časem nebo jednotkou se do dávky vůbec nedostane; vzorek odmítnutý databází (konflikt, jiná jednotka uložené řady) a duplicita mez neposunou; opakovaná dávka nic nemění. Ověřeno i restartem po každém z případů (`HighWaterTest`).
 - **Kvalita času** je vstup volajícího (zdroj synchronizace Raspberry Pi se tu nezjišťuje): `synced` a `derived` dovolí vzorky, `unsynced` ne. Čas před 2026-01-01 je vždy `unsynced`, i u startu, ukončení a událostí; `Event` s takovým časem a jinou kvalitou se odmítne. Změny a události se zapíšou vždy se svou kvalitou. Zapisovač žádný čas neodhaduje ani nedopočítává. `clock.jump` se pozná ze změny `observed_utc − expires_monotonic` o víc než 2 s.

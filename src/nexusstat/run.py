@@ -26,6 +26,7 @@ from . import __version__, history
 from .alarms import AlarmEvaluator
 from .config import HISTORY_ROLE, Config, ConfigError, load_config
 from .core import ALERT_STATES, CheckResult, State, overall_state
+from .fan_monitor import FanMonitor
 from .history_link import open_history
 from .network_monitor import NetworkMonitor
 from .system_monitor import SystemMonitor
@@ -107,10 +108,12 @@ class Collectors:
 
 
 def live_monitor(config):
-    """Skutečné read-only kolektory tohoto počítače: systém a síť podle konfigurace."""
+    """Skutečné read-only kolektory: systém, ventilátor CPU a síť podle konfigurace."""
     validity = config.collector.validity_seconds
     return Collectors(
         SystemMonitor(validity_seconds=validity),
+        # Ventilátor CPU se jen čte; chlazení dál řídí Linux (M4-1).
+        FanMonitor(validity_seconds=validity),
         NetworkMonitor(validity_seconds=validity, interface=config.network.interface),
     )
 
