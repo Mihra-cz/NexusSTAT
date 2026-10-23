@@ -1,6 +1,21 @@
 # Changelog NexusSTAT
 
-## 2026-10-24 – M4-1: read-only monitoring CPU FAN a čtvrtý řádek SYSTEM (lokálně)
+## 2026-10-23 – návrh: RGB LED, OLED a potvrzování závad (jen dokumentace, neimplementováno)
+
+- Zapsáno schválené chování čtyř RGB LED jako **návrh, který není implementovaný**: v normálním stavu OLED spí a LED jsou zhasnuté; krátký stisk probudí OLED a LED se rozsvítí tlumeně bíle, po uspání OLED bílá zhasne. **Bílá značí zdravý ověřený stav**, ne jen nepřítomnost alarmu. Chování tlačítka, přechody CAROUSEL/STATUS a časování OLED beze změny; OLED se kvůli závadě samo neprobouzí.
+- Rozhodnutí správce (2026-10-23), zapsaná v `docs/REQUIREMENTS.md`:
+  1. `UNKNOWN` nikdy nebliká. Neimplementovaný nebo záměrně nesledovaný zdroj (služba z katalogu bez kolektoru, `N/A`) bílé nebrání; skutečně monitorovaná kontrola s nedostupnými nebo prošlými daty bílou vyloučí a OLED ukazuje `?`.
+  2. Potvrzení `WARNING`/`ERROR` přežívá restart a zaniká až po doloženém odeznění: nejméně tři po sobě jdoucí platná měření bez závady, nebo delší řada podle `confirm_count` alarmového pravidla; `UNKNOWN` se nepočítá, takže uložené potvrzení nezanikne během počátečního potvrzování po restartu. Nová epizoda a zhoršení `WARNING` → `ERROR` vyžadují nové potvrzení, `CRITICAL` je signalizovaný i po potvrzení.
+  3. Probuzení OLED jednou přehraje kódy potvrzených aktivních závad, pak LED zhasnou; nepotvrzené závady a `CRITICAL` mají přednost. Žádné nové gesto tlačítka.
+  4. `WARNING`/`ERROR`: 0,4 s svit, 0,4 s tma, po skupině pauza 2 s, všechny čtyři LED společně. `CRITICAL`: červená 0,25 s / 0,25 s nepřetržitě, potvrzením neumlčitelná. Jediný jas 5–100 % (výchozí 20 %), bílá asi na polovině.
+  5. Stabilní kategorie 1 Nexus a systém (`service.nexus`, `system.*`, `history.storage`), 2 NAS, 3 AnimeDB, 4 zálohy (`service.backup`, `history.snapshot`), 5 Docker a ostatní služby, sem i každé nezařazené id skutečné závady. `INFO`, `UNKNOWN`, `N/A` a provozní údaje neblikají; žádné nové alarmy kvůli RGB.
+  6. Jas, potvrzení a údaje k rozpoznání nové epizody nebo zhoršení v samostatném malém souboru v `appdata` (při implementaci atomický zápis, soukromá oprávnění, zachování po restartu, zahrnutí do záloh). Schéma SQLite v1 beze změny.
+  7. Budoucí ovladač při inicializaci i korektním vypnutí zhasne všechny LED. **Provozní omezení M7:** WS2812 mohou po pádu procesu držet poslední barvu a ukončení aplikace to neodstraní. Pironman zůstává v provozu a ovládá RGB do samostatně schváleného převzetí.
+- Architektura: pět oddělených údajů (skutečný stav, závažnost, potvrzení, výsledná signalizace, stav OLED), čistá rozhodovací funkce `rgb_signal()` nad výsledky kolektorů před doplněním katalogem služeb a přehrávač oddělené od budoucího ovladače Adafruit NeoPixel SPI. Potvrzení vlastní hlavní proces, audit jde existující frontou zapisovače historie. Vstupem jsou existující `CheckResult` po `AlarmEvaluator`u, žádný nový alarmový systém.
+- Úklid dokumentace: opravena prokazatelně zastaralá tvrzení — CPU FAN je od M4-1 implementovaný lokálně, SQLite historie a snímky jsou implementované lokálně (M3), RGB a potvrzování jsou jen návrh. **Datum M4-1 opraveno z 2026-10-24 na 2026-10-23** podle commitu 2aee846 (2026-10-23 18:11 +0200); obsah záznamu M4-1 beze změny.
+- Změněno: `docs/REQUIREMENTS.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `docs/CHANGELOG.md`, `README.md`, `manifest.toml`. Kód, testy a konfigurace beze změny; projekt zůstává `development` / `not-deployed`.
+
+## 2026-10-23 – M4-1: read-only monitoring CPU FAN a čtvrtý řádek SYSTEM (lokálně)
 
 - Nový `src/nexusstat/fan_monitor.py`: read-only kolektor hlavního ventilátoru CPU. Čte jen `/sys/class/hwmon/hwmon*` (`name`, `fanN_input`, `fanN_label`, `pwmN`) a `/sys/class/thermal/cooling_device*` (`type`, `cur_state`, `max_state`); **nic nezapisuje do sysfs, neřídí PWM ani ventilátor a nespouští žádný příkaz** — chlazení dál řídí Linux.
 - **Jedna kontrola `system.cpu_fan` s jednoduchým stavem:** `ON`/`OFF` z **naměřených otáček** (RPM > 0, respektive 0), kde otáčky jdou do `measurement` jako doplňující číslo; bez tachometru rozhoduje **jen to, zda řízení ventilátor žádá** (hwmon `pwmN` prokázaného zařízení, jinak chladicí zařízení kernelu typu `pwm-fan`) a stav je `REQ ON`, nebo `REQ OFF`. Požadavek se nikdy nevydává za potvrzené otáčení, **chybějící tachometr se nenahrazuje odhadem otáček** a žádné procento ani stupeň PWM se nepředává do výsledku ani na displej (`details`: `fan`, `source` = `rpm`/`request`, `device`).

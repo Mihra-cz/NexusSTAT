@@ -52,24 +52,24 @@ NexusSTAT má převzít aplikační funkce Pironmanu po jednotlivých funkcích.
 | --- | --- | --- | --- |
 | Systémový monitoring | `system_monitor`, smyčka měření, alarmy | read-only kolektor a smyčka na notebooku | ověření na RPi 5 (M7) |
 | OLED (`OLEDAddon`) | `oled`, `oled_text`, `render` + ovladač SSD1306 (Adafruit) | jen simulace | HW test displeje; Pironman ho v té době nesmí ovládat |
-| RGB (`WS2812Addon`) | budoucí renderer RGB (Adafruit NeoPixel SPI) | nic | HW test, jen chybové sekvence |
+| RGB (`WS2812Addon`) | rozhodovací logika RGB oddělená od ovladače (Adafruit NeoPixel SPI), chování schválené 2026-10-23 | jen schválený návrh | jediný vlastník LED: RGB Pironmanu vypnuté jeho konfigurací bez zastavení služby, HW test, rollback |
 | Tlačítko | obsluha události Linux input | nic | ověření `systemd-logind` a `evdev` grabu |
-| Ventilátory (`FanAddon`) | hlavní CPU ventilátor: Linux řídí, NexusSTAT čte; boční: nezávislé řízení (návrh gpio-hog) + monitoring | nic | fyzicky ověřené nezávislé řízení bočních ventilátorů s rollbackem |
-| Historie (InfluxDB) | SQLite na lokálním SSD | nic | M2–M3, ověřená záloha a obnova |
+| Ventilátory (`FanAddon`) | hlavní CPU ventilátor: Linux řídí, NexusSTAT čte; boční: nezávislé řízení (návrh gpio-hog) + monitoring | hlavní CPU ventilátor read-only jen lokálně (M4-1), boční nic | fyzicky ověřené nezávislé řízení bočních ventilátorů s rollbackem |
+| Historie (InfluxDB) | SQLite na lokálním SSD | implementováno lokálně (M3), nenasazeno | ověřená záloha a obnova na Nexusu (M7) |
 | Webový dashboard | lokální LAN web NexusSTAT | nic | autentizace, schválení firewallu (M6) |
 
 - Návrat: Pironman se při převzetí jen zastaví a zakáže, neodinstaluje; jeho konfigurace i dotčené systémové soubory se předem zálohují a postup návratu se vyzkouší.
 - InfluxDB: NexusSTAT ji nečte ani nezapisuje. Před vypnutím se read-only ověří, kdo ji používá (klienti, dashboardy, skripty); vypnutí jen po schválení a se zálohou dat.
 
-## Historie a SQLite (návrh; napojení na smyčku od M3.3b-1 volitelně na notebooku)
+## Historie a SQLite (implementováno lokálně v M3, nenasazeno)
 
-Podrobný návrh M2 (tabulky a DDL, čas a identita, zápis, agregace, retence, odolnost, záloha a obnova, benchmark, plán M3, rozhodnutí ke schválení) je v `HISTORY.md`. Nic z toho není implementováno; body níže jsou shrnutí.
+Podrobný návrh M2 (tabulky a DDL, čas a identita, zápis, agregace, retence, odolnost, záloha a obnova, benchmark, plán M3, rozhodnutí ke schválení) je v `HISTORY.md`. Lokálně je implementovaný v M3 (sekce Implementováno lokálně), na Nexusu nic; body níže jsou shrnutí.
 
 - Jediný zapisovač historie ve vlastním vlákně procesu NexusSTAT dostává výsledky ze smyčky měření po `AlarmEvaluator`u. Zápis běží v dávkách (nejstarší nezapsané měření nejvýš 60 s, změny stavu a události do 10 s), každá dávka jednou transakcí s ochranou proti opakování (`run.last_batch`). Selhání zápisu smyčku ani výstupy nezastaví: omezené fronty v paměti (návrh 1 h měření a 2 000 změn), při jejich zaplnění se zahodí nejstarší položky a ztráta se zaznamená; výpadek zápisu je vlastní stav `history.storage`, ne závada měřené veličiny. Ztráta „nejvýš 60 s“ není garance, platí jen za podmínek v `HISTORY.md`, sekce 5.5. Zapisuje a checkpoint dělá jediné spojení zapisovače, všechna ostatní jsou jen pro čtení; tím návrh vylučuje podmínky chyby SQLite „WAL-reset“, jejíž oprava je v použitých verzích neprokázaná (`HISTORY.md`, sekce 5.8, gate 12.4).
 - Čas v databázi je UTC (`observed_utc`, celé Unixové sekundy); monotónní čas se nikdy neukládá. Skutečná nula = řádek s hodnotou 0, `UNKNOWN` = řádek s `NULL`, chybějící vzorek = žádný řádek (mezera), `N/A` = jen stav v tabulce změn. Simulovaná data do provozní databáze nepatří (odmítnutí v zapisovači, role a otisk stroje v souboru).
 - Historie měření: surové vzorky po 10 s, z nich průběžně 5min a hodinové agregace (počet vzorků, počet platných, minimum, maximum, součet pro průměr), aby byly vidět mezery. Historie alarmů a události: jen přechody (vznik, změna závažnosti, odeznění, ztráta dat, budoucí potvrzení či ztišení; start, ukončení, výpadek kolektoru, změna konfigurace, skok času, mezera v historii).
 - Retence: 30 dní surových vzorků je nejkratší doba uchování; vzorek se smaže, až když je starší a zároveň agregovaný, po hodinových dávkách s limitem jednoho dne dat za běh. Agregace nikdy nepřepisuje hotové okno. Smazaná data soubor nezmenší, SQLite uvolněné stránky znovu použije; `VACUUM` jen výjimečně, protože potřebuje volné místo zhruba velikosti databáze. Před zápisem se hlídá volné místo; `SQLITE_FULL` nebo chyba I/O zastaví jen zápis historie.
-- Režim WAL umožní čtení webem během zápisu. Záloha jen přes Backup API do samostatného souboru, který zahrne existující Restic (`HISTORY.md`, sekce 9, provoz v `OPERATIONS.md`).
+- Režim WAL umožní čtení webem během zápisu. Záloha jen přes Backup API do neměnných generací snímků, které zahrne existující Restic (`HISTORY.md`, sekce 9, provoz v `OPERATIONS.md`).
 - Schéma v1: `meta`, `schema_migration`, `run`, `metric`, `sample`, `agg_5m`, `agg_1h`, `aggregation_state`, `check_change`, `event`; verze v `PRAGMA user_version`, identita souboru v `application_id`.
 
 ### Měření velikosti a zápisů (benchmark M2)
@@ -86,20 +86,88 @@ Reprodukovatelný benchmark `tools/sqlite_history_benchmark.py` nad dočasnými 
 
 Závěry: klíč začínající časem a dávkování po 60 s drží zápisy surových dat na desítkách MB denně; 5min agregace jsou pětkrát menší než minutové. I s denním snímkem je to asi 110 GB/rok, malé proti výdrži běžných NVMe ve stovkách TBW; skutečný disk Nexusu se ověří read-only (SMART) před nasazením.
 
-## Budoucí stránky OLED (návrh, zatím neimplementováno)
+## Budoucí stránky OLED (návrh; NETWORK a CPU FAN hotové lokálně, STORAGE zbývá)
 
 Požadavky jsou v `REQUIREMENTS.md` (Budoucí kolotoč OLED). Technické poznámky pro M4–M5:
 
-- Kolotoč NEXUS → SYSTEM → STORAGE → NETWORK → SERVICES; časování se počítá z počtu stránek, takže pátá stránka okno 300 s neprodlouží (ověřeno v0.6 s pořadím NEXUS → SYSTEM → DISK → NETWORK → SERVICES). STORAGE místo DISK a CPU FAN jsou další fáze.
+- Kolotoč NEXUS → SYSTEM → STORAGE → NETWORK → SERVICES; časování se počítá z počtu stránek, takže pátá stránka okno 300 s neprodlouží (ověřeno v0.6 s pořadím NEXUS → SYSTEM → DISK → NETWORK → SERVICES). STORAGE místo DISK je další fáze; CPU FAN je od M4-1 hotový lokálně.
 - Rozvržení: čtyři řádky jako dnes SERVICES (12 px), název 6x13 vlevo, hodnota 8x13B vpravo (nejvýš asi 9 tučných znaků); na řádek se vejde 21 znaků 6x13. Pravidlo v0.5 „velká písmena ASCII“ by pro jednotky typu `kB/s` nebo `Mb/s` potřebovalo výslovnou výjimku (otevřené).
 - **CPU FAN** (M4-1 implementováno lokálně, `fan_monitor.py`): požadavek řízení je hwmon `pwmN` prokázaného zařízení, jinak stupeň chlazení kernelu (`/sys/class/thermal/cooling_device*` typu `pwm-fan`, `cur_state`/`max_state`); skutečné otáčky z hwmon (`fan*_input`), pokud je tachometr zapojen a ovladač ho vystavuje. Na displeji je především jednoduchý stav: `ON 3200` (doložené otáčky s doplňujícím číslem), `OFF` (doložené stání), `REQ ON`/`REQ OFF` (stav jen z požadavku řízení, nikdy tvrzení o otáčení), `UNKN` (nečitelné, nejednoznačné nebo prošlé) a `N/A` (prokazatelný zdroj neexistuje). Závada až při potvrzeném rozporu (požadavek > 0, otáčky 0) zůstává **neimplementovaná**: kolektor stavy nevyhodnocuje a prahy jsou samostatné rozhodnutí. Žádný zápis do `/sys`. **Ověřeno jen na notebooku nad syntetickými adresáři** (notebook žádný ventilátor v hwmon nemá, takže skutečná data dávají `N/A`); hodnoty `pwmfan`, `fan1_input` a `cooling_device` typu `pwm-fan` je nutné read-only ověřit na Raspberry Pi 5 (M7).
 - **STORAGE**: `statvfs` na síťovém mountu se může zaseknout, proto každá kontrola úložiště poběží s timeoutem mimo hlavní smyčku (dnešní smyčka je jednovláknová a bez timeoutu). Dostupnost mountu z `/proc/self/mountinfo`; skutečná dostupnost NAS je samostatná kontrola s timeoutem; velikost složek má vlastní dlouhý interval a timeout a na NAS se často nespouští.
 - **NETWORK** (v0.6 implementováno lokálně, popis v sekci Implementováno lokálně; zbývá adresa webu a případné prahy): RX/TX z `/sys/class/net/<rozhraní>/statistics/{rx,tx}_bytes` jako rozdíl za monotónní čas (první vzorek a reset čítače `UNKNOWN`, stejně jako CPU); stav linky z `operstate`; procentní vytížení jen při známé rychlosti linky (`speed`, u Wi-Fi často neznámá). Hlavní rozhraní z konfigurace nebo výchozí trasy (`/proc/net/route`); virtuální rozhraní (Docker `docker0`, `br-*`, `veth*`, VPN) se do hlavního zobrazení automaticky nezahrnují. IPv4 (až 15 znaků) se vejde jen písmem 6x13, IPv6 se na řádek nevejde. Adresa webu jen po úspěšné kontrole běžícího webu, nikdy podle plánovaného portu.
 - Veřejný status dostane jen allowlist souhrnných stavů; údaje stránky NETWORK do něj nepatří.
 
+## RGB signalizace a potvrzení závad (schválený návrh 2026-10-23, neimplementováno)
+
+Požadavky a rozhodnutí správce jsou v `REQUIREMENTS.md` (RGB LED a potvrzování závad). Nic z toho není implementováno; sekce popisuje budoucí datové vazby. Nový alarmový systém nevzniká: závažnost dál určují kolektory, `AlarmEvaluator` a `effective()` a `core.py`, `alarms.py` ani `oled.py` se kvůli RGB nemění. Rozhodovací logiku lze po schválení implementovat a testovat lokálně dřív než ovladač, který patří do M7.
+
+### Pět oddělených údajů
+
+| Údaj | Odkud | Kdo ho mění | Dnes |
+| --- | --- | --- | --- |
+| skutečný stav služby | kolektor → `CheckResult` (`measurement`, `details`) | jen kolektor | implementováno lokálně |
+| závažnost | `CheckResult.state` po `AlarmEvaluator`u, expirace přes `effective()` | jen diagnostika | implementováno lokálně |
+| potvrzení uživatelem | záznam v souboru uživatelského stavu | oprávněný uživatel přes web; zaniká doloženým odezněním | návrh |
+| výsledná RGB signalizace | čistá funkce z ostatních údajů a jasu | nikdo, jen se počítá | návrh |
+| stav OLED | `OledController.mode` (SLEEP = spí, CAROUSEL a STATUS = probuzený) | tlačítko a časovače | implementováno lokálně |
+
+Potvrzení nikdy nemění závažnost ani `CheckResult` a signalizace nikdy nemění potvrzení ani stav OLED.
+
+### Tok dat
+
+```text
+kolektory -> CheckResult -> AlarmEvaluator --> complete_service_results() --> OLED
+                                  |
+                                  |  jen skutečně monitorované výsledky (bez doplněných služeb bez kolektoru)
+                                  v
+jas a potvrzení (soubor stavu) ---> rgb_signal(výsledky, potvrzení, OLED, přehrání, now)
+OledController.mode po update(now) ->      |  Signal: OFF | WHITE | CODES(sekvence) | CRITICAL
+                                           v
+                                    přehrávač: frame_at(signal, t) -> barva a jas v čase t
+                                           |  spí do příští změny, nic nerozhoduje
+                                           v
+                                    ovladač WS2812 (Adafruit NeoPixel SPI): 4 × stejná barva
+```
+
+- **Skutečně monitorované kontroly** jsou výsledky, které dodal kolektor, včetně `UNKNOWN` po jeho selhání a výsledků, které mezitím prošly. Služby, které `complete_service_results()` doplní do seznamu pro OLED jen proto, že pro ně kolektor ještě neexistuje, a výsledky `N/A` do rozhodnutí o bílé nevstupují; OLED je dál ukazuje (`UNKN`, `?`). `rgb_signal()` proto dostává výsledky před doplněním katalogem a nový příznak v `CheckResult` není potřeba.
+- **Rozhodovací logika** (budoucí `rgb.py` bez importu hardwaru): `category_of(id)` podle tabulky kategorií, `rgb_signal()` a `frame_at()`. Čisté funkce testované `unittest`em se simulovaným časem jako `oled.py`.
+- **Ovladač** (budoucí tenká vrstva nad Adafruit NeoPixel SPI): jen zapíše čtyřem LED stejnou barvu s jasem, nic nerozhoduje a importuje se až při zapnutém RGB, takže testy i notebook běží bez hardwaru. Při inicializaci a korektním vypnutí odešle zhasnutí všech LED.
+- Blikání potřebuje změny po stovkách ms, kdežto měřicí smyčka tiká po 10 s. Přehrávač proto poběží v malém vlastním vlákně, které dostává jen neměnný `Signal` a spí do dalšího přechodu svit/tma; selhání zápisu na LED nezastaví měření, alarmy, OLED ani historii. Přesné uspořádání se navrhne s obsluhou tlačítka a ovladačem OLED (M7).
+
+### Pravidla `rgb_signal()` (v tomto pořadí)
+
+1. Vstupem jsou skutečně monitorované výsledky po `effective(result, now)`, na hardwaru jen `simulated=False`. Blikají jen `WARNING`, `ERROR` a `CRITICAL`.
+2. Aktivní `CRITICAL` → `CRITICAL`; potvrzení, přehrání ani stav OLED na tom nic nemění.
+3. Nepotvrzená `ERROR` → `CODES` červeně pro kategorie nepotvrzených `ERROR`; jinak nepotvrzená `WARNING` → `CODES` oranžově pro kategorie nepotvrzených `WARNING`. Platí i při probuzeném OLED.
+4. Běžící přehrání po probouzecím stisku → jeden průchod `CODES` pro potvrzené aktivní závady: kategorie `ERROR` červeně, pak `WARNING` oranžově, každé vzestupně. Přehrání začne jen tehdy, když v okamžiku probuzení existuje potvrzená aktivní `WARNING`/`ERROR` a nebliká nic s vyšší prioritou; po průchodu skončí.
+5. Probuzený OLED, aspoň jeden skutečně monitorovaný výsledek a všechny `OK` nebo `INFO` (žádná aktivní závada, potvrzená ani nepotvrzená, a žádné `UNKNOWN`) → `WHITE` na polovině nastaveného jasu.
+6. Jinak `OFF`: spící OLED, probuzený s potvrzenou trvající závadou po přehrání, nebo probuzený se skutečně monitorovanou kontrolou bez platných dat (OLED ukazuje `?`). Po startu procesu tak LED zůstanou zhasnuté až do prvního úplného měření (první vzorek CPU je `UNKNOWN`).
+
+- Probouzecí stisk se pozná bez změny automatu: po `update(now)` je `mode` SLEEP a po `press(now, …)` CAROUSEL. Porovnání musí jít až po `update(now)`, protože `press()` nejdřív sám uplatní vypršení okna a stisk po uplynutí 300 s je také probouzecí. Význam stisků, `update()` i časování 10 s / 300 s / 30 s zůstávají.
+- Změna signálu (nová závada, potvrzení, uspání) se projeví až na hranici skupiny, aby přerušená skupina neukázala špatný počet bliknutí; `CRITICAL` přebíjí okamžitě.
+- Časování: bliknutí kódu 0,4 s svit a 0,4 s tma, po každé skupině pauza 2 s; `CRITICAL` 0,25 s svit a 0,25 s tma (2 Hz) bez pauzy. Kód je zřetelně pomalejší než `CRITICAL` a nic nebliká rychleji než 3× za sekundu.
+- Barvy: červená a oranžová s nastaveným jasem 5–100 % (výchozí 20 %), bílá asi na polovině nastaveného jasu.
+- Kontroly bez potvrzování opakovaným měřením (např. `history.storage`) se signalizují, jakmile stav nahlásí; RGB kvůli tomu nepřidává vlastní zpoždění ani nová pravidla.
+
+### Datová vazba potvrzení
+
+- Záznam: `check_id`, potvrzená závažnost (`WARNING` nebo `ERROR`; u `CRITICAL` jen značka „přečteno“ bez vlivu na RGB), čas UTC a uživatel. Existence záznamu znamená, že epizoda závady ještě nebyla doloženě ukončená; zhoršení se pozná porovnáním aktuální závažnosti s potvrzenou. Jen pro skutečná data; simulátor si potvrzení drží jen v paměti.
+- Platí, když je efektivní stav kontroly `WARNING` nebo `ERROR` a není závažnější než potvrzená úroveň.
+- **Zánik:** po `N` po sobě jdoucích platných měřeních `OK`/`INFO`, kde `N = max(3, confirm_count)` u kontrol s alarmovým pravidlem a `N = 3` u ostatních. Počítají se nová měření (identita vzorku jako v `AlarmEvaluator`u podle `expires_monotonic`), ne opakovaná vyhodnocení při překreslení; `UNKNOWN`, `N/A`, prošlý výsledek i závada řadu vynulují.
+- **Restart:** počítadlo řady je jen v paměti a po restartu začíná od nuly. `AlarmEvaluator` po restartu hlásí trvající závadu jako `INFO`, dokud ji `confirm_count` měřeními znovu nepotvrdí; protože `N ≥ confirm_count`, uložené potvrzení během tohoto počátečního potvrzování nezanikne. Odeznění mimo běh procesu doložit nelze: závada, která po restartu trvá se stejnou nebo nižší závažností, se bere jako pokračující epizoda.
+- Vlastníkem záznamů je hlavní proces NexusSTAT. Web pošle požadavek (`check_id` a závažnost, kterou uživatel viděl), proces ho ověří proti aktuálnímu stavu, uloží ho a auditní událost zapíše frontou zapisovače historie. Web sám nezapisuje do databáze ani do souboru stavu (jediný zapisovač, `HISTORY.md` 5.8).
+- **Uložení:** samostatný malý soubor v `appdata/nexusstat/` pro jas, potvrzení aktivních závad a údaje k rozpoznání nové epizody nebo zhoršení, mimo SQLite historii, protože historie je volitelná a její výpadek nesmí ovlivnit výstupy. Při implementaci atomický zápis celého souboru (dočasný soubor, `fsync`, přejmenování), soukromá oprávnění, zachování po restartu a zahrnutí do záloh; úprava seznamu cest Resticu jen po schválení. Schéma SQLite v1 se nemění a nový databázový subsystém nevzniká.
+
+### Převzetí RGB od Pironmanu (M7)
+
+- Pironman zůstává v provozu a má RGB pod svou kontrolou až do samostatně schváleného bezpečného převzetí. Ovladač RGB je ve výchozím stavu vypnutý a zapne se až po ověřeném vypnutí RGB Pironmanu jeho vlastní konfigurací, bez zastavení `pironman5.service`, který dál řídí boční ventilátory. Druhého zapisovatele na SPI NexusSTAT spolehlivě nepozná, proto rozhoduje postup, ne detekce.
+- Před převzetím read-only ověřit, jak Pironman LED ovládá (zařízení, zapojení, konfigurace). Bez schválení žádná změna `config.txt`, overlayů, oprávnění ani služeb.
+- **Provozní omezení:** ovladač zhasne LED při inicializaci a korektním vypnutí, ale WS2812 po pádu procesu drží poslední barvu a pouhé ukončení aplikace to neodstraní. Svit LED po pádu NexusSTAT proto nic nedokládá; hardwarový watchdog ani další elektronika se nenavrhují.
+- Návrat: vypnout RGB v NexusSTAT a vrátit konfiguraci RGB Pironmanu ze zálohy.
+
 ## Implementováno lokálně (fáze 1: simulace, read-only kolektory, pravidelné měření a první prahy)
 
-Stav k 2026-10-22 (v0.6): jen lokální kód a testy na vývojovém počítači (x86_64, Linux Mint). Systémový a síťový kolektor čtou skutečná data notebooku, `alarms.py` je vyhodnocuje podle zapnutých prahů (výchozí vypnuto) a smyčka `run.py` je pravidelně vypisuje do terminálu; OLED je pouze obrazová simulace a se smyčkou zatím není propojen. Nic z toho nebylo spuštěno na Raspberry Pi ani proti skutečnému hardwaru displeje. Historie (`history.py` schéma M3.1a, synchronní zápis M3.1b, agregace M3.2a, retence M3.2b; vlákno `history_worker.py` M3.3a) se od M3.3b-1 dá na notebooku volitelně napojit na smyčku (`history_link.py`, sekce `[history]`, výchozí stav vypnuto, jen role `development` na výslovně zadané cestě); bez té sekce se nic neukládá. Automatická agregace a retence (M3.3b-2), snímky (M3.4) a STORAGE zůstávají plánované.
+Stav k 2026-10-23 (M4-1): jen lokální kód a testy na vývojovém počítači (x86_64, Linux Mint). Systémový, síťový a ventilátorový kolektor čtou skutečná data notebooku (ventilátor dává `N/A`, notebook žádný v hwmon nemá), `alarms.py` je vyhodnocuje podle zapnutých prahů (výchozí vypnuto) a smyčka `run.py` je pravidelně vypisuje do terminálu; OLED je pouze obrazová simulace a se smyčkou zatím není propojen. Nic z toho nebylo spuštěno na Raspberry Pi ani proti skutečnému hardwaru displeje. Historie (`history.py` schéma M3.1a, synchronní zápis M3.1b, agregace M3.2a, retence M3.2b; vlákno `history_worker.py` M3.3a) se od M3.3b-1 dá na notebooku volitelně napojit na smyčku (`history_link.py`, sekce `[history]`, výchozí stav vypnuto, jen role `development` na výslovně zadané cestě); bez té sekce se nic neukládá. Automatická agregace a retence (M3.3b-2) a snímky (M3.4) jsou hotové lokálně, STORAGE zůstává plánovaná; RGB a potvrzování závad jsou jen schválený návrh.
 
 ```text
 run.run_loop  (monotónní plán po interval_seconds, výpis do terminálu)
@@ -110,6 +178,8 @@ run.Collectors (live_monitor)   selhání jednoho kolektoru = UNKNOWN jen jeho k
   |                                     /sys/class/thermal, os.statvfs("/"))
   |-- network_monitor.NetworkMonitor  (read-only: /sys/class/net, /proc/net/route,
   |                                     ioctl SIOCGIFADDR bez odesílání)
+  |-- fan_monitor.FanMonitor          (read-only: /sys/class/hwmon,
+  |                                     /sys/class/thermal/cooling_device*, M4-1)
   nebo fiktivní CheckResult (testy, simulátor)
                 |  CheckResult: INFO + measurement/details, nebo UNKNOWN bez hodnoty
                 v
@@ -234,7 +304,7 @@ Prahy jsou data (`AlarmsConfig`/`AlarmRule`), ne kód. Budoucí LAN web jen při
 ## Zálohování
 
 - Projektové zdrojáky budou v plánovaném `/srv/nexus/projects/nexusstat` a jejich pokrytí Resticem musí být reálně ověřené.
-- Provozní SQLite (nenasazeno, návrh M2): lokální SSD, živá databáze v `/srv/nexus/appdata/nexusstat/history/`, snímky přes SQLite Backup API jako **neměnné generace** v `/srv/nexus/appdata/nexusstat/snapshot/<generace>/` (rozpracované v `snapshot-work/`), nikdy NAS/CIFS. Restic zahrne jen `snapshot/`, živou databázi s `-wal` a `-shm` vyloučí. Kontrola integrity snímku, test obnovy a zápis do manifestu až s implementací (`HISTORY.md`, sekce 9, postup v `OPERATIONS.md`).
+- Provozní SQLite (návrh M2, implementováno lokálně v M3, nenasazeno): lokální SSD, živá databáze v `/srv/nexus/appdata/nexusstat/history/`, snímky přes SQLite Backup API jako **neměnné generace** v `/srv/nexus/appdata/nexusstat/snapshot/<generace>/` (rozpracované v `snapshot-work/`), nikdy NAS/CIFS. Restic zahrne jen `snapshot/`, živou databázi s `-wal` a `-shm` vyloučí. Kontrola integrity snímku a test obnovitelnosti jsou implementované lokálně (M3.4); test obnovy na Nexusu a zápis do manifestu až s nasazením (`HISTORY.md`, sekce 9, postup v `OPERATIONS.md`).
 - Nová aplikace NESMÍ sama měnit nebo spouštět Restic job bez schválení.
 
 ## Plán milníků (návrh k posouzení)
@@ -246,7 +316,7 @@ Pořadí a obsah jsou návrh správci. Milníky nejsou hotové a čísla verzí 
 | M1 Uzavření v0.5 | posouzení anglického OLED a otevřených rozhodnutí v0.5, commit a push po schválení | uzavřená v0.5 v repozitáři | nové funkce |
 | M2 Návrh SQLite | schéma (měření, agregace, alarmy, události, verze schématu), retence a agregace, odhad velikosti a zápisů pro skutečné veličiny, dávkování, WAL, záloha přes Backup API, napojení na Restic, test obnovy, chování při chybě a plném disku. Návrh v `HISTORY.md` s benchmarkem (`tools/`), **schválený 2026-10-20 kromě R11, R13, R15 (odloženo do M7)** | schválený návrh v dokumentaci | kód aplikace |
 | M3 Lokální SQLite | zapisovač historie (`sqlite3`), zápis měření, přechodů alarmů a událostí, retence a agregace, izolace selhání, snímky; testy nad dočasnou databází se simulovaným časem, zkouška zálohy a obnovy na notebooku. Kroky M3.1a–M3.4b v `HISTORY.md`, sekce 11; **M3.1a (základ databáze) a M3.1b (synchronní zápis) hotovy lokálně 2026-10-20, M3.2a (agregace), M3.2b (retence) a M3.3a (vlákno zapisovače) 2026-10-21, M3.3b-1 (volitelné napojení na smyčku, stav hodin, SIGTERM, `history.storage`), M3.3b-2 (automatická agregace a retence z vlákna) a M3.4a (neměnné generace snímků, test obnovitelnosti) 2026-10-22, M3.4b-1 (sekce `[history.snapshot]`, denní plánování z měřicí smyčky, kontrola `history.snapshot`, auditní události, nalezení poslední platné generace při startu) a M3.4b-2 (rozpoznání obnovené databáze, příkazy `info`, `adopt` a `generations`, návrh retence generací) 2026-10-23; zbývá M3.4b-3 (mazání generací, jen po samostatném schválení)** | kód a testy na notebooku | Nexus, Restic, produkční data |
-| M4 Kolektory CPU FAN a NETWORK | read-only čtení nad vzorovými soubory a LIVE na notebooku; read-only ověření zdrojů ventilátoru na RPi 5 jen po schválení. NETWORK hotovo lokálně ve v0.6, **M4-1 (kolektor CPU FAN a čtvrtý řádek SYSTEM) hotovo lokálně 2026-10-24** | kolektory s testy | řízení ventilátorů |
-| M5 STORAGE a OLED | rozhodnutí STORAGE vs. ROOT pod SYSTEM, kontroly úložišť s timeoutem, SYSTEM se 4 řádky, simulátor a vizuální kontrola. Pětistránkový kolotoč se stránkou NETWORK hotov lokálně ve v0.6 (zatím s DISK místo STORAGE) | nové stránky v simulátoru | hardware displeje |
-| M6 Web s historií | lokální web čte historii, autentizace; port až po schválení firewallu; veřejný status odděleně | web na notebooku | veřejné nasazení |
+| M4 Kolektory CPU FAN a NETWORK | read-only čtení nad vzorovými soubory a LIVE na notebooku; read-only ověření zdrojů ventilátoru na RPi 5 jen po schválení. NETWORK hotovo lokálně ve v0.6, **M4-1 (kolektor CPU FAN a čtvrtý řádek SYSTEM) hotovo lokálně 2026-10-23** | kolektory s testy | řízení ventilátorů |
+| M5 STORAGE a OLED | rozhodnutí STORAGE vs. ROOT pod SYSTEM, kontroly úložišť s timeoutem, simulátor a vizuální kontrola (SYSTEM se 4 řádky hotový lokálně v M4-1). Pětistránkový kolotoč se stránkou NETWORK hotov lokálně ve v0.6 (zatím s DISK místo STORAGE) | nové stránky v simulátoru | hardware displeje |
+| M6 Web s historií | lokální web čte historii, autentizace; potvrzování závad a jas LED (schválený návrh 2026-10-23); port až po schválení firewallu; veřejný status odděleně | web na notebooku | veřejné nasazení |
 | M7 RPi 5 a náhrada Pironmanu | testovací nasazení podle standardu Nexus, souběh s Pironmanem, převzetí funkcí po jedné (OLED, RGB, tlačítko), boční ventilátory až po ověřeném nezávislém řízení s fyzickým dohledem, rollback; InfluxDB až po ověření dalších uživatelů | ověřená náhrada | vše bez schválení |

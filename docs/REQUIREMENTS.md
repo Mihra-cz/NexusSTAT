@@ -9,14 +9,14 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 ## Náhrada Pironmanu 5 (schválený cíl, zatím neimplementováno)
 
 - NexusSTAT postupně převezme aplikační funkce Pironman 5: systémový monitoring, obrazovky OLED, signalizaci RGB, obsluhu dostupných funkcí fyzického tlačítka, monitoring ventilátorů, historii naměřených hodnot a lokální webové rozhraní.
-- Dnes existuje jen lokální vývoj na notebooku (offline simulace OLED, read-only systémový kolektor). Na Nexusu nic neběží a Pironman dál plní všechny své funkce.
+- Dnes existuje jen lokální vývoj na notebooku (offline simulace OLED, read-only kolektory systému, sítě a CPU FAN, lokální SQLite historie). Na Nexusu nic neběží a Pironman dál plní všechny své funkce.
 - Hardwarové ochranné mechanismy Raspberry Pi (firmware, teplotní omezování výkonu, nouzové vypnutí při přehřátí) se neodstraňují ani neobcházejí.
 - Hlavní CPU ventilátor dál bezpečně řídí Linux (kernel/firmware); NexusSTAT ho jen čte.
 - Oba boční ventilátory Pironmanu musí mít před vypnutím původního softwaru bezpečně ověřené nezávislé řízení (fyzická kontrola, teplotní dohled, rollback).
 - Pironman se nevypne, dokud není ověřené předání všech potřebných funkcí. Převzetí probíhá po jednotlivých funkcích, ne najednou.
 - Návrat k původnímu softwaru musí zůstat možný: při přechodu se Pironman nejdřív jen zastaví a zakáže, neodinstaluje se, a jeho konfigurace se předem zálohuje.
 
-## Historie a databáze SQLite (schválený směr, zatím neimplementováno)
+## Historie a databáze SQLite (schválený směr; implementováno lokálně v M3, nenasazeno)
 
 - Hlavní databází NexusSTAT pro historii měření, alarmů a událostí bude **SQLite**. NexusSTAT nesmí vyžadovat InfluxDB Pironmanu ani na ní stavět.
 - Po úspěšném nahrazení Pironmanu nebude jeho ukládání historie potřeba. Vypnutí příslušné instance InfluxDB je cíl, ale až po ověření, že ji nepoužívá žádná jiná aplikace, a po schválení.
@@ -30,7 +30,7 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 - Retence, **výchozí návrh, ne implementovaný kontrakt**: 30 dní původní měření po 10 s, 1 rok agregace po 1 nebo 5 minutách, dlouhodobě hodinové nebo denní agregace; důležité alarmy a systémové události mají samostatnou retenční politiku. Schváleno 2026-10-20 (R1–R4): nejméně 30 dní surových dat, 1 rok 5min agregací, hodinové 10 let, změny stavů a události 2 roky. Velikost databáze, počet veličin, frekvence zápisů a nároky na SSD jsou změřené v návrhu M2 (`HISTORY.md`, sekce 10); ověření na Raspberry Pi 5 zbývá.
 - Změny stavu (R4, schváleno 2026-10-20): v historii se zachová každá skutečná změna diagnostického stavu i provozně významného údaje (zhoršení, zlepšení, úplné odeznění, přechod do `UNKNOWN` a návrat, změna linky `UP`/`DOWN` i při klasifikaci `INFO`) s přesným časem; opakované měření beze změny nevytváří událost; slučovat lze jen nepodstatné údaje, které nemění stav ani provozně významnou informaci; žádné tiché přepsání ani duplicita po nejistém commitu; omezení notifikací historii neovlivní.
 - Kmitání (schválený požadavek 2026-10-20, detektor zatím neimplementován): z historie musí jít dopočítat počet přechodů, četnost a délky epizod; budoucí detektor FLAPPING pracuje odděleně od diagnostického stavu a nepřepisuje ho (`CRITICAL` zůstává `CRITICAL`), má prahy pro každou kontrolu zvlášť, počítá i provozní změny typu `UP`/`DOWN`, jeho vlastní události FLAPPING START a END se nepočítají jako přechody a web má zobrazit četnost a vývoj kmitání. Okno 10 min, vznik při 6 přechodech a konec po 20 min stability jsou jen příklad k budoucímu schválení.
-- **Návrh naplnění (M2, schválený 2026-10-20 kromě R11, R13, R15 (odloženo do M7); neimplementováno, nasazení neschváleno):** `HISTORY.md` – schéma a DDL, čas a identita měření, zápis po dávkách, agregace, retence, odolnost, záloha a obnova, benchmark, plán M3 a seznam rozhodnutí ke schválení.
+- **Návrh naplnění (M2, schválený 2026-10-20 kromě R11, R13, R15 (odloženo do M7); implementováno lokálně v M3, nasazení neschváleno):** `HISTORY.md` – schéma a DDL, čas a identita měření, zápis po dávkách, agregace, retence, odolnost, záloha a obnova, benchmark, plán M3 a seznam rozhodnutí ke schválení.
 - Jednoduchost: modul `sqlite3` ze standardní knihovny, bez ORM, databázového frameworku a externí databázové služby.
 - Umístění: lokální SSD, adresář `/srv/nexus/appdata/nexusstat/` podle standardu Nexus; název souboru se určí s návrhem schématu. SQLite se nikdy neprovozuje přímo na NAS/CIFS.
 - Zvážit režim WAL pro současné čtení (web) a zápis.
@@ -71,7 +71,7 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 
 17. Stránka **NETWORK** (v0.6, implementováno lokálně, nenasazeno): čtyři řádky, název vlevo, hodnota vpravo. (1) název sledovaného rozhraní velkými písmeny a stav linky `UP`/`DOWN`/`UNKN` (bez známého rozhraní obecné `LINK`); (2) `RX` a (3) `TX` jako rychlost v automaticky vhodné jednotce `B/s`, `KB/s` nebo `MB/s` (desítkově, 1 KB = 1000 B, nejvýš 3 platné číslice: `312 B/s`, `9.9 KB/s`, `85 KB/s`, `1.2 MB/s`, `112 MB/s`); (4) `IPV4` se samotnou lokální adresou. Rozhraní platně bez IPv4 ukáže `NONE`, chybějící, neplatný, prošlý nebo ještě nespočítaný údaj (první vzorek) `UNKN`; nikdy stará hodnota, nikdy `OK`. Adresa ani port webového rozhraní se nezobrazují, dokud NexusSTAT nemá běžící web. Platná síťová měření (i linka `DOWN` a chybějící IPv4) jsou `INFO`, ne alarm; `UNKNOWN` se objeví ve STATUS (`UNKN NET RX NO DATA`, `UNKN LINK STALE`) a v symbolu `?`. Fiktivní hodnoty nesou `SIM` a adresy jen z dokumentačních rozsahů (RFC 5737).
 
-### Budoucí kolotoč OLED (schválený návrh, zatím neimplementováno)
+### Budoucí kolotoč OLED (schválený návrh; NETWORK a CPU FAN hotové lokálně, STORAGE zbývá)
 
 Body 1–17 popisují implementovanou v0.6 s pěti stránkami NEXUS, SYSTEM, DISK, NETWORK, SERVICES. **CPU FAN na stránce SYSTEM je od M4-1 implementovaný lokálně** (čtvrtý řádek, read-only kolektor `fan_monitor.py`); STORAGE místo DISK je dál plánovaná další fáze. Cílové uspořádání:
 
@@ -103,7 +103,7 @@ Body 1–17 popisují implementovanou v0.6 s pěti stránkami NEXUS, SYSTEM, DIS
 - Interval `[collector] interval_seconds`, výchozí 10 s. Platnost výsledků je trojnásobek intervalu a samostatně se nenastavuje.
 - Plánování v monotónním čase, čas měření v UTC. Plánované termíny postupně neujíždějí; při zpoždění se nespouští několik doháněcích měření najednou.
 - Selhání měření nesmí vést k falešnému stavu OK. Žádné aktivní čekání vytěžující procesor. Čisté ukončení pomocí Ctrl+C.
-- Zatím jen terminál: bez OLED hardware, služby, webu a SQLite.
+- Zatím jen terminál: bez OLED hardware, služby a webu; SQLite historie je od M3.3b-1 volitelná (výchozí vypnuto).
 
 ## Číselné hodnoty a první alarmové prahy (potvrzeno pro v0.4)
 
@@ -143,18 +143,103 @@ Body 1–17 popisují implementovanou v0.6 s pěti stránkami NEXUS, SYSTEM, DIS
 - Návrh krátkého/dlouhého stisku pro řízené vypnutí je **neuzavřený do HW testů**. Dlouhé 10s gesto reboot se **neimplementuje**, může kolidovat s hardwarovým vypnutím.
 - Ovládání tlačítka při přechodu ověřit proti `systemd-logind` a přítomnosti exkluzivního `evdev` grabu.
 
-## RGB / ventilátory
+## RGB LED a potvrzování závad (schválený návrh 2026-10-23, zatím neimplementováno)
 
-- 4 RGB WS2812: normálně vypnuté, chybové sekvence až po schváleném HW přechodu. Kód signálu nemá zakrývat důležitější alarm.
+Schválené chování čtyř RGB LED WS2812 ve vazbě na OLED a na budoucí potvrzování závad v lokálním webu. **Nic z toho není implementováno:** neexistuje ovladač RGB, web ani uložená potvrzení a na Nexusu LED dál ovládá Pironman. NexusSTAT je jednoduchá náhrada softwaru Pironman 5 a stavový panel domácího serveru, ne další alarmový systém: signalizace vychází jen z existujících výsledků `CheckResult` po `AlarmEvaluator`u a kvůli RGB nevznikají žádné nové alarmy. Oddělení rozhodovací logiky od ovladače popisuje `ARCHITECTURE.md` (RGB signalizace a potvrzení závad); rozhodnutí správce jsou shrnutá na konci sekce.
+
+### Normální stav
+
+- OLED spí a všechny čtyři LED jsou zhasnuté.
+- Krátký stisk tlačítka probudí OLED a LED se rozsvítí tlumeně bíle; když OLED usne, bílá zhasne. Chování tlačítka, přechody CAROUSEL/STATUS a časování automatu (10 s, 300 s, 30 s) se nemění a žádné nové gesto nevzniká.
+- **Bílá značí zdravý ověřený stav, ne jen nepřítomnost alarmu.** Svítí jen při probuzeném OLED, když existuje aspoň jeden výsledek skutečně monitorované kontroly a všechny skutečně monitorované kontroly mají platný stav `OK` nebo `INFO`.
+- **`UNKNOWN` a bílá:** `UNKNOWN` samo o sobě není `WARNING` ani `ERROR` a nikdy nespouští blikání. Dosud neimplementovaný nebo záměrně nesledovaný zdroj (služba z katalogu bez kolektoru, `N/A`) bílé při jinak zdravém systému nebrání. Skutečně monitorovaná kontrola s nedostupnými nebo prošlými daty se nesmí vydávat za OK: OLED ukazuje `?` a bílá se nepoužije, dokud není stav znám (LED zůstanou zhasnuté).
+- Potvrzená, ale stále aktivní závada se bílou nikdy nezobrazí jako úplné OK.
+- OLED se kvůli nové závadě samo neprobouzí (bod 9 sekce OLED platí dál).
+
+### Aktivní závady
+
+| Stav | Signál | Přednost |
+| --- | --- | --- |
+| `CRITICAL` | červená, 0,25 s svit / 0,25 s tma (2 Hz) nepřetržitě, bez kódu kategorie | před všemi ostatními vzory; potvrzení ho nikdy nevypne |
+| `ERROR` | červené skupiny bliknutí 0,4 s svit / 0,4 s tma, počet = kód kategorie, po každé skupině pauza 2 s | před `WARNING` |
+| `WARNING` | oranžové skupiny se stejným časováním jako `ERROR` | jen bez nepotvrzené `ERROR` |
+
+- Všechny čtyři LED blikají vždy společně: počet bliknutí je kód kategorie, ne číslo fyzické LED.
+- Automaticky se signalizuje jen nejvyšší závažnost mezi nepotvrzenými závadami; `CRITICAL` vždy. Více kategorií stejné závažnosti se přehraje postupně vzestupně podle kódu, každá s pauzou po skupině, a pak znovu od začátku. Kategorie s více závadami se přehraje jednou.
+- Stabilní kódy kategorií:
+
+| Bliknutí | Kategorie | Kontroly (`id`) |
+| --- | --- | --- |
+| 1 | Nexus a systém | `service.nexus`, `system.*`, `disk.*`, `network.*`, `history.storage` |
+| 2 | NAS a jeho dostupnost | `service.nas` a budoucí kontroly NAS |
+| 3 | AnimeDB | `service.animedb` a budoucí kontroly AnimeDB |
+| 4 | zálohy, Restic | `service.backup`, `history.snapshot` a budoucí kontroly Resticu |
+| 5 | Docker a ostatní skutečně monitorované služby | budoucí kontroly Dockeru a služeb; sem spadne i **každé nezařazené id** skutečné závady |
+
+- Blikají jen `WARNING`, `ERROR` a `CRITICAL`. Pouhé `INFO`, `UNKNOWN`, `N/A` a běžné změny provozních údajů (např. linka `DOWN`, která je `INFO`) neblikají. Prošlý výsledek se stejně jako na OLED vyhodnotí jako `UNKNOWN`, takže dřívější závada bez platných dat nebliká.
+- Simulovaná data (`simulated=True`) skutečné LED nikdy nerozsvítí: LED nemají značku `SIM` a simulace se nesmí prezentovat jako skutečný alarm Nexusu.
+
+### Potvrzení závady
+
+- Lokální web nabídne u každé aktivní závady tlačítko **„Beru na vědomí / pracuji na nápravě“**. Potvrzení není oprava.
+- Po potvrzení `WARNING` nebo `ERROR` závada zůstává aktivní a její diagnostický stav se nemění; vypne se jen její automatické blikání. OLED ji dál ukazuje beze změny (STATUS, pořadí, trojúhelník na stránce NEXUS).
+- Potvrzení platí pro danou kontrolu až do potvrzené závažnosti včetně, dokud trvá epizoda závady: zmírnění `ERROR` → `WARNING` nové potvrzení nevyžaduje, zhoršení `WARNING` → `ERROR` ano. Nová epizoda závady vyžaduje nové potvrzení.
+- **Zánik potvrzení:** jen po doloženém odeznění závady, tedy po nejméně třech po sobě jdoucích platných měřeních bez závady (`OK` nebo `INFO`); vyžaduje-li alarmové pravidlo delší řadu (`confirm_count` nad 3), platí ta delší. `UNKNOWN`, `N/A` ani prošlá data se jako odstranění problému nepočítají.
+- **Restart:** potvrzení `WARNING`/`ERROR` přežívá restart NexusSTAT. `AlarmEvaluator` po restartu začíná znovu (`HISTORY.md` 4.2), takže se trvající závada prvních měření jeví jako `INFO`; během tohoto počátečního potvrzování výsledků se uložené potvrzení nesmí předčasně zrušit.
+- Potvrzení nese závažnost, kterou uživatel viděl; zhoršila-li se mezitím, odmítne se a uživatel rozhodne znovu.
+- `CRITICAL` lze evidovat jako přečtený, ale je signalizovaný i po potvrzení. Přečtení neumlčí ani `ERROR` či `WARNING`, na které se `CRITICAL` později zmírní; ty vyžadují běžné potvrzení.
+- Volitelné „potvrdit všechny `WARNING`/`ERROR`“ potvrdí jen závady aktivní v tu chvíli, ne budoucí; `CRITICAL` se tím neumlčí.
+- Potvrzení a jeho zánik jsou událost historie alarmů (viz Historie a databáze SQLite); web je předá procesu NexusSTAT, který je zapíše frontou zapisovače (`HISTORY.md` 5.8, bod 5). Signalizace ani potvrzení na zapnuté historii nezávisí.
+
+### Tlačítko, OLED a přehrání kódů
+
+Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrzených závad → jednorázové přehrání potvrzených závad → bílá → zhasnuto.
+
+- Aktivní `CRITICAL`: nepřetržité červené blikání; ostatní vzory mají nižší prioritu.
+- Aktivní nepotvrzená závada: automatická signalizace podle její závažnosti pokračuje i při probuzeném OLED.
+- Jen potvrzené aktivní `WARNING`/`ERROR`: při probuzení OLED se jejich světelné kódy jednou přehrají (nejdřív `ERROR` červeně, pak `WARNING` oranžově, kategorie vzestupně). Po dokončení přehrání LED opět zhasnou a do uspání OLED se bílá nepoužije.
+- Ostatní stisky (otevření STATUS, listování, návrat do CAROUSEL) a časování OLED mají dosavadní význam a nic nepřehrávají.
+
+### Jas a nastavení
+
+- Jediný uživatelský parametr jasu 5–100 %, výchozí 20 %. Platí pro červenou i oranžovou, tedy i pro `CRITICAL`; dolní mez 5 % brání umlčení `CRITICAL` jasem.
+- Bílá při probuzeném OLED svítí tlumeněji, přibližně na polovině nastaveného jasu; druhý posuvník není.
+- Jas i potvrzení přetrvají restart NexusSTAT.
+- Nastavení jasu a potvrzování jsou dostupné jen oprávněnému uživateli v LAN (autentizace, ochrana CSRF, viz Web / přístup); veřejný status je nenabízí ani nezobrazuje.
+
+### Ukládání uživatelského stavu (schválený návrh, bez kódu)
+
+- Jas, potvrzení aktivních závad a údaje potřebné k rozpoznání nové epizody nebo zhoršení budou v samostatném malém souboru v `appdata` NexusSTAT, ne v SQLite historii. Schéma SQLite v1 se nerozšiřuje a nový databázový subsystém nevzniká.
+- Při budoucí implementaci: atomický zápis, soukromá oprávnění, zachování po restartu a zahrnutí do záloh.
+
+### Bezpečnost hardwaru a převzetí od Pironmanu
+
+- Pironman zůstává v provozu a má RGB pod svou kontrolou až do samostatně schváleného bezpečného převzetí. LED smí ovládat vždy jen jeden program; NexusSTAT je neotevře, dokud je ovládá Pironman (`WS2812Addon`). Souběžný zápis dvou programů nejde spolehlivě odhalit, proto rozhoduje ověřený postup, ne automatická detekce.
+- Převzetí RGB nesmí zastavit Pironman jako celek, dokud nejsou ověřené boční ventilátory: RGB Pironmanu se vypne jen jeho vlastní konfigurací, jinak až při celkovém přechodu (M7). Konkrétní volbu Pironmanu i zapojení LED (předpoklad SPI pro Adafruit NeoPixel SPI) je nutné nejdřív ověřit read-only.
+- Budoucí ovladač RGB bude ve výchozím stavu vypnutý a při inicializaci i korektním vypnutí odešle zhasnutí všech LED. Selhání LED nesmí zastavit měření, alarmy, OLED ani historii. Návrat: vypnout RGB v NexusSTAT a vrátit původní nastavení RGB Pironmanu.
+- **Provozní omezení (M7):** WS2812 mohou po pádu procesu držet poslední barvu. Pouhé ukončení aplikace to neodstraní, takže svit LED po pádu NexusSTAT nic nedokládá (zamrzlá bílá neznamená OK). Hardwarový watchdog ani další elektronika se nenavrhují.
+
+### Rozhodnutí správce (2026-10-23)
+
+1. `UNKNOWN` nikdy nebliká; neimplementovaný nebo záměrně nesledovaný zdroj bílé nebrání, skutečně monitorovaná kontrola bez platných dat bílou vyloučí. Bílá = zdravý ověřený stav.
+2. Potvrzení `WARNING`/`ERROR` přežívá restart a zaniká až po nejméně třech platných měřeních bez závady, případně po delší řadě podle alarmového pravidla; `UNKNOWN` se nepočítá. Nová epizoda a zhoršení vyžadují nové potvrzení, `CRITICAL` zůstává signalizovaný.
+3. Probuzení OLED jednou přehraje kódy potvrzených aktivních závad a LED pak zhasnou; nepotvrzené závady a `CRITICAL` mají přednost; tlačítko a časování OLED beze změny.
+4. Kód 0,4 s svit / 0,4 s tma s pauzou 2 s po skupině, `CRITICAL` 0,25 s / 0,25 s nepřetržitě; jediný jas 5–100 % (výchozí 20 %), bílá asi na polovině.
+5. Stabilní kategorie 1–5, nezařazené id skutečné závady do 5; `INFO`, `UNKNOWN`, `N/A` a provozní údaje neblikají; žádné nové alarmy kvůli RGB.
+6. Samostatný malý soubor v `appdata` pro jas a potvrzení (atomický zápis, soukromá oprávnění, po restartu, v zálohách); SQLite v1 beze změny.
+7. Zhasnutí při inicializaci a korektním vypnutí ovladače; držení barvy WS2812 po pádu je provozní omezení M7; Pironman ovládá RGB do schváleného převzetí.
+
+## Ventilátory
+
 - Hlavní PWM ventilátor CPU ponechat stávající linuxové regulaci.
 - Oba boční ventilátory nyní ovládá Pironman přes GPIO6 v režimu Always On (`gpio_fan_mode=0`); GPIO6 bylo při read-only kontrole `HIGH`. Kernelový gpio-hog je **návrh**, není nasazen ani fyzicky otestován.
 - Nezastavovat Pironman, dokud není schválené a ověřené předání řízení ventilátorů a tlačítka.
-- Monitoring ventilátorů (plán): CPU FAN read-only podle budoucí stránky SYSTEM. U bočních ventilátorů se nejdřív ověří, zda vůbec poskytují otáčky; bez tachometru lze jejich stav nanejvýš odvodit z řídicího signálu, a i jeho čtení (GPIO) vyžaduje samostatné schválení.
+- Monitoring ventilátorů: CPU FAN read-only je od M4-1 implementovaný lokálně (`fan_monitor.py`, čtvrtý řádek stránky SYSTEM), na Raspberry Pi 5 neověřený. U bočních ventilátorů se nejdřív ověří, zda vůbec poskytují otáčky; bez tachometru lze jejich stav nanejvýš odvodit z řídicího signálu, a i jeho čtení (GPIO) vyžaduje samostatné schválení.
 
 ## Web / přístup
 
 - Lokální webový dashboard dostupný z LAN na konfigurovatelném portu (navržen `8765`), po schválení firewallu a autentizace.
-- Funkce LAN: přehledné stavové karty, filtrování událostí, potvrzení/ztišení alarmů, konfigurace (včetně délky kolotoče 300 s, intervalu 10 s, nečinnosti STATUS 30 s).
+- Funkce LAN: přehledné stavové karty, filtrování událostí, potvrzení závad a jas LED (viz RGB LED a potvrzování závad; `CRITICAL` nelze umlčet), konfigurace (včetně délky kolotoče 300 s, intervalu 10 s, nečinnosti STATUS 30 s).
 - Na veřejném webu `mh42.cz` pouze sanitizovaný read-only celkový stav a případně stručný výpis závad. **Nikdy** celé logy, interní IP, administraci ani API pro zápis.
 - Oddělit veřejnou projekci dat od administračního procesu už v návrhu; žádný automatický port forwarding nebo cloud.
 - Budoucí lokální web zobrazí historii ze SQLite jen pro čtení; veřejný status z ní dostane jen výslovně povolené souhrnné údaje (allowlist), nikdy IP adresy, rozhraní ani cesty.
