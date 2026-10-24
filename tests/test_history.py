@@ -826,6 +826,20 @@ class SampleContractTest(RecorderTest):
         self.assertEqual(self.samples(), [])
         self.assertEqual(self.changes("service.animedb"), [(BASE, None, "N/A", None)])
 
+    def test_animedb_health_stores_changes_only(self):
+        # SERVICES-1: healthcheck AnimeDB nemá číselnou řadu. Do historie jdou jen
+        # skutečné změny stavu a kategorických details; trvající výpadek řádky nepřidává.
+        down = {"health": "down", "cause": "refused"}
+        up = {"health": "ok"}
+        sequence = [(State.OK, up), (State.UNKNOWN, down), (State.UNKNOWN, down), (State.ERROR, down),
+                    (State.ERROR, down), (State.ERROR, up), (State.OK, up)]
+        self.write(*[[result("service.animedb", state, ts=BASE + 10 * index, details=details)]
+                     for index, (state, details) in enumerate(sequence)])
+        self.assertEqual(self.samples(), [])
+        self.assertEqual([(from_state, to_state) for _, from_state, to_state, _ in self.changes("service.animedb")],
+                         [(None, "OK"), ("OK", "UNKNOWN"), ("UNKNOWN", "ERROR"), ("ERROR", "ERROR"), ("ERROR", "OK")])
+        self.assertEqual(sum(self.recorder.rejected.values()), 0)
+
     def test_simulated_results_are_never_stored(self):
         outcome = self.write([result(CPU_TEMP_ID, State.WARNING, 80.0, CELSIUS, simulated=True),
                               result(LINK_ID, State.INFO, details={INTERFACE: "eth0", LINK: "UP"}, simulated=True)])

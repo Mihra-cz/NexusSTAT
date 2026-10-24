@@ -12,7 +12,7 @@ from unittest import mock
 from nexusstat.config import OledConfig
 from nexusstat.core import CheckResult, Measurement, State
 from nexusstat.oled import ALERT_SYMBOL, CAROUSEL_PAGES, UNKNOWN_SYMBOL, OledController
-from nexusstat.oled_text import STATE_TEXT, service_rows
+from nexusstat.oled_text import HEALTH_TEXT, STATE_TEXT, service_rows
 from nexusstat.services import SERVICE_LABELS, complete_service_results
 from nexusstat.simulate import sample_results
 
@@ -362,6 +362,14 @@ class TextFitTest(unittest.TestCase):
             for name in (TEXT_FONT, TITLE_FONT):
                 with self.subTest(text=text, font=name):
                     self.assertLessEqual(ink_width(fit_text(text, font(name), max_width), font(name)), max_width)
+
+    def test_health_reasons_fit_status_row(self):
+        # SERVICES-1: důvod stavu AnimeDB se ve STATUS vejde celý, bez výpustky.
+        status_width = RIGHT_EDGE + 1 - render.STATUS_TEXT_X
+        for word in HEALTH_TEXT.values():
+            text = f"ANIMEDB {word}"
+            with self.subTest(text=text):
+                self.assertEqual(render.first_fitting([text, "ANIMEDB"], font(TEXT_FONT), status_width), text)
 
     def test_many_czech_texts_fit(self):
         import random

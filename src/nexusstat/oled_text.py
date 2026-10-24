@@ -12,6 +12,7 @@ KB/s a MB/s (výslovně zadané pro stránku NETWORK).
 
 import hashlib
 
+from .animedb_monitor import DOWN, HEALTH, INVALID, UP
 from .core import ALERT_STATES, State, effective
 from .fan_monitor import CPU_FAN_ID, FAN_ON, FAN_STATE, SOURCE, SOURCE_REQUEST
 from .network_monitor import ADDRESS, BYTES_PER_SECOND, INTERFACE, IPV4_ID, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
@@ -69,6 +70,17 @@ FAULT_TEXT = {
     BACKUP_ID: "BACKUP OVERDUE",
     "system.time_sync": "TIME UNSYNCED",
     "disk.root_readonly": "ROOT READ-ONLY",
+}
+
+# Důvod stavu healthchecku pro STATUS podle (stav, details["health"]), nejvýš
+# 7 znaků, aby se celý řádek (např. "ANIMEDB FAILING") vešel do 15 znaků.
+# Potvrzený výpadek (ERROR) je DOWN, ještě nepotvrzený (UNKNOWN) FAILING;
+# neplatná odpověď INVALID odliší neznámý výsledek kontroly od výpadku.
+HEALTH_TEXT = {
+    (State.ERROR, DOWN): "DOWN",
+    (State.UNKNOWN, DOWN): "FAILING",
+    (State.UNKNOWN, INVALID): "INVALID",
+    (State.ERROR, UP): "RECOVER",  # odpovídá, ale výpadek ještě neodezněl
 }
 
 # Proč je stav UNKNOWN, rozlišené jen podle času, ne podle textu summary.
@@ -218,7 +230,7 @@ def service_rows(results, now):
 
     Výsledky mají projít services.complete_service_results(), aby sledovaná
     služba bez dat byla UNKNOWN stejně v SERVICES, v symbolu NEXUS i ve STATUS.
-    Prošlý výsledek je UNKN; N/A (nenasazená AnimeDB) zůstává N/A. Kdyby
+    Prošlý výsledek je UNKN; N/A (vypnuté sledování AnimeDB) zůstává N/A. Kdyby
     doplnění chybělo, chybějící služba se tu i tak ukáže jako UNKN, nikdy OK.
     """
     current = {result.id: effective(result, now) for result in results}
@@ -239,12 +251,18 @@ def status_texts(result, now):
     """
     current = effective(result, now)
     name = check_name(current.id)
+    # Jen výsledky healthchecku AnimeDB mají details "health" (SERVICES-1);
+    # prošlý výsledek je nemá (effective() je smaže), takže zůstane STALE.
+    reason = HEALTH_TEXT.get((current.state, current.details.get(HEALTH)))
     if current.measurement is not None:
         detail = measurement_text(current.measurement)  # potvrzená závada ukáže naměřenou hodnotu
     elif current.state is State.UNKNOWN:
         # effective() u prošlého výsledku nemění expires_monotonic, takže se
-        # prošlá data poznají z času, ne z textu.
-        detail = STALE if now >= current.expires_monotonic else NO_DATA
+        # prošlá data poznají z času, ne z textu. Nepotvrzený výpadek (FAILING)
+        # a neplatná odpověď (INVALID) nejsou totéž co chybějící data (NO DATA).
+        detail = STALE if now >= current.expires_monotonic else (reason or NO_DATA)
+    elif current.state in ALERT_STATES and reason is not None:
+        detail = reason  # ANIMEDB DOWN, ANIMEDB RECOVER
     elif current.state in ALERT_STATES and current.id in FAULT_TEXT:
         return [FAULT_TEXT[current.id], name]
     elif current.state is State.NA:

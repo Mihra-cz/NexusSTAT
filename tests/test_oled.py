@@ -345,10 +345,11 @@ class ServiceConsistencyTest(unittest.TestCase):
                 self.assertEqual(service_rows(completed, 10)[0], ("NEXUS", "UNKN"))
                 self.assertIs(problem_states(completed)[NEXUS_SERVICES_ID], State.UNKNOWN)
 
-    def test_not_deployed_animedb_is_na_without_alarm(self):
+    def test_unmonitored_animedb_is_na_without_alarm(self):
         results = complete_service_results(real_system_results(), OBSERVED, 30)
         [animedb] = [r for r in results if r.id == ANIMEDB_ID]
-        self.assertEqual((animedb.state, animedb.simulated, animedb.summary), (State.NA, False, "AnimeDB není nasazena"))
+        self.assertEqual((animedb.state, animedb.simulated, animedb.summary),
+                         (State.NA, False, "AnimeDB: sledování vypnuto"))
         self.assertNotIn(ANIMEDB_ID, problem_states(results))
         self.assertIs(effective(animedb, 10**9).state, State.NA)  # N/A nevyprší
         # Samotné N/A nejsou sledovaná data ani alarm.
@@ -415,6 +416,8 @@ class ServiceConsistencyTest(unittest.TestCase):
 
 class FakeMonitor:
     """Náhrada skutečných kolektorů pro simulate --live: skutečná (ne simulovaná) data bez závady."""
+
+    labels = SYSTEM_LABELS  # stejné rozhraní jako run.Collectors
 
     def __init__(self, config):
         self.validity_seconds = config.collector.validity_seconds

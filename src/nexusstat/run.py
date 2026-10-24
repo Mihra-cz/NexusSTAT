@@ -6,9 +6,11 @@ Použití:
 Každých `interval_seconds` (sekce [collector], výchozí 10 s) změří vytížení CPU,
 teplotu CPU, RAM, obsazenost / a síťové rozhraní ([network]: linka, RX/TX, IPv4),
 vyhodnotí zapnuté prahy ([alarms], výchozí vypnuto) a vypíše jeden řádek.
+Se zapnutým [services.animedb] (výchozí vypnuto) navíc jedním požadavkem GET
+na nastavenou adresu /health zkontroluje dostupnost AnimeDB.
 Ukončení: Ctrl+C nebo SIGTERM.
-Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nic neposílá
-do sítě a nepřistupuje k displeji, NAS ani jinému hardwaru. Se zapnutou historií
+Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nepřistupuje
+k displeji, NAS ani jinému hardwaru a do sítě posílá jen zapnutý healthcheck AnimeDB. Se zapnutou historií
 ([history] enabled = true s výslovnou cestou) předává vyhodnocené výsledky
 vláknu zapisovače SQLite; samo měření zůstává read-only a chyba historie ho
 nezastaví (history_link.py).
@@ -24,6 +26,7 @@ from pathlib import Path
 
 from . import __version__, history
 from .alarms import AlarmEvaluator
+from .animedb_monitor import AnimeDbMonitor
 from .config import HISTORY_ROLE, Config, ConfigError, load_config
 from .core import ALERT_STATES, CheckResult, State, overall_state
 from .fan_monitor import FanMonitor
@@ -108,14 +111,21 @@ class Collectors:
 
 
 def live_monitor(config):
-    """Skutečné read-only kolektory: systém, ventilátor CPU a síť podle konfigurace."""
+    """Skutečné read-only kolektory: systém, ventilátor CPU, síť a volitelně AnimeDB podle konfigurace."""
     validity = config.collector.validity_seconds
-    return Collectors(
+    monitors = [
         SystemMonitor(validity_seconds=validity),
         # Ventilátor CPU se jen čte; chlazení dál řídí Linux (M4-1).
         FanMonitor(validity_seconds=validity),
         NetworkMonitor(validity_seconds=validity, interface=config.network.interface),
-    )
+    ]
+    animedb = config.services.animedb
+    if animedb.enabled:
+        # Healthcheck se volá jen při výslovně zapnutém sledování (SERVICES-1);
+        # jinak kolektor vůbec nevznikne, nic se nepřipojuje a AnimeDB zůstává N/A.
+        monitors.append(AnimeDbMonitor(validity_seconds=validity, url=animedb.url,
+                                       timeout_seconds=animedb.timeout_seconds))
+    return Collectors(*monitors)
 
 
 def result_text(result):
@@ -285,7 +295,7 @@ def start_history(config, output=print_now):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Pravidelné read-only měření systému a sítě NexusSTAT")
     parser.add_argument("--config", type=Path,
-                        help="TOML se sekcemi [collector], [network], [alarms], [oled] a [history]")
+                        help="TOML se sekcemi [collector], [network], [alarms], [oled], [history] a [services]")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config) if args.config else Config()

@@ -6,8 +6,9 @@ Použití:
 
 Bez --live: skriptovaný scénář stisků s fiktivními daty, simulovaný čas, nic se nečeká.
 S --live: jeden snímek každé obrazovky ze skutečného read-only měření tohoto
-počítače (system_monitor a network_monitor). Ani jeden režim nepřistupuje
-k hardwaru displeje a nic neposílá do sítě.
+počítače (system_monitor, fan_monitor, network_monitor a se zapnutým
+[services.animedb] i healthcheck AnimeDB). Ani jeden režim nepřistupuje
+k hardwaru displeje; do sítě jde jen zapnutý healthcheck AnimeDB.
 """
 
 import argparse
@@ -151,17 +152,18 @@ def run_live(output_dir, config):
     """Snímek každé obrazovky ze skutečného měření. Čas je skutečný monotónní.
 
     `config` je celá konfigurace: [oled] pro automat, [collector] pro platnost
-    výsledků, [network] pro sledované rozhraní.
+    výsledků, [network] pro sledované rozhraní, [services] pro AnimeDB.
     """
     monitor = live_monitor(config)
     monitor.collect(time.monotonic(), datetime.now(timezone.utc))  # první vzorek CPU a síťových čítačů
     time.sleep(1)
     now = time.monotonic()
     observed_utc = datetime.now(timezone.utc)
-    # Kolektory služeb zatím nejsou: NEXUS, NAS a BACKUP jsou UNKNOWN (bez dat)
-    # na všech obrazovkách, AnimeDB je známě nenasazená, tedy N/A.
+    # Kolektory NEXUS, NAS a BACKUP zatím nejsou: jsou UNKNOWN (bez dat) na všech
+    # obrazovkách. AnimeDB je N/A, ledaže je zapnutý její healthcheck.
     results = complete_service_results(
-        monitor.collect(now, observed_utc), observed_utc, now + config.collector.validity_seconds
+        monitor.collect(now, observed_utc), observed_utc, now + config.collector.validity_seconds,
+        monitored=monitor.labels,
     )
     for result in results:
         print(f"{result.id:<17} {result.state.value:<8} {result.summary}")

@@ -9,12 +9,14 @@ from nexusstat.config import (
     THRESHOLD_LIMITS,
     AlarmRule,
     AlarmsConfig,
+    AnimeDbConfig,
     CollectorConfig,
     Config,
     ConfigError,
     HistoryConfig,
     NetworkConfig,
     OledConfig,
+    ServicesConfig,
     SnapshotConfig,
     alarms_config_from_dict,
     collector_config_from_dict,
@@ -22,6 +24,7 @@ from nexusstat.config import (
     load_config,
     network_config_from_dict,
     oled_config_from_dict,
+    services_config_from_dict,
 )
 
 EXAMPLE_CONFIG = Path(__file__).resolve().parent.parent / "config" / "config.example.toml"
@@ -42,7 +45,8 @@ class DefaultsTest(unittest.TestCase):
         # Ostatní sekce (web, storage) jsou v ukázce jen jako komentář,
         # aby nevypadaly funkčně, dokud je kód nenačítá.
         with open(EXAMPLE_CONFIG, "rb") as file:
-            self.assertEqual(set(tomllib.load(file)), {"oled", "collector", "network", "alarms", "history"})
+            self.assertEqual(set(tomllib.load(file)),
+                             {"oled", "collector", "network", "alarms", "history", "services"})
 
     def test_example_config_keeps_history_off_without_path(self):
         # Ukázka nesmí zapnout ukládání ani nabídnout výchozí cestu k databázi.
@@ -508,6 +512,89 @@ class SnapshotFileTest(unittest.TestCase):
         self.assertFalse(snapshot.enabled)
         self.assertIsNone(snapshot.work_dir)
         self.assertIsNone(snapshot.published_dir)
+
+
+class ServicesConfigTest(unittest.TestCase):
+    """[services.animedb] (SERVICES-1): výchozí vypnuto, adresa /health jen výslovně."""
+
+    URL = "http://192.0.2.10:8080/health"  # dokumentační rozsah RFC 5737, ne skutečná adresa
+
+    def test_default_is_off_without_url(self):
+        self.assertEqual(Config().services, ServicesConfig(AnimeDbConfig(enabled=False, url=None, timeout_seconds=2)))
+        self.assertEqual(services_config_from_dict({}), ServicesConfig())
+
+    def test_example_config_keeps_animedb_off_without_address(self):
+        # Ukázka nesmí nic zapnout ani obsahovat adresu skutečné instalace.
+        animedb = load_config(EXAMPLE_CONFIG).services.animedb
+        self.assertEqual((animedb.enabled, animedb.url, animedb.timeout_seconds), (False, None, 2))
+
+    def test_values(self):
+        for url in (self.URL, "http://127.0.0.1/health", "http://[::1]:8000/api/health", "http://192.0.2.10:80/health"):
+            with self.subTest(url=url):
+                config = services_config_from_dict({"animedb": {"enabled": True, "url": url, "timeout_seconds": 1.5}})
+                self.assertEqual(config.animedb, AnimeDbConfig(enabled=True, url=url, timeout_seconds=1.5))
+        # Adresa bez zapnutí je platná a nic nezapíná.
+        self.assertFalse(services_config_from_dict({"animedb": {"url": self.URL}}).animedb.enabled)
+
+    def test_invalid_urls(self):
+        urls = (
+            "https://192.0.2.10/health",  # jen http
+            "ftp://192.0.2.10/health",
+            "http://animedb.lan/health",  # název hostitele: DNS bez limitu
+            "http://localhost:8080/health",
+            "http://user:heslo@192.0.2.10/health",  # přihlašovací údaje
+            "http://192.0.2.10/health?full=1",
+            "http://192.0.2.10/health?",
+            "http://192.0.2.10/health#x",
+            "http://192.0.2.10/status",  # jiný endpoint
+            "http://192.0.2.10/",
+            "http://192.0.2.10",
+            "http://192.0.2.10:0/health",
+            "http://192.0.2.10:99999/health",
+            "http://192.0.2.10:port/health",
+            "http://[::1/health",
+            "http://192.0.2.10/he alth",
+            "http://192.0.2.10/health\r\nX: y",
+            "http://192.0.2.10/zdraví/health",
+            "http://192.0.2.10/" + "a" * 300 + "/health",
+            "",
+            5,
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                with self.assertRaises(ConfigError):
+                    services_config_from_dict({"animedb": {"url": url}})
+
+    def test_invalid_values(self):
+        sections = (
+            {"animedb": {"enabled": True}},  # zapnuto bez adresy
+            {"animedb": {"enabled": "true", "url": self.URL}},
+            {"animedb": {"enabled": 1, "url": self.URL}},
+            {"animedb": {"timeout_seconds": 0}},
+            {"animedb": {"timeout_seconds": -1}},
+            {"animedb": {"timeout_seconds": 5.5}},
+            {"animedb": {"timeout_seconds": float("inf")}},
+            {"animedb": {"timeout_seconds": float("nan")}},
+            {"animedb": {"timeout_seconds": True}},
+            {"animedb": {"timeout_seconds": "2"}},
+            {"animedb": {"enabled": False, "container": "x"}},  # neznámý klíč (dřívější Docker varianta)
+            {"nas": {"enabled": False}},  # služba bez kolektoru
+            {"animedb": "on"},
+        )
+        for section in sections:
+            with self.subTest(section=section):
+                with self.assertRaises(ConfigError):
+                    services_config_from_dict(section)
+
+    def test_section_from_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(f'[services.animedb]\nenabled = true\nurl = "{self.URL}"\ntimeout_seconds = 2\n',
+                            encoding="utf-8")
+            self.assertEqual(load_config(path).services.animedb, AnimeDbConfig(True, self.URL, 2))
+            path.write_text("[services.animedb]\nenabled = true\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, r"\[services.animedb\] enabled = true vyžaduje url"):
+                load_config(path)
 
 
 class LoadFileTest(unittest.TestCase):

@@ -1,9 +1,14 @@
-"""Načtení a validace konfiguračního TOML: sekce [oled], [collector], [network], [alarms] a [history]."""
+"""Načtení a validace konfiguračního TOML.
 
+Sekce [oled], [collector], [network], [alarms], [history] a [services].
+"""
+
+import ipaddress
 import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .core import is_finite_number
@@ -35,6 +40,18 @@ KNOWN_NETWORK_KEYS = {"interface"}
 KNOWN_HISTORY_KEYS = {"enabled", "path", "snapshot"}
 KNOWN_SNAPSHOT_KEYS = {"enabled", "work_dir", "published_dir", "daily_time", "timezone"}
 KNOWN_RULE_KEYS = {"enabled", "warning", "error", "hysteresis", "confirm_count", "clear_count"}
+# Jediná služba se skutečným kolektorem (SERVICES-1). Další služby se přidají
+# až s vlastním kolektorem, ne předem jako nefunkční volby.
+KNOWN_SERVICES_KEYS = {"animedb"}
+KNOWN_ANIMEDB_KEYS = {"enabled", "url", "timeout_seconds"}
+
+# Healthcheck AnimeDB (SERVICES-1): limit celé kontroly v sekundách (spojení,
+# odeslání i příjem dohromady). Měřicí smyčka je jednovláknová, takže se
+# zdrží nejvýš o tuto dobu; horní mez chrání před překlepem.
+HEALTH_TIMEOUT_DEFAULT = 2
+HEALTH_TIMEOUT_MAX = 5
+HEALTH_PATH_SUFFIX = "/health"
+MAX_URL_LENGTH = 256
 
 # Názvy síťových rozhraní, se kterými NexusSTAT pracuje: nejvýš 15 znaků jako
 # v jádře (IFNAMSIZ − 1), jen písmena, číslice, "_", "." a "-". Jádro povoluje
@@ -63,9 +80,14 @@ BOUNDARY_DECIMALS = 6
 # Při intervalu 10 s je 60 měření deset minut.
 MAX_CONFIRM_COUNT = 60
 
+# Výchozí počty po sobě jdoucích měření pro vznik a odeznění závady. Stejný
+# princip potvrzování používá i healthcheck AnimeDB (animedb_monitor.py).
+DEFAULT_CONFIRM_COUNT = 3
+DEFAULT_CLEAR_COUNT = 2
+
 # Načítané sekce. Ostatní ([web], [storage], ...) jsou chyba,
 # dokud je kód skutečně nepoužívá, jinak by se tiše ignorovaly.
-KNOWN_SECTIONS = {"oled", "collector", "network", "alarms", "history"}
+KNOWN_SECTIONS = {"oled", "collector", "network", "alarms", "history", "services"}
 
 # Role databáze historie v tomto kroku: jen vývojová databáze na notebooku.
 # Konfigurace roli nenastavuje, takže produkční databázi nelze zapnout omylem
@@ -188,8 +210,8 @@ class AlarmRule:
     warning: float | None = None
     error: float | None = None
     hysteresis: float | None = None
-    confirm_count: int = 3  # po sobě jdoucí měření nad prahem pro vznik závady
-    clear_count: int = 2  # po sobě jdoucí měření pod prahem s hysterezí pro odeznění
+    confirm_count: int = DEFAULT_CONFIRM_COUNT  # po sobě jdoucí měření nad prahem pro vznik závady
+    clear_count: int = DEFAULT_CLEAR_COUNT  # po sobě jdoucí měření pod prahem s hysterezí pro odeznění
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
@@ -365,6 +387,70 @@ class HistoryConfig:
             raise ConfigError(f"path musí mít příponu {HISTORY_SUFFIX}, ne {name!r}")
 
 
+def check_health_url(url):
+    """Ověří adresu healthchecku a vrátí ji rozloženou (urlsplit).
+
+    Jen `http://<IP adresa>[:port]/…/health`: název hostitele by se překládal
+    přes DNS bez časového limitu a https by potřebovalo samostatné rozhodnutí
+    o certifikátech. Bez přihlašovacích údajů, query a fragmentu a jen
+    tisknutelné ASCII bez mezer, aby adresa šla beze změny do požadavku HTTP.
+    """
+    problem = f"url musí být http://<IP adresa>[:port]/…/health, ne {url!r}"
+    if not isinstance(url, str) or not 0 < len(url) <= MAX_URL_LENGTH or not all("!" <= ch <= "~" for ch in url):
+        raise ConfigError(problem)
+    try:
+        parts = urlsplit(url)
+        port = parts.port  # neplatný nebo příliš velký port vyvolá ValueError
+        ipaddress.ip_address(parts.hostname or "")
+    except ValueError:
+        raise ConfigError(problem) from None
+    if (parts.scheme != "http" or "@" in parts.netloc or "?" in url or "#" in url or port == 0
+            or not parts.path.endswith(HEALTH_PATH_SUFFIX)):
+        raise ConfigError(problem)
+    return parts
+
+
+def check_health_timeout(value):
+    # is_finite_number odmítne i bool: TOML `true` není počet sekund.
+    if not is_finite_number(value) or not 0 < value <= HEALTH_TIMEOUT_MAX:
+        raise ConfigError(f"timeout_seconds musí být číslo v rozsahu (0, {HEALTH_TIMEOUT_MAX}] s, ne {value!r}")
+
+
+@dataclass(frozen=True)
+class AnimeDbConfig:
+    """Volitelné sledování AnimeDB přes její HTTP endpoint /health (SERVICES-1).
+
+    Výchozí stav je vypnuto a adresa nemá výchozí hodnotu: bez výslovného
+    zapnutí se nikam nepřipojuje a AnimeDB je `N/A`. Skutečná adresa patří
+    jen do lokální konfigurace mimo Git. Dostupnost endpointu se tu
+    nekontroluje (mění se za běhu), jen tvar adresy a limit.
+    """
+
+    enabled: bool = False
+    url: str | None = None
+    timeout_seconds: float = HEALTH_TIMEOUT_DEFAULT
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(f"enabled musí být true nebo false, ne {self.enabled!r}")
+        if self.url is not None:
+            check_health_url(self.url)
+        check_health_timeout(self.timeout_seconds)
+        if self.enabled and self.url is None:
+            raise ConfigError("enabled = true vyžaduje url")
+
+
+@dataclass(frozen=True)
+class ServicesConfig:
+    """Kolektory služeb. Zatím jediný: healthcheck AnimeDB, výchozí vypnuto."""
+
+    animedb: AnimeDbConfig = field(default_factory=AnimeDbConfig)
+
+    def __post_init__(self):
+        if not isinstance(self.animedb, AnimeDbConfig):
+            raise ConfigError("[services.animedb] musí být AnimeDbConfig")
+
+
 @dataclass(frozen=True)
 class Config:
     """Celá konfigurace. Chybějící sekce mají výchozí hodnoty."""
@@ -374,6 +460,7 @@ class Config:
     alarms: AlarmsConfig = field(default_factory=AlarmsConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
+    services: ServicesConfig = field(default_factory=ServicesConfig)
 
 
 def oled_config_from_dict(section):
@@ -414,6 +501,18 @@ def history_config_from_dict(section):
     return HistoryConfig(**keys, snapshot=snapshot)
 
 
+def services_config_from_dict(section):
+    """Vytvoří ServicesConfig ze slovníku sekce [services] včetně podsekce [services.animedb]."""
+    _check_section("services", section, KNOWN_SERVICES_KEYS)
+    animedb_section = section.get("animedb", {})
+    _check_section("services.animedb", animedb_section, KNOWN_ANIMEDB_KEYS)
+    try:
+        animedb = AnimeDbConfig(**animedb_section)
+    except ConfigError as error:
+        raise ConfigError(f"[services.animedb] {error}") from error
+    return ServicesConfig(animedb=animedb)
+
+
 def alarms_config_from_dict(section):
     """Vytvoří AlarmsConfig ze slovníku sekce [alarms]. Chybějící pravidla = vypnutá."""
     _check_section("alarms", section, set(THRESHOLD_LIMITS))
@@ -443,4 +542,5 @@ def load_config(path):
         alarms=alarms_config_from_dict(data.get("alarms", {})),
         network=network_config_from_dict(data.get("network", {})),
         history=history_config_from_dict(data.get("history", {})),
+        services=services_config_from_dict(data.get("services", {})),
     )

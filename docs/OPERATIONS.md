@@ -6,7 +6,7 @@ Na Nexusu zatím neběží žádný kód, service ani port. Není co instalovat,
 
 ## Lokální vývoj (simulace, read-only kolektory a pravidelné měření)
 
-Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku ani NAS a nic neposílá do sítě. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`. Síťový kolektor (v0.6) jen čte `/sys/class/net` a `/proc/net/route` a lokální IPv4 zjistí dotazem na jádro (`ioctl SIOCGIFADDR` na nepřipojeném socketu: žádný paket, žádný port, žádné připojení). Nic nezapisují a nespouštějí žádné příkazy.
+Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku ani NAS a nic neposílá do sítě. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`. Síťový kolektor (v0.6) jen čte `/sys/class/net` a `/proc/net/route` a lokální IPv4 zjistí dotazem na jádro (`ioctl SIOCGIFADDR` na nepřipojeném socketu: žádný paket, žádný port, žádné připojení). Nic nezapisují a nespouštějí žádné příkazy. Jedinou výjimkou je volitelný healthcheck AnimeDB (SERVICES-1, níže): jen se zapnutým `[services.animedb]` pošle jeden HTTP `GET` na nastavenou adresu `/health`; ve výchozím stavu je vypnutý a nikam se nepřipojuje.
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
@@ -39,6 +39,26 @@ SQLite historii (`src/nexusstat/history.py`, základ M3.1a, synchronní zápis M
 
 Vlákno zapisovače (M3.3a) spouští od M3.3b-1 i `nexusstat.run` se zapnutou sekcí `[history]` (viz níže); jinak jen testy. Pro provoz platí: při chybě zápisu drží data jen v paměti (omezené fronty, nejvýš hodina) a opakuje zápis s odstupem; nikdy nevytvoří novou databázi. Po ztrátě práva zápisu je potřeba vrátit práva souboru databáze **i** jeho `-wal` a `-shm` (SQLite je mohlo mezitím vytvořit jen pro čtení). Poškozený nebo cizí soubor zapisovač zastaví (`FAILED`) a soubor nemění. Ukončení čeká nejvýš 10 s; zápis zaseknutý v systémovém I/O ukončit nejde, zámek pak uvolní až konec procesu a nepotvrzená data se ztratí (příští start je označí neznámou mezerou).
 
+### Healthcheck AnimeDB (SERVICES-1, volitelný, výchozí stav vypnuto)
+
+Bez sekce `[services.animedb]` (nebo s `enabled = false`) se kolektor nevytvoří a nikam se nepřipojuje; AnimeDB je na SERVICES `N/A`. Zapnutí jen ve vlastní kopii konfigurace mimo Git (`config/config.toml`), protože obsahuje skutečnou adresu:
+
+```toml
+[services.animedb]
+enabled = true
+url = "http://192.0.2.10:8080/health"   # skutečnou IP a port jen v lokální konfiguraci
+timeout_seconds = 2
+```
+
+- Adresa jen `http://<IP adresa>[:port]/…/health` (název hostitele ne: DNS nemá časový limit), bez přihlašovacích údajů, query a fragmentu; neplatná adresa ukončí program kódem 2.
+- Při každém měření (výchozí po 10 s) jediný `GET` bez proxy z prostředí a bez následování přesměrování; spojení, odeslání i příjem mají dohromady nejvýš `timeout_seconds` (výchozí 2 s, nejvýš 5 s). Jednovláknovou smyčku i okno náhledu zdrží nejvýš o tuto dobu; ostatní kolektory měří normálně.
+- Výpadek (odmítnuto, timeout, přerušeno, nedostupná adresa, HTTP 5xx) se ukáže jako `ERROR` až po 3 po sobě jdoucích kontrolách; první dvě jsou `UNKNOWN` (`ANIMEDB FAILING`) bez blikání, takže restart AnimeDB kratší než asi 20 s alarm nevyvolá. Výpadek odezní po 2 úspěšných kontrolách (mezi nimi `ANIMEDB RECOVER`). Neplatná nebo nečekaná odpověď je `UNKNOWN` (`ANIMEDB INVALID`). Význam stavů je v `docs/REQUIREMENTS.md` (Healthcheck AnimeDB).
+- Výsledek `service.animedb` jde do řádku `nexusstat.run` (např. `AnimeDB: /health odpovídá, status ok`, `AnimeDB: spojení odmítnuto (výpadek zatím nepotvrzen, 1/3)`), se zapnutou historií do SQLite jako změna stavu (bez číselné řady), v živém náhledu LIVE na SERVICES, do STATUS, na symbol stránky NEXUS a do simulovaných LED. Adresa se do výpisu ani historie nezapisuje.
+- Nepotřebuje Docker, jeho socket ani skupinu `docker`; nic se nespouští ani neinstaluje.
+- Návrat: `enabled = false` nebo odstranění sekce a nové spuštění; nic jiného se nemění.
+
+Ověřeno jen testy nad syntetickými odpověďmi HTTP (`tests/test_animedb_monitor.py`); proti běžící AnimeDB kolektor zatím nebyl spuštěn.
+
 ### Zkouška historie na notebooku (M3.3b-1, volitelná, výchozí stav vypnuto)
 
 Bez sekce `[history]` je chování shodné s v0.6: nic se neukládá. Zapnutí je výslovné rozhodnutí a vyžaduje už existující databázi v roli `development`, kterou vytvoří správce mimo repozitář (`.gitignore` chrání `*.sqlite3`, cesty Nexusu se nepoužívají):
@@ -68,7 +88,7 @@ Benchmark návrhu SQLite (M2, `tools/sqlite_history_benchmark.py`) není součá
 python3 tools/sqlite_history_benchmark.py --quick
 ```
 
-Simulátor kreslí i stránku SERVICES: ve scénáři s fiktivními stavy a značkou `SIM`, v režimu `--live` bez kolektorů služeb: NEXUS, NAS a BACKUP jsou `UNKNOWN` na SERVICES (`UNKN`) i ve STATUS (`NAS NO DATA`) a stránka NEXUS ukazuje `?`; AnimeDB je `N/A`. Snímky ukládej mimo repozitář (např. do `/tmp`).
+Simulátor kreslí i stránku SERVICES: ve scénáři s fiktivními stavy a značkou `SIM`, v režimu `--live` bez kolektorů služeb: NEXUS, NAS a BACKUP jsou `UNKNOWN` na SERVICES (`UNKN`) i ve STATUS (`NAS NO DATA`) a stránka NEXUS ukazuje `?`; AnimeDB je `N/A`, se zapnutým `[services.animedb]` (a `--config`) výsledek jednoho healthchecku (bez potvrzování, které potřebuje víc kontrol). Snímky ukládej mimo repozitář (např. do `/tmp`).
 
 ### Živý simulátor OLED a RGB LED (v0.5, RGB-1)
 
@@ -91,7 +111,7 @@ PYTHONPATH=src python3 -m nexusstat.preview --scenario rgb_acknowledged
 - Displej je anglicky (texty z `oled_text.py`), ovládání okna česky.
 - Pod displejem je režim (SLEEP / CAROUSEL – stránka / STATUS – stránka x/y) a zdroj dat: „SIMULACE: fiktivní data“ nebo „LIVE: měření tohoto NOTEBOOKU, ne Nexusu“.
 - Scénáře: 1 Vše v pořádku, 2 WARNING (teplota), 3 ERROR a CRITICAL, 4 UNKNOWN (neplatná, chybějící a po 20/40 s zastaralá data), 5 Více problémů (2 stránky STATUS), 6 Nenapojené služby (NEXUS, NAS, BACKUP `UNKNOWN`, AnimeDB `N/A`), 7–11 NETWORK (v0.6): linka DOWN, bez IPv4, nízký provoz, vysoký provoz, neplatná a po 20 s zastaralá data, 12–17 RGB (NAS WARNING, AnimeDB ERROR, zálohy ERROR, několik závad, CRITICAL a WARNING, potvrzená závada). Změna scénáře začne data, paměť alarmů, potvrzení LED i okno kolotoče znovu; rozsvícený displej zůstane rozsvícený od stránky NEXUS.
-- LIVE: `SystemMonitor`, `NetworkMonitor` (rozhraní z `[network]`) a `AlarmEvaluator` (prahy z `--config`) v intervalu `[collector]`, vždy 1×, bez značky `SIM`. Měření běží v okně (typicky jednotky ms); zaseknuté čtení `/` by okno zablokovalo stejně jako `nexusstat.run`. První vzorek CPU je `UNKNOWN`.
+- LIVE: `SystemMonitor`, `NetworkMonitor` (rozhraní z `[network]`) a `AlarmEvaluator` (prahy z `--config`) v intervalu `[collector]`, vždy 1×, bez značky `SIM`. Měření běží v okně (typicky jednotky ms); zaseknuté čtení `/` by okno zablokovalo stejně jako `nexusstat.run`. První vzorek CPU je `UNKNOWN`. Se zapnutým `[services.animedb]` se přidá healthcheck AnimeDB (okno zdrží nejvýš `timeout_seconds`) a popis pod displejem to uvádí; jinak „AnimeDB N/A (sledování vypnuto)“.
 - Bez tkinter skončí příkaz kódem 2 se zprávou, bez grafického displeje kódem 1.
 
 Úspěšné testy dokládají logiku automatu, validaci, výpočty kolektorů nad vzorovými vstupy (síťové stavy výhradně ve fixturách, nezávisle na síti počítače), plánování smyčky a vyhodnocení prahů se simulovaným časem a hodnotami a vykreslení do obrázku. Nedokládají vhodnost konkrétních prahů pro Nexus. Nedokládají funkci displeje, tlačítka ani správnou volbu teplotního senzoru na Raspberry Pi 5; to vyžaduje samostatné schválené read-only ověření na cílovém stroji. Ruční běh `nexusstat.run` dokládá jen funkci na notebooku.
@@ -112,7 +132,7 @@ Skutečné názvy jednotek a cesty mountů jsou v soukromé dokumentaci Nexusu, 
 
 Kontrola mountu nikdy není náhradou za ověřený read-only test dostupnosti NAS s timeoutem. Nespouštěj restic backup, retention ani test zápisu bez schválení.
 
-Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje dat na RPi 5, např. typy a stav `/sys/class/thermal/cooling_device*` (`type`, `cur_state`, `max_state`), dostupnost otáček v `/sys/class/hwmon/hwmon*/` (`name`, `fan*_input`) a rozhraní v `/sys/class/net/*/operstate` (název ethernetu na RPi 5 s Debianem 13, např. `eth0` nebo `end0`, a zda automatický výběr zvolí správné rozhraní). Nic se nezapisuje; GPIO se ani nečte bez samostatného schválení.
+Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje dat na RPi 5, např. typy a stav `/sys/class/thermal/cooling_device*` (`type`, `cur_state`, `max_state`), dostupnost otáček v `/sys/class/hwmon/hwmon*/` (`name`, `fan*_input`) a rozhraní v `/sys/class/net/*/operstate` (název ethernetu na RPi 5 s Debianem 13, např. `eth0` nebo `end0`, a zda automatický výběr zvolí správné rozhraní). Nic se nezapisuje; GPIO se ani nečte bez samostatného schválení. Pro healthcheck AnimeDB (SERVICES-1) až po nasazení AnimeDB ručně jen `curl --noproxy '*' --max-time 2 http://<adresa>/health` (očekávané HTTP 200 a `{"status":"ok"}`), bez zásahu do AnimeDB.
 
 ## Před přechodem na hardware
 

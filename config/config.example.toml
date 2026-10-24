@@ -80,6 +80,22 @@ enabled = false
 # daily_time = "02:00"
 # timezone = "Europe/Prague"
 
+# Healthcheck AnimeDB přes její HTTP endpoint /health (SERVICES-1). Výchozí
+# stav: vypnuto, nikam se nepřipojuje a AnimeDB je N/A.
+# Při `enabled = true` je povinná `url`: jen http://<IP adresa>[:port]/…/health
+# (název hostitele ne, DNS by nemělo časový limit; bez přihlašovacích údajů,
+# query a fragmentu). Skutečná adresa patří jen do lokální konfigurace mimo Git.
+# Při každém měření jediný GET bez proxy z prostředí a bez přesměrování;
+# celá kontrola nejvýš `timeout_seconds` (číslo v rozsahu (0, 5], výchozí 2).
+# Stavy: HTTP 200 a {"status": "ok"} = OK; výpadek (odmítnuto, timeout,
+# přerušeno, nedostupná adresa, HTTP 5xx) = ERROR až po 3 po sobě jdoucích
+# kontrolách (do té doby UNKNOWN, bez blikání), odezní po 2 úspěšných;
+# jiná nebo neplatná odpověď = UNKNOWN. Docker ani jeho socket se nepoužívá.
+[services.animedb]
+enabled = false
+# url = "http://192.0.2.10:8080/health"
+timeout_seconds = 2
+
 # --- Budoucí možnosti: zatím NEIMPLEMENTOVÁNO a nenačítá se ---
 # Nápis na první stránce je pevně NEXUS, hodiny jsou vždy 24h.
 # Symboly na stránce NEXUS (trojúhelník / "?") nelze vypnout.

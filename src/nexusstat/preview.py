@@ -6,8 +6,8 @@ Spuštění:
 Obraz kreslí výhradně render.render_screen(); simulátor jen řídí čas,
 tlačítko, scénáře a zvětšení. LED jsou samostatná plocha pod displejem
 a jejich barvu určuje rgb.py, do bitmapy OLED se nekreslí. Nepřistupuje
-k hardwaru displeje, LED, SPI ani GPIO a nic neposílá do sítě (LIVE síť jen
-čte jako network_monitor). Stavová logika (PreviewSession) nepotřebuje
+k hardwaru displeje, LED, SPI ani GPIO a do sítě posílá jen zapnutý healthcheck
+AnimeDB v LIVE (síť jinak jen čte jako network_monitor). Stavová logika (PreviewSession) nepotřebuje
 tkinter ani grafický displej, takže ji testy ověřují bez X serveru; tkinter
 se načte až při otevření okna.
 """
@@ -323,7 +323,8 @@ class PreviewSession:
         if self.is_live:
             # Skutečné měření běží ve skutečném čase.
             self.clock.set_speed(1)
-            # Skutečné read-only kolektory podle konfigurace: systém a síť ([network]).
+            # Skutečné read-only kolektory podle konfigurace: systém, síť ([network])
+            # a jen při zapnutém [services.animedb] i healthcheck AnimeDB.
             self.monitor = self.monitor_factory(self.config)
             self.evaluator = AlarmEvaluator(self.config.alarms)
         else:
@@ -375,7 +376,9 @@ class PreviewSession:
         # Skutečně monitorované kontroly pro LED: služby, které doplnění níže
         # přidá jen kvůli chybějícímu kolektoru, bílou blokovat nemají.
         self.monitored = measured
-        self.results = complete_service_results(measured, observed_utc, now + self.validity)
+        # Služba se zapnutým kolektorem (LIVE, např. AnimeDB) bez výsledku je UNKNOWN, ne N/A.
+        enabled = self.monitor.labels if self.monitor is not None else ()
+        self.results = complete_service_results(measured, observed_utc, now + self.validity, monitored=enabled)
         self.next_refresh = now + self.interval
 
     def _refresh_if_due(self, now):
@@ -441,8 +444,11 @@ class PreviewSession:
 
     def source_text(self):
         if self.is_live:
+            animedb = self.config.services.animedb
+            source = ("AnimeDB z HTTP healthchecku /health" if animedb.enabled
+                      else "AnimeDB N/A (sledování vypnuto)")
             return ("LIVE: skutečná read-only měření (systém a síť) tohoto NOTEBOOKU, ne Nexusu. "
-                    "Služby bez kolektoru UNKNOWN, AnimeDB N/A. Čas 1×.")
+                    f"Služby bez kolektoru UNKNOWN, {source}. Čas 1×.")
         return f"SIMULACE: fiktivní data (značka SIM), čas {self.clock.speed}×."
 
     def rgb_text(self):
@@ -625,7 +631,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Živý simulátor OLED NexusSTAT (tkinter, jen notebook)")
     parser.add_argument("--scenario", choices=list(SCENARIOS), default="ok", help="výchozí scénář")
     parser.add_argument("--scale", type=int, choices=SCALES, default=4, help="zvětšení pixelů OLED")
-    parser.add_argument("--config", type=Path, help="TOML se sekcemi [oled], [collector] a [alarms]")
+    parser.add_argument("--config", type=Path,
+                        help="TOML se sekcemi [oled], [collector], [alarms], [network] a [services]")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config) if args.config else Config()
