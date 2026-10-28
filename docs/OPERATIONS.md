@@ -6,7 +6,7 @@ Na Nexusu zatím neběží žádný kód, service ani port. Není co instalovat,
 
 ## Lokální vývoj (simulace, read-only kolektory a pravidelné měření)
 
-Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku ani NAS a nic neposílá do sítě. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`. Síťový kolektor (v0.6) jen čte `/sys/class/net` a `/proc/net/route` a lokální IPv4 zjistí dotazem na jádro (`ioctl SIOCGIFADDR` na nepřipojeném socketu: žádný paket, žádný port, žádné připojení). Nic nezapisují a nespouštějí žádné příkazy. Jedinou výjimkou je volitelný healthcheck AnimeDB (SERVICES-1, níže): jen se zapnutým `[services.animedb]` pošle jeden HTTP `GET` na nastavenou adresu `/health`; ve výchozím stavu je vypnutý a nikam se nepřipojuje.
+Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku ani NAS a nic neposílá do sítě. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`. Síťový kolektor (v0.6) jen čte `/sys/class/net` a `/proc/net/route` a lokální IPv4 zjistí dotazem na jádro (`ioctl SIOCGIFADDR` na nepřipojeném socketu: žádný paket, žádný port, žádné připojení). Nic nezapisují a nespouštějí žádné příkazy. Výjimkami jsou volitelný healthcheck AnimeDB (SERVICES-1, níže): jen se zapnutým `[services.animedb]` pošle jeden HTTP `GET` na nastavenou adresu `/health`, a volitelná kontrola NAS (SERVICES-2, níže): jen se zapnutým `[services.nas]` jeden pokus o spojení TCP na port SMB, který se hned zavře. Obě jsou ve výchozím stavu vypnuté a nikam se nepřipojují.
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
@@ -58,6 +58,28 @@ timeout_seconds = 2
 - Návrat: `enabled = false` nebo odstranění sekce a nové spuštění; nic jiného se nemění.
 
 Ověřeno jen testy nad syntetickými odpověďmi HTTP (`tests/test_animedb_monitor.py`); proti běžící AnimeDB kolektor zatím nebyl spuštěn.
+
+### Kontrola dostupnosti NAS (SERVICES-2, volitelná, výchozí stav vypnuto)
+
+Bez sekce `[services.nas]` (nebo s `enabled = false`) se kolektor nevytvoří a nikam se nepřipojuje; NAS je na SERVICES `N/A` (do SERVICES-2 `UNKN`). Zapnutí jen ve vlastní kopii konfigurace mimo Git (`config/config.toml`), protože obsahuje skutečnou adresu:
+
+```toml
+[services.nas]
+enabled = true
+host = "192.0.2.20"   # skutečnou IP NAS jen v lokální konfiguraci
+port = 445
+timeout_seconds = 2
+```
+
+- `host` jen číselná IPv4 nebo IPv6 adresa (název hostitele ne: DNS nemá časový limit; bez zóny `%rozhraní`, ne `0.0.0.0` ani `::`), `port` celé číslo 1–65535, `timeout_seconds` v rozsahu (0, 5] s; neplatná hodnota ukončí program kódem 2.
+- Při každém měření (výchozí po 10 s) **jediný pokus o spojení TCP**, který se po navázání hned zavře. Žádné přihlášení SMB, procházení sdílených složek, čtení souborů, SNMP, DSM API ani SSH; síťové mounty NAS a `autofs` se neotevírají, takže kontrola automatické připojení nespustí. Pokus trvá nejvýš `timeout_seconds` (výchozí 2 s); jednovláknovou smyčku zdrží nejvýš o tuto dobu, se zapnutou AnimeDB se limity sčítají (timeouty proto drž výrazně pod `[collector] interval_seconds`). Čas a platnost výsledků se počítají od začátku měření; měření delší než interval se provádějí hned po sobě (zmeškaná se nedohánějí) a měření delší než platnost výsledků (3 × interval) výpadek nikdy nepotvrdí, NAS i AnimeDB pak zůstanou `UNKNOWN`. Ctrl+C a SIGTERM přeruší i čekající spojení.
+- `OK` znamená jen „služba SMB přijímá spojení“: **ne** dostupnost všech sdílených složek, čitelnost dat, možnost zapisovat zálohy ani zdraví hardwaru NAS.
+- Výpadek (odmítnuto, timeout, nedostupná síť nebo adresa) se ukáže jako `ERROR` až po 3 po sobě jdoucích kontrolách (`NAS OFFLINE`); první dvě jsou `UNKNOWN` (`NAS FAILING`) bez blikání. Výpadek odezní po 2 úspěšných kontrolách (mezi nimi `NAS RECOVER`). Chyba na této straně (např. nedostatek deskriptorů) je `UNKNOWN` (`NAS NO DATA`), nikdy výpadek ani OK. Význam stavů je v `docs/REQUIREMENTS.md` (Kontrola dostupnosti NAS).
+- Výsledek `service.nas` jde do řádku `nexusstat.run` (např. `NAS: služba SMB přijímá spojení (port 445)`, `NAS: spojení odmítnuto (výpadek zatím nepotvrzen, 1/3)`), se zapnutou historií do SQLite jako změna stavu (bez číselné řady), v živém náhledu LIVE na SERVICES, do STATUS, na symbol stránky NEXUS a do simulovaných LED (kód 2). Adresa se do výpisu ani historie nezapisuje.
+- NAS může v logu vidět krátké spojení z Nexusu při každém měření; s přihlášením to nesouvisí.
+- Návrat: `enabled = false` nebo odstranění sekce a nové spuštění; nic jiného se nemění.
+
+Ověřeno jen testy nad podvrženým spojením (`tests/test_nas_monitor.py`); proti skutečnému NAS kontrola zatím nebyla spuštěna. Dostupnost sdílených složek SMB a ověřování záloh Restic zatím **nejsou implementované**.
 
 ### Zkouška historie na notebooku (M3.3b-1, volitelná, výchozí stav vypnuto)
 

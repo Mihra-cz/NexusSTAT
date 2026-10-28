@@ -511,6 +511,23 @@ class ConfirmationTest(unittest.TestCase):
                          [State.UNKNOWN, State.UNKNOWN, State.ERROR, State.UNKNOWN, State.ERROR, State.ERROR,
                           State.UNKNOWN, State.ERROR, State.OK])
 
+    def test_unexpected_exception_interrupts_the_series(self):
+        # Regrese (review SERVICES-2): výjimka, kterou zachytí až run.Collectors, je kontrola
+        # bez výsledku. Dřív se nepočítala vůbec, takže timeout, výjimka, timeout, timeout dalo
+        # ERROR jako tři výpadky po sobě a úspěch, výjimka, úspěch ukončil výpadek (falešné OK).
+        def states(*steps):
+            collectors = Collectors(monitor_for(FakeNetwork(*steps)))
+            return [collectors.collect(NOW + INTERVAL * index, OBSERVED)[0] for index in range(len(steps))]
+
+        timeout, bug = socket.timeout("timed out"), RuntimeError("chyba")
+        results = states(timeout, bug, timeout, timeout)
+        self.assertEqual([r.state for r in results], [State.UNKNOWN] * 4)
+        self.assertEqual(results[1].details[COLLECTOR_FAILURE], "RuntimeError")
+        self.assertIn("2/3", results[3].summary)  # řada začala znovu až po výjimce
+        self.assertEqual([r.state for r in states(REFUSED, REFUSED, REFUSED, HEALTHY, bug, HEALTHY, HEALTHY)],
+                         [State.UNKNOWN, State.UNKNOWN, State.ERROR, State.ERROR, State.UNKNOWN, State.ERROR,
+                          State.OK])
+
     def test_gap_in_measurement_restarts_the_series(self):
         monitor = monitor_for(FakeNetwork(REFUSED))
         first = monitor.collect(NOW, OBSERVED)[0]
@@ -562,7 +579,7 @@ class DisplayAndRgbTest(unittest.TestCase):
                     self.assertEqual(signal.steps, ((State.ERROR, 3),))
                     self.assertEqual(symbol, ALERT_SYMBOL)
                 else:
-                    # NEXUS, NAS a BACKUP nemají kolektor (UNKNOWN), proto "?" i při zdravé AnimeDB.
+                    # NEXUS a BACKUP nemají kolektor (UNKNOWN), proto "?" i při zdravé AnimeDB.
                     self.assertEqual(symbol, UNKNOWN_SYMBOL)
 
     def test_expired_result_is_unknown_never_ok(self):

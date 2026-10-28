@@ -40,10 +40,11 @@ KNOWN_NETWORK_KEYS = {"interface"}
 KNOWN_HISTORY_KEYS = {"enabled", "path", "snapshot"}
 KNOWN_SNAPSHOT_KEYS = {"enabled", "work_dir", "published_dir", "daily_time", "timezone"}
 KNOWN_RULE_KEYS = {"enabled", "warning", "error", "hysteresis", "confirm_count", "clear_count"}
-# Jediná služba se skutečným kolektorem (SERVICES-1). Další služby se přidají
-# až s vlastním kolektorem, ne předem jako nefunkční volby.
-KNOWN_SERVICES_KEYS = {"animedb"}
+# Jen služby se skutečným kolektorem (AnimeDB od SERVICES-1, NAS od SERVICES-2).
+# Další služby se přidají až s vlastním kolektorem, ne předem jako nefunkční volby.
+KNOWN_SERVICES_KEYS = {"animedb", "nas"}
 KNOWN_ANIMEDB_KEYS = {"enabled", "url", "timeout_seconds"}
+KNOWN_NAS_KEYS = {"enabled", "host", "port", "timeout_seconds"}
 
 # Healthcheck AnimeDB (SERVICES-1): limit celé kontroly v sekundách (spojení,
 # odeslání i příjem dohromady). Měřicí smyčka je jednovláknová, takže se
@@ -52,6 +53,11 @@ HEALTH_TIMEOUT_DEFAULT = 2
 HEALTH_TIMEOUT_MAX = 5
 HEALTH_PATH_SUFFIX = "/health"
 MAX_URL_LENGTH = 256
+
+# Kontrola NAS (SERVICES-2): port SMB přímo přes TCP. Limit spojení je stejný
+# jako u healthchecku AnimeDB (HEALTH_TIMEOUT_DEFAULT, HEALTH_TIMEOUT_MAX).
+NAS_PORT_DEFAULT = 445
+MAX_PORT = 65535
 
 # Názvy síťových rozhraní, se kterými NexusSTAT pracuje: nejvýš 15 znaků jako
 # v jádře (IFNAMSIZ − 1), jen písmena, číslice, "_", "." a "-". Jádro povoluje
@@ -81,7 +87,8 @@ BOUNDARY_DECIMALS = 6
 MAX_CONFIRM_COUNT = 60
 
 # Výchozí počty po sobě jdoucích měření pro vznik a odeznění závady. Stejný
-# princip potvrzování používá i healthcheck AnimeDB (animedb_monitor.py).
+# princip potvrzování používají i kontroly služeb AnimeDB a NAS
+# (services.OutageConfirmation).
 DEFAULT_CONFIRM_COUNT = 3
 DEFAULT_CLEAR_COUNT = 2
 
@@ -440,15 +447,70 @@ class AnimeDbConfig:
             raise ConfigError("enabled = true vyžaduje url")
 
 
+def check_nas_host(value):
+    """Ověří adresu NAS: jen číselná IPv4 nebo IPv6, vrátí ji jako ipaddress.
+
+    Název hostitele ne: překlad přes DNS by neměl časový limit. Zóna IPv6
+    (`fe80::1%eth0`) také ne, protože to už není samotná číselná adresa, ale
+    i název rozhraní. Nespecifikovaná adresa (0.0.0.0, ::) by se v Linuxu
+    připojila k tomuto počítači a jeho otevřený port by vypadal jako dostupný NAS.
+    """
+    problem = f"host musí být číselná adresa IPv4 nebo IPv6, ne {value!r}"
+    if not isinstance(value, str) or "%" in value:
+        raise ConfigError(problem)
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise ConfigError(problem) from None
+    if address.is_unspecified:
+        raise ConfigError(f"host musí být adresa NAS, ne nespecifikovaná adresa {value!r}")
+    return address
+
+
+def check_port(value):
+    # bool je v Pythonu podtřída int, takže TOML `true` by jinak prošlo jako port 1.
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_PORT:
+        raise ConfigError(f"port musí být celé číslo 1–{MAX_PORT}, ne {value!r}")
+
+
+@dataclass(frozen=True)
+class NasConfig:
+    """Volitelná kontrola dostupnosti NAS spojením TCP na port SMB (SERVICES-2).
+
+    Výchozí stav je vypnuto a adresa nemá výchozí hodnotu: bez výslovného
+    zapnutí se nikam nepřipojuje a NAS je `N/A`. Skutečná adresa patří jen
+    do lokální konfigurace mimo Git. Dostupnost se tu nekontroluje (mění se
+    za běhu), jen tvar adresy, port a limit.
+    """
+
+    enabled: bool = False
+    host: str | None = None
+    port: int = NAS_PORT_DEFAULT
+    timeout_seconds: float = HEALTH_TIMEOUT_DEFAULT
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(f"enabled musí být true nebo false, ne {self.enabled!r}")
+        if self.host is not None:
+            check_nas_host(self.host)
+        check_port(self.port)
+        check_health_timeout(self.timeout_seconds)
+        if self.enabled and self.host is None:
+            raise ConfigError("enabled = true vyžaduje host")
+
+
 @dataclass(frozen=True)
 class ServicesConfig:
-    """Kolektory služeb. Zatím jediný: healthcheck AnimeDB, výchozí vypnuto."""
+    """Kolektory služeb: healthcheck AnimeDB a dostupnost NAS, oba výchozí vypnuto."""
 
     animedb: AnimeDbConfig = field(default_factory=AnimeDbConfig)
+    nas: NasConfig = field(default_factory=NasConfig)
 
     def __post_init__(self):
         if not isinstance(self.animedb, AnimeDbConfig):
             raise ConfigError("[services.animedb] musí být AnimeDbConfig")
+        if not isinstance(self.nas, NasConfig):
+            raise ConfigError("[services.nas] musí být NasConfig")
 
 
 @dataclass(frozen=True)
@@ -502,7 +564,7 @@ def history_config_from_dict(section):
 
 
 def services_config_from_dict(section):
-    """Vytvoří ServicesConfig ze slovníku sekce [services] včetně podsekce [services.animedb]."""
+    """Vytvoří ServicesConfig ze slovníku sekce [services] s podsekcemi [services.animedb] a [services.nas]."""
     _check_section("services", section, KNOWN_SERVICES_KEYS)
     animedb_section = section.get("animedb", {})
     _check_section("services.animedb", animedb_section, KNOWN_ANIMEDB_KEYS)
@@ -510,7 +572,13 @@ def services_config_from_dict(section):
         animedb = AnimeDbConfig(**animedb_section)
     except ConfigError as error:
         raise ConfigError(f"[services.animedb] {error}") from error
-    return ServicesConfig(animedb=animedb)
+    nas_section = section.get("nas", {})
+    _check_section("services.nas", nas_section, KNOWN_NAS_KEYS)
+    try:
+        nas = NasConfig(**nas_section)
+    except ConfigError as error:
+        raise ConfigError(f"[services.nas] {error}") from error
+    return ServicesConfig(animedb=animedb, nas=nas)
 
 
 def alarms_config_from_dict(section):

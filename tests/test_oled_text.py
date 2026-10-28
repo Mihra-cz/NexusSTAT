@@ -178,10 +178,15 @@ class StatusTextTest(unittest.TestCase):
         self.assertEqual(status_line(evaluated, 20), ("ERR", "CPU TEMP 88°C"))
 
     def test_nas_without_data_is_unknown_not_fault(self):
-        [nas] = [r for r in complete_service_results([], OBSERVED, 1000) if r.id == NAS_ID]
+        # Zapnuté sledování bez výsledku je UNKNOWN; vypnuté (výchozí, SERVICES-2) N/A bez problému.
+        [nas] = [r for r in complete_service_results([], OBSERVED, 1000, monitored={NAS_ID}) if r.id == NAS_ID]
         self.assertEqual(status_line(nas, 10), ("UNKN", "NAS NO DATA"))
         self.assertEqual(service_rows([nas], 10)[2], ("NAS", "UNKN"))
         self.assertEqual(status_line(result(NAS_ID, State.UNKNOWN), 10), ("UNKN", "NAS NO DATA"))
+        [off] = [r for r in complete_service_results([], OBSERVED, 1000) if r.id == NAS_ID]
+        self.assertEqual((off.state, off.summary), (State.NA, "NAS: sledování vypnuto"))
+        self.assertEqual(service_rows([off], 10)[2], ("NAS", "N/A"))
+        self.assertEqual(active_problems([off], 10), [])
 
     def test_nas_proven_unreachable_is_offline_with_fault_state(self):
         for state in (State.CRITICAL, State.ERROR):
@@ -406,10 +411,11 @@ class ScenarioTextTest(unittest.TestCase):
         self.assertEqual(self.lines("ok"), [])
         self.assertEqual(self.lines("warning"), [("WARN", "CPU TEMP 74°C")])
         self.assertEqual(self.lines("error"), [("CRIT", "NAS OFFLINE"), ("ERR", "CPU TEMP 86°C")])
-        self.assertEqual(self.lines("unconnected"),
-                         [("UNKN", "BACKUP NO DATA"), ("UNKN", "NAS NO DATA"), ("UNKN", "NEXUS NO DATA")])
+        # NAS a AnimeDB mají ve výchozí konfiguraci sledování vypnuté (N/A), do STATUS nepatří.
+        self.assertEqual(self.lines("unconnected"), [("UNKN", "BACKUP NO DATA"), ("UNKN", "NEXUS NO DATA")])
         self.assertEqual(self.lines(LIVE), [("UNKN", "ROOT NO DATA"), ("UNKN", "BACKUP NO DATA"),
-                                            ("UNKN", "NAS NO DATA"), ("UNKN", "NEXUS NO DATA")])
+                                            ("UNKN", "NEXUS NO DATA")])
+        self.assertEqual(self.lines("nas_animedb"), [("ERR", "ANIMEDB DOWN"), ("ERR", "NAS OFFLINE")])
 
     def test_network_scenarios(self):
         # Linka DOWN, chybějící IPv4 i nízký či vysoký provoz jsou platná měření (INFO),

@@ -12,11 +12,10 @@ KB/s a MB/s (výslovně zadané pro stránku NETWORK).
 
 import hashlib
 
-from .animedb_monitor import DOWN, HEALTH, INVALID, UP
 from .core import ALERT_STATES, State, effective
 from .fan_monitor import CPU_FAN_ID, FAN_ON, FAN_STATE, SOURCE, SOURCE_REQUEST
 from .network_monitor import ADDRESS, BYTES_PER_SECOND, INTERFACE, IPV4_ID, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
-from .services import BACKUP_ID, NAS_ID, SERVICE_LABELS
+from .services import BACKUP_ID, DOWN, HEALTH, INVALID, NAS_ID, SERVICE_LABELS, UP
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
 
 # Krátký text stavu pro STATUS, stránku SERVICES a hodnotu bez čísla.
@@ -61,10 +60,11 @@ CHECK_NAMES = {
 }
 
 # Hláška potvrzené závady (WARNING/ERROR/CRITICAL) bez číselné hodnoty. Jen pro
-# kontroly, jejichž id odpovídá na jedinou otázku: NAS = dostupnost, BACKUP =
-# stáří poslední zálohy. Jiný druh závady (např. zaplnění NAS) dostane vlastní
-# id, ne jiný text. Ostatní závady bez hodnoty ukážou jen název; závažnost
-# nese sloupec stavu.
+# kontroly, jejichž id odpovídá na jedinou otázku: NAS = dostupnost (od
+# SERVICES-2 služby SMB), BACKUP = stáří poslední zálohy. Jiný druh závady
+# (např. zaplnění NAS nebo chybějící sdílená složka) dostane vlastní id, ne
+# jiný text. Ostatní závady bez hodnoty ukážou jen název; závažnost nese
+# sloupec stavu.
 FAULT_TEXT = {
     NAS_ID: "NAS OFFLINE",
     BACKUP_ID: "BACKUP OVERDUE",
@@ -72,10 +72,12 @@ FAULT_TEXT = {
     "disk.root_readonly": "ROOT READ-ONLY",
 }
 
-# Důvod stavu healthchecku pro STATUS podle (stav, details["health"]), nejvýš
-# 7 znaků, aby se celý řádek (např. "ANIMEDB FAILING") vešel do 15 znaků.
-# Potvrzený výpadek (ERROR) je DOWN, ještě nepotvrzený (UNKNOWN) FAILING;
-# neplatná odpověď INVALID odliší neznámý výsledek kontroly od výpadku.
+# Důvod stavu kontroly dostupnosti (AnimeDB, NAS) pro STATUS podle (stav,
+# details["health"]), nejvýš 7 znaků, aby se celý řádek (např. "ANIMEDB FAILING")
+# vešel do 15 znaků. Potvrzený výpadek (ERROR) je DOWN, ještě nepotvrzený
+# (UNKNOWN) FAILING; neplatná odpověď INVALID odliší neznámý výsledek kontroly
+# od výpadku. Potvrzený výpadek kontroly s hláškou ve FAULT_TEXT (NAS) ukáže
+# tu hlášku (NAS OFFLINE), ne DOWN.
 HEALTH_TEXT = {
     (State.ERROR, DOWN): "DOWN",
     (State.UNKNOWN, DOWN): "FAILING",
@@ -251,9 +253,11 @@ def status_texts(result, now):
     """
     current = effective(result, now)
     name = check_name(current.id)
-    # Jen výsledky healthchecku AnimeDB mají details "health" (SERVICES-1);
-    # prošlý výsledek je nemá (effective() je smaže), takže zůstane STALE.
-    reason = HEALTH_TEXT.get((current.state, current.details.get(HEALTH)))
+    # Jen výsledky kontrol dostupnosti AnimeDB a NAS mají details "health"
+    # (SERVICES-1, SERVICES-2); prošlý výsledek je nemá (effective() je smaže),
+    # takže zůstane STALE.
+    health = current.details.get(HEALTH)
+    reason = HEALTH_TEXT.get((current.state, health))
     if current.measurement is not None:
         detail = measurement_text(current.measurement)  # potvrzená závada ukáže naměřenou hodnotu
     elif current.state is State.UNKNOWN:
@@ -261,10 +265,12 @@ def status_texts(result, now):
         # prošlá data poznají z času, ne z textu. Nepotvrzený výpadek (FAILING)
         # a neplatná odpověď (INVALID) nejsou totéž co chybějící data (NO DATA).
         detail = STALE if now >= current.expires_monotonic else (reason or NO_DATA)
-    elif current.state in ALERT_STATES and reason is not None:
-        detail = reason  # ANIMEDB DOWN, ANIMEDB RECOVER
-    elif current.state in ALERT_STATES and current.id in FAULT_TEXT:
+    elif current.state in ALERT_STATES and current.id in FAULT_TEXT and health != UP:
+        # NAS OFFLINE i při potvrzeném výpadku z kontroly NAS; když už NAS
+        # odpovídá a výpadek jen odeznívá, hláška by neplatila (NAS RECOVER níže).
         return [FAULT_TEXT[current.id], name]
+    elif current.state in ALERT_STATES and reason is not None:
+        detail = reason  # ANIMEDB DOWN, ANIMEDB RECOVER, NAS RECOVER
     elif current.state is State.NA:
         detail = STATE_TEXT[State.NA]
     else:

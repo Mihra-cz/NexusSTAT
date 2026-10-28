@@ -1,11 +1,16 @@
-"""Katalog služeb pro stránku SERVICES.
+"""Katalog služeb pro stránku SERVICES a společné potvrzování výpadku služby.
 
 Definice id výsledků služeb (služby Nexusu, AnimeDB, NAS, zálohy) a krátké
-názvy pro displej. Sám nesbírá žádná data. Jediný skutečný kolektor služby je
-zatím healthcheck AnimeDB přes HTTP /health (animedb_monitor.py, SERVICES-1), a to
-jen po výslovném zapnutí v konfiguraci; NAS, Restic ani služby Nexusu se nečtou.
+názvy pro displej. Sám nesbírá žádná data. Skutečné kolektory služeb jsou
+zatím dva, oba jen po výslovném zapnutí v konfiguraci: healthcheck AnimeDB
+přes HTTP /health (animedb_monitor.py, SERVICES-1) a dostupnost NAS spojením
+TCP na port SMB (nas_monitor.py, SERVICES-2). Sdílené SMB složky, Restic ani
+služby Nexusu se nečtou.
 """
 
+import errno
+
+from .config import DEFAULT_CLEAR_COUNT, DEFAULT_CONFIRM_COUNT
 from .core import CheckResult, State
 
 NEXUS_SERVICES_ID = "service.nexus"  # souhrn služeb hostitele Nexus
@@ -27,7 +32,82 @@ SERVICE_LABELS = {
 # UNKNOWN, nikdy N/A (complete_service_results, parametr `monitored`).
 OPTIONAL_SERVICES = {
     ANIMEDB_ID: "AnimeDB: sledování vypnuto",
+    NAS_ID: "NAS: sledování vypnuto",
 }
+
+# Výsledek jedné kontroly dostupnosti služby (AnimeDB, NAS); zároveň hodnota
+# `health` v details. Jen tyto pevné texty, takže historie zapíše řádek jen
+# při skutečné změně a displej (oled_text.HEALTH_TEXT) z nich odvodí důvod.
+HEALTH = "health"
+CAUSE = "cause"  # proč výpadek nebo neplatná odpověď: refused, timeout, unreachable, http_503, json, ...
+UP = "ok"
+DOWN = "down"
+INVALID = "invalid"
+
+# Chyby spojení, které dokládají nedostupnost adresy nebo sítě (ne chybu na této straně).
+UNREACHABLE_ERRNOS = (errno.EHOSTUNREACH, errno.ENETUNREACH)
+
+
+class OutageConfirmation:
+    """Potvrzení výpadku služby opakovanými kontrolami, stejným principem jako alarmové prahy.
+
+    Výpadek vznikne po DEFAULT_CONFIRM_COUNT po sobě jdoucích kontrolách
+    s výpadkem a odezní po DEFAULT_CLEAR_COUNT po sobě jdoucích úspěšných
+    kontrolách; neznámý výsledek (None) ani mezera v měření výpadek nepotvrdí
+    ani nevyřeší, jen přeruší řadu. Paměť je jako alarms.History: po sobě
+    jdoucí kontroly s výpadkem a úspěšné kontroly, potvrzený výpadek
+    a platnost posledního výsledku (pro poznání mezery v měření).
+    Používá ho healthcheck AnimeDB (SERVICES-1) i kontrola NAS (SERVICES-2),
+    obě přes check().
+    """
+
+    def __init__(self, validity_seconds):
+        self.validity_seconds = validity_seconds
+        self.failures = 0
+        self.successes = 0
+        self.down = False
+        self.last_expires = None
+
+    def check(self, probe, now):
+        """(stav, popis, details) jednoho pokusu `probe()` po potvrzení v monotónním čase `now`.
+
+        `probe` vrací (výsledek UP/DOWN/None, popis, details). Neočekávaná
+        výjimka z něj je také neznámý výsledek: přeruší řadu a projde dál
+        (UNKNOWN pro kontrolu pak doplní run.Collectors). Jinak by se výpadky
+        nebo úspěchy oddělené kontrolou bez výsledku sečetly, jako by šly po sobě.
+        """
+        try:
+            outcome, text, details = probe()
+        except Exception:
+            self.confirm(None, now)
+            raise
+        state, note = self.confirm(outcome, now)
+        return state, f"{text}{note}", details
+
+    def confirm(self, outcome, now):
+        """(stav, doplněk popisu) pro výsledek kontroly UP, DOWN nebo None v monotónním čase `now`."""
+        if self.last_expires is not None and now >= self.last_expires:
+            # Předchozí výsledek mezitím prošel (mezera v měření): řada začíná znovu.
+            self.failures = self.successes = 0
+        self.last_expires = now + self.validity_seconds
+        if outcome == DOWN:
+            self.failures, self.successes = self.failures + 1, 0
+            if self.failures >= DEFAULT_CONFIRM_COUNT:
+                self.down = True
+            if self.down:
+                return State.ERROR, ""
+            # Nepotvrzený výpadek: neznámý stav bez blikání, ne OK ani ERROR.
+            return State.UNKNOWN, f" (výpadek zatím nepotvrzen, {self.failures}/{DEFAULT_CONFIRM_COUNT})"
+        if outcome == UP:
+            self.successes, self.failures = self.successes + 1, 0
+            if self.down and self.successes >= DEFAULT_CLEAR_COUNT:
+                self.down = False
+            if self.down:
+                return State.ERROR, f" (výpadek odeznívá, {self.successes}/{DEFAULT_CLEAR_COUNT})"
+            return State.OK, ""
+        # Neplatná odpověď nebo nemožná kontrola: výpadek nepotvrdí ani nevyřeší.
+        self.failures = self.successes = 0
+        return State.UNKNOWN, ""
 
 
 def complete_service_results(results, observed_utc, expires_monotonic, monitored=()):

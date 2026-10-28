@@ -6,8 +6,9 @@ Spuštění:
 Obraz kreslí výhradně render.render_screen(); simulátor jen řídí čas,
 tlačítko, scénáře a zvětšení. LED jsou samostatná plocha pod displejem
 a jejich barvu určuje rgb.py, do bitmapy OLED se nekreslí. Nepřistupuje
-k hardwaru displeje, LED, SPI ani GPIO a do sítě posílá jen zapnutý healthcheck
-AnimeDB v LIVE (síť jinak jen čte jako network_monitor). Stavová logika (PreviewSession) nepotřebuje
+k hardwaru displeje, LED, SPI ani GPIO a do sítě posílá jen zapnuté kontroly
+AnimeDB a NAS v LIVE (síť jinak jen čte jako network_monitor). Scénáře s NAS
+používají podvržené spojení, nikam se nepřipojují. Stavová logika (PreviewSession) nepotřebuje
 tkinter ani grafický displej, takže ji testy ověřují bez X serveru; tkinter
 se načte až při otevření okna.
 """
@@ -23,8 +24,9 @@ from pathlib import Path
 
 from . import rgb
 from .alarms import AlarmEvaluator
-from .config import Config, ConfigError, load_config
+from .config import HEALTH_TIMEOUT_DEFAULT, NAS_PORT_DEFAULT, Config, ConfigError, load_config
 from .core import CheckResult, Measurement, State, active_problems
+from .nas_monitor import NasMonitor
 from .network_monitor import (
     ADDRESS,
     BYTES_PER_SECOND,
@@ -40,7 +42,7 @@ from .network_monitor import (
 )
 from .oled import Mode, OledController, status_page_count
 from .run import failed_results, live_monitor
-from .services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
+from .services import ANIMEDB_ID, BACKUP_ID, CAUSE, DOWN, HEALTH, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
 from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
 
 # Zrychlení simulovaného času. LIVE běží vždy 1×, protože měří skutečný čas.
@@ -71,6 +73,7 @@ LED_COUNT = 4
 # aby se simulace nikdy nepletla se skutečnou sítí.
 SIM_INTERFACE = "eth0"
 SIM_ADDRESS = "192.0.2.10"
+SIM_NAS_ADDRESS = "192.0.2.20"  # fiktivní NAS ze stejného rozsahu; nikdy se na ni nepřipojuje
 
 
 def pct(value):
@@ -158,7 +161,8 @@ def scenario_many(sim):
 
 def scenario_unconnected(sim):
     # Fiktivní systém a síť, služby bez výsledku: doplnění je ukáže jako dnes
-    # ve skutečnosti (NEXUS, NAS, BACKUP UNKNOWN, AnimeDB N/A).
+    # ve skutečnosti s výchozí konfigurací (NEXUS, BACKUP UNKNOWN; AnimeDB a NAS
+    # se sledováním vypnutým N/A).
     return system_and_services(sim)[:4] + network(sim, rx=1_234_000, tx=85_300)
 
 
@@ -235,6 +239,48 @@ def scenario_rgb_critical(sim):
     return results
 
 
+# Scénáře kontroly NAS (SERVICES-2). V průběhu výpadku dává výsledek NAS
+# skutečný NasMonitor s podvrženým spojením (ScriptedConnection): jeden pokus
+# na každou obnovu dat, takže potvrzení výpadku i odeznění probíhá stejně jako
+# v provozu. Po posledním pokusu se opakuje poslední (NAS dál dostupný).
+# Při intervalu 10 s: 0 s OK, 10 s a 20 s UNKNOWN 1/3 a 2/3 (bez blikání),
+# od 30 s ERROR (NAS OFFLINE, 2 bliknutí), 90 s ERROR odeznívá 1/2 (NAS RECOVER),
+# od 100 s OK.
+NAS_OUTAGE = (None, ConnectionRefusedError, TimeoutError) + (ConnectionRefusedError,) * 6 + (None, None)
+
+
+class ScriptedConnection:
+    """Náhrada socket.create_connection pro scénáře NAS: připravený průběh, žádná síť.
+
+    Pokus je None (spojení přijato) nebo třída výjimky, kterou by vyvolalo
+    skutečné spojení; každý pokus dostane novou výjimku.
+    """
+
+    def __init__(self, attempts):
+        self.attempts = attempts
+        self.count = 0
+
+    def __call__(self, address, timeout=None):
+        attempt = self.attempts[min(self.count, len(self.attempts) - 1)]
+        self.count += 1
+        if attempt is not None:
+            raise attempt("simulace")
+        return self  # „navázané spojení“, které NasMonitor hned zavře
+
+    def close(self):
+        pass
+
+
+def scenario_nas_animedb(sim):
+    # Potvrzený výpadek NAS i AnimeDB zároveň (stejné popisy a details jako
+    # u kolektorů): červeně 2 a 3 bliknutí, ve STATUS ANIMEDB DOWN a NAS OFFLINE.
+    refused = {HEALTH: DOWN, CAUSE: "refused"}
+    results = scenario_ok(sim)
+    results[5] = sim(NAS_ID, State.ERROR, "NAS: spojení odmítnuto", details=refused)
+    results[7] = sim(ANIMEDB_ID, State.ERROR, "AnimeDB: spojení odmítnuto", details=refused)
+    return results
+
+
 # Pořadí odpovídá nabídce v okně.
 SCENARIOS = {
     "ok": ("1 Vše v pořádku", scenario_ok),
@@ -254,10 +300,14 @@ SCENARIOS = {
     "rgb_multi": ("15 RGB: několik závad (ERROR 3, 4; WARNING 1, 2)", scenario_rgb_multi),
     "rgb_critical": ("16 RGB: CRITICAL a WARNING", scenario_rgb_critical),
     "rgb_acknowledged": ("17 RGB: potvrzená závada (zálohy ERROR)", scenario_rgb_backup_error),
+    "nas_outage": ("18 NAS: průběh výpadku a obnovení (1/3, 2/3, ERROR, odeznění)", scenario_ok),
+    "nas_animedb": ("19 NAS a AnimeDB: současný výpadek (2 a 3 bliknutí)", scenario_nas_animedb),
     LIVE: ("LIVE: měření tohoto notebooku", None),
 }
 # Scénáře, ve kterých je závada potvrzená hned od spuštění.
 PREACKNOWLEDGED = {"rgb_acknowledged"}
+# Scénáře, ve kterých výsledek NAS dává NasMonitor podle připraveného průběhu pokusů.
+NAS_ATTEMPTS = {"nas_outage": NAS_OUTAGE}
 
 
 class SessionClock:
@@ -329,6 +379,11 @@ class PreviewSession:
             self.evaluator = AlarmEvaluator(self.config.alarms)
         else:
             self.monitor = self.evaluator = None
+        # Průběh výpadku NAS začíná se scénářem znovu, jako potvrzení a alarmy.
+        attempts = NAS_ATTEMPTS.get(name)
+        self.nas = None if attempts is None else NasMonitor(
+            self.validity, SIM_NAS_ADDRESS, NAS_PORT_DEFAULT, HEALTH_TIMEOUT_DEFAULT,
+            connect=ScriptedConnection(attempts))
         now = self.clock.now()
         self.started_at = now
         self.controller = OledController(self.config.oled)
@@ -373,6 +428,10 @@ class PreviewSession:
         else:
             observed_utc = self.utc_at(now)
             measured = self._scenario_results(now)
+            if self.nas is not None:
+                # Místo pevného výsledku NAS další pokus z připraveného průběhu.
+                measured = [result for result in measured if result.id != NAS_ID]
+                measured += self.nas.collect(now, observed_utc)
         # Skutečně monitorované kontroly pro LED: služby, které doplnění níže
         # přidá jen kvůli chybějícímu kolektoru, bílou blokovat nemají.
         self.monitored = measured
@@ -447,9 +506,17 @@ class PreviewSession:
             animedb = self.config.services.animedb
             source = ("AnimeDB z HTTP healthchecku /health" if animedb.enabled
                       else "AnimeDB N/A (sledování vypnuto)")
+            nas = ("NAS ze spojení TCP na port SMB" if self.config.services.nas.enabled
+                   else "NAS N/A (sledování vypnuto)")
             return ("LIVE: skutečná read-only měření (systém a síť) tohoto NOTEBOOKU, ne Nexusu. "
-                    f"Služby bez kolektoru UNKNOWN, {source}. Čas 1×.")
-        return f"SIMULACE: fiktivní data (značka SIM), čas {self.clock.speed}×."
+                    f"Služby bez kolektoru UNKNOWN, {source}, {nas}. Čas 1×.")
+        text = f"SIMULACE: fiktivní data (značka SIM), čas {self.clock.speed}×."
+        if self.nas is not None:
+            # OLED ukazuje u 1. i 2. neúspěšného pokusu stejné NAS FAILING;
+            # pořadí pokusu a důvod jsou vidět jen v českém popisu výsledku.
+            [nas] = [result for result in self.monitored if result.id == NAS_ID]
+            text += f"\nPoslední kontrola NAS ({self.nas.connect.count}.): {nas.summary}"
+        return text
 
     def rgb_text(self):
         """Popis pod LED: co právě ukazují, jaký je jas a co je potvrzené."""

@@ -578,7 +578,7 @@ class ServicesConfigTest(unittest.TestCase):
             {"animedb": {"timeout_seconds": True}},
             {"animedb": {"timeout_seconds": "2"}},
             {"animedb": {"enabled": False, "container": "x"}},  # neznámý klíč (dřívější Docker varianta)
-            {"nas": {"enabled": False}},  # služba bez kolektoru
+            {"restic": {"enabled": False}},  # služba bez kolektoru
             {"animedb": "on"},
         )
         for section in sections:

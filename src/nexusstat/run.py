@@ -7,10 +7,12 @@ Každých `interval_seconds` (sekce [collector], výchozí 10 s) změří vytí�
 teplotu CPU, RAM, obsazenost / a síťové rozhraní ([network]: linka, RX/TX, IPv4),
 vyhodnotí zapnuté prahy ([alarms], výchozí vypnuto) a vypíše jeden řádek.
 Se zapnutým [services.animedb] (výchozí vypnuto) navíc jedním požadavkem GET
-na nastavenou adresu /health zkontroluje dostupnost AnimeDB.
+na nastavenou adresu /health zkontroluje dostupnost AnimeDB, se zapnutým
+[services.nas] (výchozí vypnuto) jedním pokusem o spojení TCP na port SMB
+dostupnost NAS (bez přihlášení, bez sdílených složek a mountů).
 Ukončení: Ctrl+C nebo SIGTERM.
 Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nepřistupuje
-k displeji, NAS ani jinému hardwaru a do sítě posílá jen zapnutý healthcheck AnimeDB. Se zapnutou historií
+k displeji, mountům NAS ani jinému hardwaru a do sítě posílá jen zapnuté kontroly AnimeDB a NAS. Se zapnutou historií
 ([history] enabled = true s výslovnou cestou) předává vyhodnocené výsledky
 vláknu zapisovače SQLite; samo měření zůstává read-only a chyba historie ho
 nezastaví (history_link.py).
@@ -31,6 +33,7 @@ from .config import HISTORY_ROLE, Config, ConfigError, load_config
 from .core import ALERT_STATES, CheckResult, State, overall_state
 from .fan_monitor import FanMonitor
 from .history_link import open_history
+from .nas_monitor import NasMonitor
 from .network_monitor import NetworkMonitor
 from .system_monitor import SystemMonitor
 
@@ -111,7 +114,7 @@ class Collectors:
 
 
 def live_monitor(config):
-    """Skutečné read-only kolektory: systém, ventilátor CPU, síť a volitelně AnimeDB podle konfigurace."""
+    """Skutečné read-only kolektory: systém, ventilátor CPU, síť a volitelně AnimeDB a NAS podle konfigurace."""
     validity = config.collector.validity_seconds
     monitors = [
         SystemMonitor(validity_seconds=validity),
@@ -125,6 +128,12 @@ def live_monitor(config):
         # jinak kolektor vůbec nevznikne, nic se nepřipojuje a AnimeDB zůstává N/A.
         monitors.append(AnimeDbMonitor(validity_seconds=validity, url=animedb.url,
                                        timeout_seconds=animedb.timeout_seconds))
+    nas = config.services.nas
+    if nas.enabled:
+        # Pokus o spojení TCP jen při výslovně zapnutém sledování (SERVICES-2);
+        # jinak kolektor vůbec nevznikne, nic se nepřipojuje a NAS zůstává N/A.
+        monitors.append(NasMonitor(validity_seconds=validity, host=nas.host, port=nas.port,
+                                   timeout_seconds=nas.timeout_seconds))
     return Collectors(*monitors)
 
 

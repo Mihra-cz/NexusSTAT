@@ -21,10 +21,10 @@ Výsledkem je jediná kontrola `service.animedb`:
 Potvrzování je stejné jako u alarmových prahů (alarms.py): výpadek vznikne po
 DEFAULT_CONFIRM_COUNT po sobě jdoucích kontrolách s výpadkem a odezní po
 DEFAULT_CLEAR_COUNT po sobě jdoucích úspěšných kontrolách; neznámý výsledek ani
-mezera v měření výpadek nepotvrdí ani nevyřeší, jen přeruší řadu.
+mezera v měření výpadek nepotvrdí ani nevyřeší, jen přeruší řadu. Logika je
+společná s kontrolou NAS (services.OutageConfirmation).
 """
 
-import errno
 import http.client
 import io
 import json
@@ -32,25 +32,15 @@ import socket
 import time
 
 from . import __version__
-from .config import DEFAULT_CLEAR_COUNT, DEFAULT_CONFIRM_COUNT, check_health_timeout, check_health_url
-from .core import CheckResult, State, is_finite_number
-from .services import ANIMEDB_ID
+from .config import check_health_timeout, check_health_url
+from .core import CheckResult, is_finite_number
+# Pevné texty `health`/`cause` a chyby nedostupnosti jsou společné s kontrolou NAS.
+from .services import ANIMEDB_ID, CAUSE, DOWN, HEALTH, INVALID, UNREACHABLE_ERRNOS, UP, OutageConfirmation
 
 LABELS = {ANIMEDB_ID: "AnimeDB"}
 
 # Odpověď /health je krátký JSON; delší tělo je neočekávané a dál se nečte.
 MAX_BODY_BYTES = 4096
-
-# Výsledek jedné kontroly; zároveň hodnota `health` v details (jen tyto texty,
-# takže historie zapíše řádek jen při skutečné změně).
-HEALTH = "health"
-CAUSE = "cause"  # proč výpadek nebo neplatná odpověď: refused, timeout, http_503, json, ...
-UP = "ok"
-DOWN = "down"
-INVALID = "invalid"
-
-# Chyby spojení, které dokládají nedostupnost adresy (ne chybu na této straně).
-UNREACHABLE_ERRNOS = (errno.EHOSTUNREACH, errno.ENETUNREACH)
 
 
 class _DeadlineReader(io.RawIOBase):
@@ -155,19 +145,12 @@ class AnimeDbMonitor:
         self.connect = connect
         self.clock = clock
         self.simulated = connect is not socket.create_connection
-        # Paměť potvrzování (jako alarms.History): po sobě jdoucí kontroly
-        # s výpadkem a úspěšné kontroly, potvrzený výpadek a platnost
-        # posledního výsledku (pro poznání mezery v měření).
-        self.failures = 0
-        self.successes = 0
-        self.down = False
-        self.last_expires = None
+        self.outage = OutageConfirmation(validity_seconds)
 
     def collect(self, now, observed_utc):
         """Jeden výsledek `service.animedb`. `now` je monotónní čas, `observed_utc` čas UTC."""
-        outcome, text, details = self.probe()
-        state, note = self.confirm(outcome, now)
-        return [CheckResult(ANIMEDB_ID, state, f"{LABELS[ANIMEDB_ID]}: {text}{note}", observed_utc,
+        state, text, details = self.outage.check(self.probe, now)
+        return [CheckResult(ANIMEDB_ID, state, f"{LABELS[ANIMEDB_ID]}: {text}", observed_utc,
                             now + self.validity_seconds, simulated=self.simulated, details=details)]
 
     def probe(self):
@@ -189,28 +172,3 @@ class AnimeDbMonitor:
             # Chyba na této straně (např. nedostatek deskriptorů): o AnimeDB nic nevíme.
             return None, f"kontrolu nelze provést ({type(error).__name__})", {}
         return classify(status, body)
-
-    def confirm(self, outcome, now):
-        """(stav, doplněk popisu) po potvrzení stejným principem jako alarmové prahy."""
-        if self.last_expires is not None and now >= self.last_expires:
-            # Předchozí výsledek mezitím prošel (mezera v měření): řada začíná znovu.
-            self.failures = self.successes = 0
-        self.last_expires = now + self.validity_seconds
-        if outcome == DOWN:
-            self.failures, self.successes = self.failures + 1, 0
-            if self.failures >= DEFAULT_CONFIRM_COUNT:
-                self.down = True
-            if self.down:
-                return State.ERROR, ""
-            # Nepotvrzený výpadek: neznámý stav bez blikání, ne OK ani ERROR.
-            return State.UNKNOWN, f" (výpadek zatím nepotvrzen, {self.failures}/{DEFAULT_CONFIRM_COUNT})"
-        if outcome == UP:
-            self.successes, self.failures = self.successes + 1, 0
-            if self.down and self.successes >= DEFAULT_CLEAR_COUNT:
-                self.down = False
-            if self.down:
-                return State.ERROR, f" (výpadek odeznívá, {self.successes}/{DEFAULT_CLEAR_COUNT})"
-            return State.OK, ""
-        # Neplatná odpověď nebo nemožná kontrola: výpadek nepotvrdí ani nevyřeší.
-        self.failures = self.successes = 0
-        return State.UNKNOWN, ""

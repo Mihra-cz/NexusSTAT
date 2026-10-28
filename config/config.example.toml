@@ -96,6 +96,24 @@ enabled = false
 # url = "http://192.0.2.10:8080/health"
 timeout_seconds = 2
 
+# Dostupnost NAS spojením TCP na port SMB (SERVICES-2). Výchozí stav: vypnuto,
+# nikam se nepřipojuje a NAS je N/A.
+# Při `enabled = true` je povinný `host`: jen číselná IPv4 nebo IPv6 adresa
+# (název hostitele ne, DNS by nemělo časový limit; bez zóny %rozhraní, ne 0.0.0.0
+# ani ::). Skutečná adresa patří jen do lokální konfigurace mimo Git.
+# `port` celé číslo 1–65535 (výchozí 445), `timeout_seconds` číslo v rozsahu (0, 5].
+# Při každém měření jediný pokus o spojení TCP, který se hned zavře: žádné
+# přihlášení SMB, sdílené složky, čtení souborů ani přístup k mountům (autofs).
+# Stavy: spojení navázáno = OK (jen „služba SMB přijímá spojení“, ne dostupnost
+# sdílených složek, čitelnost dat ani zápis záloh); odmítnuto, timeout nebo
+# nedostupná síť či adresa = ERROR až po 3 po sobě jdoucích kontrolách (do té
+# doby UNKNOWN, bez blikání), odezní po 2 úspěšných; chyba na této straně = UNKNOWN.
+[services.nas]
+enabled = false
+# host = "192.0.2.20"
+port = 445
+timeout_seconds = 2
+
 # --- Budoucí možnosti: zatím NEIMPLEMENTOVÁNO a nenačítá se ---
 # Nápis na první stránce je pevně NEXUS, hodiny jsou vždy 24h.
 # Symboly na stránce NEXUS (trojúhelník / "?") nelze vypnout.

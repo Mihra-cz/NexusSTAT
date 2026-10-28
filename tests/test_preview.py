@@ -237,7 +237,7 @@ class ScenarioTest(unittest.TestCase):
         self.assertEqual(list(SCENARIOS), ["ok", "warning", "error", "unknown", "many", "unconnected", "net_down",
                                            "net_no_ipv4", "net_low", "net_high", "net_invalid", "rgb_nas_warning",
                                            "rgb_animedb_error", "rgb_backup_error", "rgb_multi", "rgb_critical",
-                                           "rgb_acknowledged", LIVE])
+                                           "rgb_acknowledged", "nas_outage", "nas_animedb", LIVE])
 
     def test_fictitious_values_are_simulated(self):
         for name in SCENARIOS:
@@ -273,6 +273,9 @@ class ScenarioTest(unittest.TestCase):
             "rgb_critical": {State.CRITICAL, State.WARNING},
             # Potvrzení stav závady nemění: ERROR zůstává ERROR.
             "rgb_acknowledged": {State.ERROR},
+            # Průběh výpadku NAS začíná dostupným NAS (OK), výpadek přijde až dalšími pokusy.
+            "nas_outage": set(),
+            "nas_animedb": {State.ERROR},
         }
         for name, states in expected.items():
             session, _ = make_session(name)
@@ -283,9 +286,9 @@ class ScenarioTest(unittest.TestCase):
         session, _ = make_session("unconnected")
         now = session.clock.now()
         self.assertEqual(service_rows(session.results, now),
-                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "UNKN"), ("BACKUP", "UNKN")])
+                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "UNKN")])
         self.assertEqual(home_symbol(session.results, now), UNKNOWN_SYMBOL)
-        self.assertEqual({p.id for p in active_problems(session.results, now)}, {NEXUS_SERVICES_ID, NAS_ID, BACKUP_ID})
+        self.assertEqual({p.id for p in active_problems(session.results, now)}, {NEXUS_SERVICES_ID, BACKUP_ID})
 
     def test_switch_resets_data_and_window(self):
         session, real = make_session("many")
@@ -375,7 +378,7 @@ class LiveTest(unittest.TestCase):
         now = session.clock.now()
         self.assertFalse(any(result.simulated for result in session.results))
         self.assertEqual(service_rows(session.results, now),
-                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "UNKN"), ("BACKUP", "UNKN")])
+                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "UNKN")])
 
     def test_live_applies_alarm_rules(self):
         config = Config(alarms=AlarmsConfig(cpu_temp=AlarmRule(True, 70, 80, 5)))
