@@ -12,7 +12,7 @@ nepoužívá. Záznam v tabulce dokládá jen to, že jádro mount eviduje, **ne
 Každý mount se zařadí podle typu souborového systému:
 
 * `local`: souborový systém na blokovém zařízení nebo obrazu (ext4, btrfs, vfat…),
-* `network`: síťové úložiště (CIFS, NFS, sshfs…; stejný seznam jako storage.py),
+* `network`: síťové úložiště (CIFS, NFS, sshfs…; tentýž seznam používá storage.py),
 * `virtual`: systémový nebo paměťový souborový systém (proc, sysfs, tmpfs, overlay…),
 * `autofs`: bod automatického připojení; skutečný cíl se připojí až při přístupu,
 * `unknown`: jiný typ; nikdy se nepovažuje za lokální.
@@ -25,12 +25,22 @@ import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from .storage import UNVERIFIABLE_FILESYSTEMS, is_network_filesystem
-
 MOUNTINFO_PATH = "/proc/self/mountinfo"
 # Běžná tabulka má jednotky až desítky KiB (i s Dockerem a snapy); větší vstup
 # je neočekávaný a dál se nečte.
 MAX_MOUNTINFO_BYTES = 4 * 1024 * 1024
+
+# Síťová úložiště, na která databáze historie ani její snímky nepatří (storage.py):
+# SQLite tam nemá spolehlivé zámky ani fsync a připojení může zmizet uprostřed zápisu.
+NETWORK_FILESYSTEMS = frozenset({
+    "cifs", "smb2", "smb3", "smbfs", "nfs", "nfs3", "nfs4", "afs", "ceph", "glusterfs",
+    "9p", "ncpfs", "lustre", "beegfs", "orangefs", "gfs2", "ocfs2",
+    "sshfs", "davfs", "webdav", "s3fs", "rclone", "curlftpfs", "smbnetfs",
+})
+
+# Typy připojení, u kterých cílové úložiště dopředu ověřit nejde: autofs připojí
+# cíl až při prvním přístupu a bývá to NFS nebo CIFS.
+UNVERIFIABLE_FILESYSTEMS = frozenset({"autofs"})
 
 LOCAL = "local"
 NETWORK = "network"
@@ -67,6 +77,11 @@ FIELDS_AFTER_SEPARATOR = 3
 
 class MountInfoError(ValueError):
     """Tabulku připojení nejde věrohodně přečíst."""
+
+
+def is_network_filesystem(kind):
+    name = kind.split(".", 1)[1] if kind.startswith("fuse.") else kind
+    return name in NETWORK_FILESYSTEMS
 
 
 def kind_of(fstype):

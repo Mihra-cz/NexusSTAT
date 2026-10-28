@@ -167,8 +167,8 @@ class StorageCheckTest(SnapshotCase):
 
     def test_network_storage_is_refused(self):
         mounts = self.root / "mounts"
-        mounts.write_text(f"/dev/sda1 / ext4 rw 0 0\n//server/share {self.published} cifs rw 0 0\n",
-                          encoding="utf-8")
+        mounts.write_text(f"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+                          f"22 21 0:40 / {self.published} rw - cifs //server/share rw\n", encoding="utf-8")
         with self.assertRaises(SnapshotError) as caught:
             snapshot.prepare(self.work, self.published, mounts=mounts)
         self.assertIn("síťovém", str(caught.exception))
@@ -570,13 +570,14 @@ class SharedStorageRulesTest(SnapshotCase):
 
     def table(self, kind):
         mounts = self.root / "mounts"
-        mounts.write_text(f"/dev/sda1 / ext4 rw 0 0\nzdroj {self.root} {kind} rw 0 0\n", encoding="utf-8")
+        mounts.write_text(f"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n22 21 0:40 / {self.root} rw - {kind} zdroj rw\n",
+                          encoding="utf-8")
         return mounts
 
     def test_both_uses_refuse_the_same_storage(self):
         from nexusstat import history_link
         for kind, expected in (("cifs", "síťovém"), ("nfs4", "síťovém"), ("fuse.sshfs", "síťovém"),
-                               ("autofs", "autofs")):
+                               ("autofs", "autofs"), ("tmpfs", "trvalé úložiště"), ("overlay", "trvalé úložiště")):
             with self.subTest(kind=kind):
                 mounts = self.table(kind)
                 with self.assertRaises(storage.StorageError) as direct:
@@ -612,8 +613,8 @@ class SharedStorageRulesTest(SnapshotCase):
     def test_symlink_and_nested_mounts_behave_the_same(self):
         from nexusstat import history_link
         mounts = self.root / "mounts"
-        mounts.write_text(f"/dev/sda1 / ext4 rw 0 0\n//server/share {self.root}/nas cifs rw 0 0\n"
-                          f"/dev/sdb1 {self.root}/nas/lokalni ext4 rw 0 0\n", encoding="utf-8")
+        mounts.write_text(f"21 1 8:1 / / rw - ext4 /dev/sda1 rw\n22 21 0:40 / {self.root}/nas rw - cifs //server/share rw\n"
+                          f"23 22 8:2 / {self.root}/nas/lokalni rw - ext4 /dev/sdb1 rw\n", encoding="utf-8")
         (self.root / "nas" / "lokalni").mkdir(parents=True)
         link = self.root / "odkaz"
         link.symlink_to(self.root / "nas")
@@ -623,10 +624,13 @@ class SharedStorageRulesTest(SnapshotCase):
                     storage.check_local_path(path, mounts)
                 with self.assertRaises(history.HistoryError):
                     history_link.check_local_path(path, mounts)
-        # Lokální systém připojený dovnitř síťového vyhrává delším bodem připojení.
+        # Lokální systém připojený dovnitř síťového se odmítne stejně: cesta k němu vede přes
+        # síťový mount (zpřísnění opravy viditelného mountu, dřív vyhrál delší bod připojení).
         inner = self.root / "nas" / "lokalni" / "db.sqlite3"
-        self.assertEqual(storage.check_local_path(inner, mounts), "ext4")
-        self.assertEqual(history_link.check_local_path(inner, mounts), "ext4")
+        with self.assertRaises(storage.StorageError):
+            storage.check_local_path(inner, mounts)
+        with self.assertRaises(history.HistoryError):
+            history_link.check_local_path(inner, mounts)
 
 
 class RenameNoReplaceTest(SnapshotCase):

@@ -1,10 +1,16 @@
 """Kontroly úložiště pro databázi historie a její snímky (jen čtení a stat).
 
-Rozhoduje skutečné místo souboru, ne zápis cesty: cesty se rozvíjejí
-(`os.path.realpath`), takže symlink v poslední části ani v nadřazeném adresáři
-nepropašuje data na jiné úložiště. Odmítá se síťové úložiště (NAS, CIFS, NFS,
-9p, sshfs…), `autofs` i stav, kdy úložiště **ověřit nelze**: raději se nezapíše
-nic, než aby historie skončila na NAS (docs/HISTORY.md 11.5).
+Rozhoduje skutečné místo souboru, ne zápis cesty: cesta se rozvíjí (symlinky,
+`.`, `..`), takže symlink v poslední části ani v nadřazeném adresáři
+nepropašuje data na jiné úložiště. Úložiště určuje viditelný mount z tabulky
+jádra `/proc/self/mountinfo` (mounts.py), ne nejdelší bod připojení: mount
+skrytý pozdějším překryvem nadřazeného bodu se neuplatní. Povoleno je jen
+doloženě lokální úložiště (druh `local` z mounts.py); odmítá se síťové (NAS,
+CIFS, NFS, 9p, sshfs…), `autofs`, virtuální (tmpfs, ramfs, overlay, proc…),
+neznámý typ i stav, kdy úložiště **ověřit nelze** (neúplná nebo nejednoznačná
+tabulka): raději se nezapíše nic, než aby historie skončila na NAS nebo v paměti
+(docs/HISTORY.md 11.5). Název typu souborového systému ale není důkaz
+fyzického umístění (např. ext4 na síťovém blokovém zařízení).
 
 Modul je záměrně bez závislosti na ostatních modulech historie, aby ho mohl
 použít jak zapisovač, tak snímky.
@@ -15,11 +21,34 @@ import ctypes.util
 import errno
 import functools
 import os
-import re
+import stat
 import tempfile
 from pathlib import Path, PurePosixPath
 
-MOUNTS_PATH = "/proc/self/mounts"
+# Klasifikace typů je společná s inventurou úložišť (mounts.py); jména zůstávají
+# dostupná i odsud, aby se volajícím nic nezměnilo.
+from .mounts import (  # noqa: F401
+    LOCAL,
+    MOUNTINFO_PATH,
+    NETWORK_FILESYSTEMS,
+    UNVERIFIABLE_FILESYSTEMS,
+    MountInfoError,
+    is_network_filesystem,
+    kind_of,
+    read_mountinfo,
+)
+
+# Tabulka připojení pro kontrolu cest; od opravy viditelného mountu formát
+# /proc/self/mountinfo (dřív /proc/self/mounts). Testy podstrkují vlastní soubor.
+MOUNTS_PATH = MOUNTINFO_PATH
+# Druhy úložiště, na které se smí zapisovat živá historie a její snímky: jen
+# lokální souborový systém. Virtuální druh je legitimní pro inventuru, ale pro
+# SQLite ne: tmpfs a ramfs nepřežijí restart, u overlay není podkladové úložiště
+# doložené a proc, sysfs a další pseudo-FS nejsou úložiště. Neznámý typ se nikdy
+# nepovažuje za lokální.
+ALLOWED_KINDS = frozenset({LOCAL})
+# Nejvýš tolik symlinků při rozvíjení jedné cesty, jako dovolí jádro (ELOOP).
+MAX_SYMLINKS = 40
 
 # renameat2(RENAME_NOREPLACE): atomické přejmenování, které **nikdy** nepřepíše
 # existující cílovou cestu. Obyčejné os.rename() prázdný cílový adresář
@@ -30,26 +59,9 @@ AT_FDCWD = -100
 # musí operaci odmítnout, nikdy tiše použít nechráněné os.rename().
 UNSUPPORTED_ERRNO = frozenset({errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP})
 
-# Síťová úložiště, na která databáze historie ani její snímky nepatří: SQLite
-# tam nemá spolehlivé zámky ani fsync a připojení může zmizet uprostřed zápisu.
-NETWORK_FILESYSTEMS = frozenset({
-    "cifs", "smb2", "smb3", "smbfs", "nfs", "nfs3", "nfs4", "afs", "ceph", "glusterfs",
-    "9p", "ncpfs", "lustre", "beegfs", "orangefs", "gfs2", "ocfs2",
-    "sshfs", "davfs", "webdav", "s3fs", "rclone", "curlftpfs", "smbnetfs",
-})
-
-# Typy připojení, u kterých cílové úložiště dopředu ověřit nejde: autofs připojí
-# cíl až při prvním přístupu a bývá to NFS nebo CIFS.
-UNVERIFIABLE_FILESYSTEMS = frozenset({"autofs"})
-
 
 class StorageError(Exception):
     """Cesta se pro data historie nesmí použít; nic se přitom nezměnilo."""
-
-
-def _unescape(field):
-    # /proc/self/mounts kóduje mezeru, tabulátor, nový řádek a zpětné lomítko osmičkově.
-    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), field)
 
 
 def resolve_path(path):
@@ -60,46 +72,78 @@ def resolve_path(path):
     return PurePosixPath(os.path.realpath(path))
 
 
-def filesystem_type(path, mounts=None):
-    """Typ souborového systému, na kterém cesta skutečně leží.
-
-    Rozhoduje nejdelší bod připojení, který je předponou rozvinuté cesty; při
-    stejně dlouhém bodu platí poslední záznam, protože pozdější připojení
-    překryje starší. None = typ nelze zjistit (nečitelná tabulka připojení,
-    žádný odpovídající bod); volající pak zápis odmítne. Tabulka se čte až tady,
-    protože se za běhu mění.
-    """
+def _mount_table(mounts):
+    """Úplná tabulka připojení, nebo None: nečitelná, příliš dlouhá i neúplná tabulka nic nevylučuje."""
     try:
-        lines = Path(mounts or MOUNTS_PATH).read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
+        table = read_mountinfo(mounts or MOUNTS_PATH)
+    except (OSError, MountInfoError):
         return None
-    target = resolve_path(path)
-    found = None
-    for line in lines:
-        fields = line.split()
-        if len(fields) < 3:
-            continue  # neúplný řádek: z takové tabulky se nic nedovozuje
-        point = PurePosixPath(_unescape(fields[1]))
-        # Porovnávají se části cesty, ne text: /srv/nas-zaloha neleží pod /srv/nas.
-        if target != point and point not in target.parents:
+    return table if table.complete else None
+
+
+def filesystem_type(path, mounts=None):
+    """Typ souborového systému viditelného mountu, na kterém cesta skutečně leží.
+
+    Cesta se rozvíjí po částech jako `os.path.realpath` (symlinky, `.`, `..`;
+    neexistující zbytek lexikálně), ale každá část se nejdřív lexikálně najde
+    v tabulce připojení (mounts.MountTable.covering). Na úložiště, které se
+    nesmí použít (síťové, autofs, virtuální, neznámé), se tak kontrola nedotkne
+    ani jedním lstat: vrátí rovnou jeho typ. Cesta, která takovým mountem jen
+    prochází, se tím odmítne také. Jinak by už samotné rozvíjení cesty
+    sáhlo na NAS (a mohlo se zaseknout) nebo spustilo autofs.
+    None = typ nelze zjistit (nečitelná, neúplná nebo nejednoznačná tabulka,
+    cesta bez viditelného mountu, smyčka symlinků); volající pak zápis odmítne.
+    Tabulka se čte až tady, protože se za běhu mění.
+    """
+    table = _mount_table(mounts)
+    if table is None:
+        return None
+    text = os.fspath(path)
+    if not text.startswith("/"):
+        text = os.path.join(os.getcwd(), text)
+    pending = list(PurePosixPath("/" + text.lstrip("/")).parts[1:])
+    current, links = PurePosixPath("/"), 0
+    while pending:
+        part = pending.pop(0)
+        if part == "..":
+            current = current.parent  # current je už rozvinutý, takže stačí lexikálně
             continue
-        if found is None or len(point.parts) >= len(found[0].parts):
-            found = (point, _unescape(fields[2]))
-    return None if found is None else found[1]
-
-
-def is_network_filesystem(kind):
-    name = kind.split(".", 1)[1] if kind.startswith("fuse.") else kind
-    return name in NETWORK_FILESYSTEMS
+        candidate = current / part
+        mount = table.covering(candidate)
+        if mount is None or mount.kind not in ALLOWED_KINDS:
+            return None if mount is None else mount.fstype
+        try:
+            is_link = stat.S_ISLNK(os.lstat(candidate).st_mode)
+        except OSError:
+            is_link = False  # neexistující zbytek cesty se rozvine lexikálně
+        if not is_link:
+            current = candidate
+            continue
+        links += 1
+        if links > MAX_SYMLINKS:
+            return None
+        try:
+            target = os.readlink(candidate)
+        except OSError:
+            return None
+        if target.startswith("/"):
+            current, target = PurePosixPath("/"), target.lstrip("/")
+        # Cíl symlinku se zpracuje stejným postupem, takže se ověří každá jeho část.
+        pending[:0] = PurePosixPath(target).parts
+    mount = table.covering(current)
+    return None if mount is None else mount.fstype
 
 
 def check_local_path(path, mounts=None):
-    """Povolí jen cestu na doloženě lokálním úložišti; vrací jeho typ.
+    """Povolí jen cestu na doloženě lokálním úložišti (druh `local`); vrací jeho typ.
 
-    Odmítne síťové úložiště, `autofs` (cíl se připojí až při přístupu) a stejně
-    tak stav, kdy úložiště ověřit nelze (nečitelná nebo neúplná tabulka
-    připojení, cesta mimo všechny body připojení). Kontroluje se při každém
-    použití, protože připojení se za běhu mění.
+    Odmítne síťové úložiště, `autofs` (cíl se připojí až při přístupu),
+    virtuální souborový systém (tmpfs, ramfs, overlay, proc…), neznámý typ
+    a stejně tak stav, kdy úložiště ověřit nelze
+    (nečitelná, neúplná nebo nejednoznačná tabulka připojení, cesta bez
+    viditelného mountu). Kontroluje se při každém použití, protože připojení se
+    za běhu mění. Typ je to, co hlásí jádro; o fyzickém umístění zařízení
+    (např. síťový blokový disk) nic nedokládá.
     """
     kind = filesystem_type(path, mounts)
     if kind is None:
@@ -108,6 +152,9 @@ def check_local_path(path, mounts=None):
         raise StorageError(f"{path} leží na síťovém souborovém systému {kind}; data historie se tam nezapisují")
     if kind in UNVERIFIABLE_FILESYSTEMS:
         raise StorageError(f"{path} leží pod {kind}; cílové úložiště se připojí až při přístupu a nelze ho ověřit")
+    if kind_of(kind) not in ALLOWED_KINDS:
+        raise StorageError(f"{path} leží na souborovém systému {kind}, který není doloženě lokální trvalé "
+                           "úložiště; nic se nezapisuje")
     return kind
 
 
@@ -115,14 +162,16 @@ def check_directory(path, purpose, mounts=None):
     """Existující skutečný adresář na lokálním úložišti; vrací jeho st_dev.
 
     Adresář se nikdy nevytváří (to je věc správce) a symlink se odmítá: u
-    publikace generace musí být jisté, kam přejmenování povede.
+    publikace generace musí být jisté, kam přejmenování povede. Úložiště se
+    ověří jako první, aby se na síťové úložiště ani autofs nesáhlo ani kvůli
+    zjištění, zda adresář existuje.
     """
     path = Path(path)
+    check_local_path(path, mounts)
     if path.is_symlink():
         raise StorageError(f"{purpose} {path} je symlink; cesta musí být skutečný adresář")
     if not path.is_dir():
         raise StorageError(f"{purpose} {path} neexistuje nebo není adresář; vytvořit ho musí správce")
-    check_local_path(path, mounts)
     return os.stat(path).st_dev
 
 

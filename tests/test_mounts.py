@@ -304,10 +304,11 @@ class SafetyTest(unittest.TestCase):
                 read_mountinfo(Path(directory) / "chybi")
 
     def test_not_connected_to_measurement_loop_or_display(self):
+        # Jediný uživatel je kontrola cest historie a snímků (storage.py); smyčka ani displej ne.
         users = [path.name for path in SRC.glob("*.py") if path.name != "mounts.py"
                  and "mounts" in {getattr(node, "module", None) for node in ast.walk(ast.parse(path.read_text(
                      encoding="utf-8"))) if isinstance(node, ast.ImportFrom)}]
-        self.assertEqual(users, [])
+        self.assertEqual(users, ["storage.py"])
 
     def test_manual_listing_never_prints_the_source(self):
         output = io.StringIO()

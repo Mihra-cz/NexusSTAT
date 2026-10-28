@@ -19,7 +19,7 @@ import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 from nexusstat import history, history_link, snapshot, storage
@@ -143,6 +143,27 @@ class Sync:
         return self.states[0] if len(self.states) == 1 else self.states.pop(0)
 
 
+def mountinfo(*entries):
+    """Syntetický obsah /proc/self/mountinfo z položek "zdroj bod typ" v pořadí připojení.
+
+    Rodičem každého mountu je dřív připojený mount na nejdelším bodu, který je
+    předponou jeho bodu (při shodě pozdější): pozdější mount na stejném bodě tak
+    leží nad dřívějším a vnořený mount nad tím, na který byl připojen. Bod
+    s mezerou se zapisuje osmičkově (\\040) jako v jádře. Další pole položky
+    (volby ze starého formátu /proc/self/mounts) se ignorují.
+    """
+    lines, mounted = [], []
+    for mount_id, entry in enumerate(entries, start=21):
+        source, point, fstype = entry.split()[:3]
+        target = PurePosixPath(point.replace("\\040", " "))
+        below = [(len(other.parts), other_id) for other_id, other in mounted
+                 if other == target or other in target.parents]
+        parent = max(below)[1] if below else 1
+        mounted.append((mount_id, target))
+        lines.append(f"{mount_id} {parent} 0:{mount_id} / {point} rw shared:{mount_id} - {fstype} {source} rw\n")
+    return "".join(lines)
+
+
 def maintenance_status(**changes):
     """Snímek údržby pro testy diagnostiky."""
     return MaintenanceStatus(**changes)
@@ -182,8 +203,8 @@ class FilesystemTest(unittest.TestCase):
         self.mounts = self.folder / "mounts"
 
     def write(self, *lines):
-        """Tabulka připojení ve formátu /proc/self/mounts (zdroj, bod, typ, …)."""
-        self.mounts.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+        """Tabulka připojení z položek "zdroj bod typ" v pořadí připojení (ve formátu mountinfo)."""
+        self.mounts.write_text(mountinfo(*lines), encoding="utf-8")
         return self.mounts
 
     def nas_table(self, *extra):
@@ -210,7 +231,7 @@ class FilesystemTest(unittest.TestCase):
         self.assertEqual(filesystem_type("/srv/nas", mounts), "cifs")
 
     def test_escaped_mount_point(self):
-        mounts = self.write("/dev/sdb1 /mnt/disk\\040kopie ext4 rw 0 0")
+        mounts = self.write("/dev/sda1 / ext4 rw 0 0", "/dev/sdb1 /mnt/disk\\040kopie ext4 rw 0 0")
         self.assertEqual(filesystem_type("/mnt/disk kopie/history.sqlite3", mounts), "ext4")
 
     def test_network_filesystems_are_refused(self):
@@ -221,7 +242,7 @@ class FilesystemTest(unittest.TestCase):
                 self.assertRefused("/mnt/sit/history.sqlite3", mounts, "síťovém")
 
     def test_local_filesystems_pass(self):
-        for kind in ("ext4", "btrfs", "xfs", "tmpfs", "f2fs", "zfs", "ext2"):
+        for kind in ("ext4", "btrfs", "xfs", "f2fs", "zfs", "ext2"):
             with self.subTest(kind=kind):
                 mounts = self.write(f"/dev/sda1 / {kind} rw 0 0")
                 self.assertFalse(is_network_filesystem(kind))
@@ -245,8 +266,16 @@ class FilesystemTest(unittest.TestCase):
         self.assertRefused("/srv/history.sqlite3", mounts, "nelze ověřit")
 
     def test_incomplete_lines_are_not_trusted(self):
-        mounts = self.write("/dev/sda1 /", "nesmysl", "")
-        self.assertRefused("/srv/history.sqlite3", mounts, "nelze ověřit")
+        # Neúplná tabulka nic nevylučuje: nečitelný řádek mohl být právě síťový mount nad cestou.
+        for broken in ("nesmysl\n", "\n", f"30 21 0:40 / {self.folder}/nas rw - cifs //192.0.2.20/share\n"):
+            with self.subTest(broken=broken):
+                self.mounts.write_text(mountinfo("/dev/sda1 / ext4") + broken, encoding="utf-8")
+                self.assertRefused(self.folder / "nas" / "history.sqlite3", self.mounts, "nelze ověřit")
+                self.assertRefused("/srv/history.sqlite3", self.mounts, "nelze ověřit")
+
+    def test_oversized_mount_table_is_refused(self):
+        self.mounts.write_bytes(mountinfo("/dev/sda1 / ext4").encode() + b"x" * (4 * 1024 * 1024))
+        self.assertRefused("/srv/history.sqlite3", self.mounts, "nelze ověřit")
 
     def test_autofs_is_refused(self):
         # autofs připojí cíl až při přístupu a bývá to NFS nebo CIFS.
@@ -279,8 +308,11 @@ class FilesystemTest(unittest.TestCase):
         (self.folder / "lokalni").mkdir()
         (self.folder / "nas").mkdir()
         self.assertRefused(self.folder / "lokalni" / ".." / "nas" / "history.sqlite3", mounts, "síťovém")
-        self.assertEqual(check_local_path(self.folder / "nas" / ".." / "lokalni" / "history.sqlite3", mounts),
+        self.assertEqual(check_local_path(self.folder / "lokalni" / ".." / "lokalni" / "history.sqlite3", mounts),
                          "ext4")
+        # Cesta přes síťový mount se odmítne, i když se `..` vrátí na lokální úložiště:
+        # zjistit, kam `nas/..` vede, by znamenalo sáhnout na kořen CIFS (zpřísnění opravy).
+        self.assertRefused(self.folder / "nas" / ".." / "lokalni" / "history.sqlite3", mounts, "síťovém")
 
     def test_local_symlink_stays_allowed(self):
         mounts = self.nas_table(f"/dev/sdb1 {self.folder}/lokalni ext4 rw 0 0")
@@ -298,16 +330,98 @@ class FilesystemTest(unittest.TestCase):
     def test_nested_mounts(self):
         mounts = self.write("/dev/sda1 / ext4 rw 0 0", "//server/share /srv/nas cifs rw 0 0",
                             "/dev/sdb1 /srv/nas/lokalni ext4 rw 0 0")
-        # Lokální systém připojený dovnitř síťového vyhrává delším bodem připojení.
-        self.assertEqual(check_local_path("/srv/nas/lokalni/history.sqlite3", mounts), "ext4")
+        # Lokální systém připojený dovnitř síťového se odmítne: každý přístup k cestě vede
+        # přes síťový mount, který se může zaseknout (zpřísnění opravy, dřív vyhrál delší bod).
+        self.assertRefused("/srv/nas/lokalni/history.sqlite3", mounts, "síťovém")
         self.assertRefused("/srv/nas/jine/history.sqlite3", mounts, "síťovém")
+        # Lokální systém vnořený do lokálního zůstává povolený.
+        mounts = self.write("/dev/sda1 / ext4 rw 0 0", "/dev/sdb1 /srv/data xfs rw 0 0",
+                            "/dev/sdc1 /srv/data/db btrfs rw 0 0")
+        self.assertEqual(check_local_path("/srv/data/db/history.sqlite3", mounts), "btrfs")
+        self.assertEqual(check_local_path("/srv/data/x/history.sqlite3", mounts), "xfs")
 
     def test_overlapping_mounts_use_the_later_one(self):
         # Dva body připojení na stejném místě: platí pozdější (překryje starší).
-        later_network = self.write("/dev/sdb1 /srv/data ext4 rw 0 0", "//server/share /srv/data cifs rw 0 0")
+        later_network = self.write("/dev/sda1 / ext4 rw 0 0", "/dev/sdb1 /srv/data ext4 rw 0 0",
+                                   "//server/share /srv/data cifs rw 0 0")
         self.assertRefused("/srv/data/history.sqlite3", later_network, "síťovém")
-        later_local = self.write("//server/share /srv/data cifs rw 0 0", "/dev/sdb1 /srv/data ext4 rw 0 0")
+        later_local = self.write("/dev/sda1 / ext4 rw 0 0", "//server/share /srv/data cifs rw 0 0",
+                                 "/dev/sdb1 /srv/data ext4 rw 0 0")
         self.assertEqual(check_local_path("/srv/data/history.sqlite3", later_local), "ext4")
+
+    # --- viditelný mount (regrese: dřív rozhodoval nejdelší bod připojení) ------------
+
+    def test_mount_below_a_hidden_parent_is_refused(self):
+        # Lokální <folder>/data leží na lokálním <folder>, přes který se později připojil CIFS:
+        # <folder>/data pod ním není vidět a cesta ve skutečnosti leží na CIFS.
+        (self.folder / "data").mkdir()
+        mounts = self.write("/dev/sda1 / ext4", f"/dev/sdb1 {self.folder} ext4", f"/dev/sdc1 {self.folder}/data ext4",
+                            f"//192.0.2.20/share {self.folder} cifs")
+        self.assertRefused(self.folder / "data" / "history.sqlite3", mounts, "síťovém")
+        # Opačně: síťový mount pod skrytým rodičem nebrání zápisu na viditelný lokální mount.
+        mounts = self.write("/dev/sda1 / ext4", f"/dev/sdb1 {self.folder} ext4", f"//192.0.2.20/share {self.folder}/data cifs",
+                            f"/dev/sdc1 {self.folder} ext4")
+        self.assertEqual(check_local_path(self.folder / "data" / "history.sqlite3", mounts), "ext4")
+
+    def test_ambiguous_mount_stack_is_refused(self):
+        # Dva mounty se stejným rodičem na stejném bodě: který je vidět, nejde určit.
+        self.mounts.write_text(mountinfo("/dev/sda1 / ext4")
+                               + f"30 21 8:2 / {self.folder} rw - ext4 /dev/sdb1 rw\n"
+                               + f"31 21 0:40 / {self.folder} rw - cifs //192.0.2.20/share rw\n", encoding="utf-8")
+        self.assertRefused(self.folder / "history.sqlite3", self.mounts, "nelze ověřit")
+
+    def test_unknown_filesystem_type_is_refused(self):
+        # Neznámý typ se nikdy nepovažuje za lokální (dřív prošlo cokoli mimo seznam síťových).
+        for kind in ("fuse", "fuse.gvfsd-fuse", "fuse.unknown", "foo"):
+            with self.subTest(kind=kind):
+                mounts = self.write("/dev/sda1 / ext4 rw 0 0", f"zdroj {self.folder} {kind} rw 0 0")
+                self.assertRefused(self.folder / "history.sqlite3", mounts, "není doloženě lokální trvalé úložiště")
+
+    def test_virtual_filesystems_are_refused(self):
+        # Virtuální druh se pro SQLite nepovoluje: tmpfs a ramfs nepřežijí restart, overlay nemá
+        # doložené podkladové úložiště, proc a sysfs nejsou úložiště (dřív tmpfs prošlo).
+        for kind in ("tmpfs", "ramfs", "overlay", "proc", "sysfs", "devtmpfs"):
+            with self.subTest(kind=kind):
+                mounts = self.write("/dev/sda1 / ext4 rw 0 0", f"zdroj {self.folder} {kind} rw 0 0")
+                self.assertRefused(self.folder / "history.sqlite3", mounts, "není doloženě lokální trvalé úložiště")
+        # Lokální disk připojený dovnitř tmpfs: cesta vede přes virtuální mount, odmítne se také.
+        mounts = self.write("/dev/sda1 / ext4", f"tmpfs {self.folder} tmpfs", f"/dev/sdb1 {self.folder}/data ext4")
+        self.assertRefused(self.folder / "data" / "history.sqlite3", mounts, "tmpfs")
+        # Lokální ext4 a btrfs dál projdou.
+        for kind in ("ext4", "btrfs"):
+            mounts = self.write("/dev/sda1 / ext4 rw 0 0", f"/dev/sdb1 {self.folder} {kind} rw 0 0")
+            self.assertEqual(check_local_path(self.folder / "history.sqlite3", mounts), kind)
+
+    def test_forbidden_storage_is_never_touched(self):
+        # Rozvíjení cesty ani kontrola adresáře nesmí na síťové úložiště ani autofs sáhnout
+        # (lstat by se na nedostupném NAS zasekl, pod autofs spustil připojení).
+        (self.folder / "nas" / "sub").mkdir(parents=True)
+        (self.folder / "auto" / "sub").mkdir(parents=True)
+        (self.folder / "odkaz").symlink_to(self.folder / "nas")
+        mounts = self.write("/dev/sda1 / ext4", f"//192.0.2.20/share {self.folder}/nas cifs",
+                            f"systemd-1 {self.folder}/auto autofs")
+        touched = []
+        real_lstat, real_stat = os.lstat, os.stat
+
+        def record(function):
+            def wrapper(path, *args, **kwargs):
+                touched.append(str(path))
+                return function(path, *args, **kwargs)
+            return wrapper
+
+        calls = (lambda: check_local_path(self.folder / "odkaz" / "sub" / "history.sqlite3", mounts),
+                 lambda: check_local_path(self.folder / "auto" / "sub" / "history.sqlite3", mounts),
+                 lambda: storage.check_directory(self.folder / "nas" / "sub", "test", mounts),
+                 lambda: storage.check_directory(self.folder / "auto" / "sub", "test", mounts))
+        with mock.patch("os.lstat", record(real_lstat)), mock.patch("os.stat", record(real_stat)):
+            for call in calls:
+                with self.assertRaises((history.HistoryError, storage.StorageError)):
+                    call()
+        forbidden = [path for path in touched
+                     if any(path == str(self.folder / name) or path.startswith(f"{self.folder / name}/")
+                            for name in ("nas", "auto"))]
+        self.assertEqual(forbidden, [])
+        self.assertIn(str(self.folder / "odkaz"), touched)  # symlink na lokálním úložišti se přečíst smí
 
     def test_real_project_path_is_local(self):
         # Jediné čtení skutečné tabulky připojení: vývojový adresář musí projít.
@@ -774,7 +888,7 @@ class OpenHistoryTest(LinkCase):
 
     def test_network_path_is_refused_without_writing(self):
         mounts = self.folder / "mounts"
-        mounts.write_text(f"nas {self.folder} cifs rw 0 0\n", encoding="utf-8")
+        mounts.write_text(mountinfo("/dev/sda1 / ext4", f"nas {self.folder} cifs"), encoding="utf-8")
         with mock.patch.object(storage, "MOUNTS_PATH", str(mounts)):
             config = Config(history=HistoryConfig(enabled=True, path=str(self.db)))
             link = open_history(config, app_version="test", output=self.lines.append, sync=Sync(True),
@@ -795,10 +909,12 @@ class OpenHistoryTest(LinkCase):
 class OpenWriterTest(LinkCase):
     """Ověření úložiště před i po otevření databáze (zúžení okna záměny)."""
 
+    def table_text(self, kind="ext4"):
+        return mountinfo("/dev/sda1 / ext4", f"zdroj {os.path.realpath(self.folder)} {kind}")
+
     def table(self, kind="ext4"):
         mounts = self.folder / "mounts"
-        mounts.write_text(f"/dev/sda1 / ext4 rw 0 0\nzdroj {os.path.realpath(self.folder)} {kind} rw 0 0\n",
-                          encoding="utf-8")
+        mounts.write_text(self.table_text(kind), encoding="utf-8")
         return mounts
 
     def test_local_path_opens_and_closes_cleanly(self):
@@ -826,8 +942,7 @@ class OpenWriterTest(LinkCase):
     def test_network_storage_appearing_during_opening_closes_the_database(self):
         mounts = self.table()
         local = mounts.read_text(encoding="utf-8")
-        with self.swap_during_open(mounts, local.replace(f"{os.path.realpath(self.folder)} ext4",
-                                                         f"{os.path.realpath(self.folder)} cifs")):
+        with self.swap_during_open(mounts, self.table_text("cifs")):
             with self.assertRaises(history.HistoryError) as caught:
                 _open_writer(self.db, HOST, mounts)
         self.assertIn("síťovém", str(caught.exception))
@@ -838,8 +953,8 @@ class OpenWriterTest(LinkCase):
     def test_storage_identity_change_during_opening_is_refused(self):
         mounts = self.table()
         local = mounts.read_text(encoding="utf-8")
-        with self.swap_during_open(mounts, local.replace(f"{os.path.realpath(self.folder)} ext4",
-                                                         f"{os.path.realpath(self.folder)} tmpfs")):
+        # Jiný, ale povolený lokální typ: pozná se samotná změna identity úložiště.
+        with self.swap_during_open(mounts, self.table_text("btrfs")):
             with self.assertRaises(history.HistoryError) as caught:
                 _open_writer(self.db, HOST, mounts)
         self.assertIn("se během otevírání změnilo", str(caught.exception))
