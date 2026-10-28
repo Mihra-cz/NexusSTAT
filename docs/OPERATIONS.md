@@ -6,7 +6,7 @@ Na Nexusu zatím neběží žádný kód, service ani port. Není co instalovat,
 
 ## Lokální vývoj (simulace, read-only kolektory a pravidelné měření)
 
-Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku ani NAS a nic neposílá do sítě. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`. Síťový kolektor (v0.6) jen čte `/sys/class/net` a `/proc/net/route` a lokální IPv4 zjistí dotazem na jádro (`ioctl SIOCGIFADDR` na nepřipojeném socketu: žádný paket, žádný port, žádné připojení). Nic nezapisují a nespouštějí žádné příkazy. Výjimkami jsou volitelný healthcheck AnimeDB (SERVICES-1, níže): jen se zapnutým `[services.animedb]` pošle jeden HTTP `GET` na nastavenou adresu `/health`, a volitelná kontrola NAS (SERVICES-2, níže): jen se zapnutým `[services.nas]` jeden pokus o spojení TCP na port SMB, který se hned zavře. Třetí výjimkou je volitelná kontrola záloh (SERVICES-3, níže): jen se zapnutým `[services.backup]` jeden read-only dotaz `/usr/bin/systemctl show` na nastavenou zálohovací službu a timer (žádný jiný příkaz, shell ani sudo). Všechny tři jsou ve výchozím stavu vypnuté.
+Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku ani NAS a nic neposílá do sítě. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`. Síťový kolektor (v0.6) jen čte `/sys/class/net` a `/proc/net/route` a lokální IPv4 zjistí dotazem na jádro (`ioctl SIOCGIFADDR` na nepřipojeném socketu: žádný paket, žádný port, žádné připojení). Nic nezapisují a nespouštějí žádné příkazy. Výjimkami jsou volitelný healthcheck AnimeDB (SERVICES-1, níže): jen se zapnutým `[services.animedb]` pošle jeden HTTP `GET` na nastavenou adresu `/health`, a volitelná kontrola NAS (SERVICES-2, níže): jen se zapnutým `[services.nas]` jeden pokus o spojení TCP na port SMB, který se hned zavře. Inventura úložišť (M5-S1, `python3 -m nexusstat.mounts`, zatím jen ruční výpis) čte jen tabulku jádra `/proc/self/mountinfo`: body připojení neotevírá, síť nepoužívá a autofs nespustí; zdroj mountu (může obsahovat adresu NAS) nevypisuje. Třetí výjimkou je volitelná kontrola záloh (SERVICES-3, níže): jen se zapnutým `[services.backup]` jeden read-only dotaz `/usr/bin/systemctl show` na nastavenou zálohovací službu a timer (žádný jiný příkaz, shell ani sudo). Všechny tři jsou ve výchozím stavu vypnuté.
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
@@ -15,6 +15,7 @@ PYTHONPATH=src python3 -m nexusstat.simulate /tmp/nexusstat-live --live
 PYTHONPATH=src python3 -m nexusstat.system_monitor
 PYTHONPATH=src python3 -m nexusstat.network_monitor
 PYTHONPATH=src python3 -m nexusstat.network_monitor eth0
+PYTHONPATH=src python3 -m nexusstat.mounts
 PYTHONPATH=src python3 -m nexusstat.run
 PYTHONPATH=src python3 -m nexusstat.run --config config/config.example.toml
 ```
