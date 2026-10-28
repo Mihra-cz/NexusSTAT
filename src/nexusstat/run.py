@@ -9,7 +9,9 @@ vyhodnotí zapnuté prahy ([alarms], výchozí vypnuto) a vypíše jeden řádek
 Se zapnutým [services.animedb] (výchozí vypnuto) navíc jedním požadavkem GET
 na nastavenou adresu /health zkontroluje dostupnost AnimeDB, se zapnutým
 [services.nas] (výchozí vypnuto) jedním pokusem o spojení TCP na port SMB
-dostupnost NAS (bez přihlášení, bez sdílených složek a mountů).
+dostupnost NAS (bez přihlášení, bez sdílených složek a mountů), se zapnutým
+[services.backup] (výchozí vypnuto) jedním read-only dotazem `systemctl show`
+výsledek existující zálohovací úlohy (bez spouštění zálohy a bez Resticu).
 Ukončení: Ctrl+C nebo SIGTERM.
 Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nepřistupuje
 k displeji, mountům NAS ani jinému hardwaru a do sítě posílá jen zapnuté kontroly AnimeDB a NAS. Se zapnutou historií
@@ -29,6 +31,7 @@ from pathlib import Path
 from . import __version__, history
 from .alarms import AlarmEvaluator
 from .animedb_monitor import AnimeDbMonitor
+from .backup_monitor import BackupMonitor
 from .config import HISTORY_ROLE, Config, ConfigError, load_config
 from .core import ALERT_STATES, CheckResult, State, overall_state
 from .fan_monitor import FanMonitor
@@ -114,7 +117,7 @@ class Collectors:
 
 
 def live_monitor(config):
-    """Skutečné read-only kolektory: systém, ventilátor CPU, síť a volitelně AnimeDB a NAS podle konfigurace."""
+    """Skutečné read-only kolektory: systém, ventilátor CPU, síť a volitelně AnimeDB, NAS a zálohy podle konfigurace."""
     validity = config.collector.validity_seconds
     monitors = [
         SystemMonitor(validity_seconds=validity),
@@ -134,6 +137,12 @@ def live_monitor(config):
         # jinak kolektor vůbec nevznikne, nic se nepřipojuje a NAS zůstává N/A.
         monitors.append(NasMonitor(validity_seconds=validity, host=nas.host, port=nas.port,
                                    timeout_seconds=nas.timeout_seconds))
+    backup = config.services.backup
+    if backup.enabled:
+        # Dotaz na systemd jen při výslovně zapnutém sledování (SERVICES-3); jinak
+        # kolektor vůbec nevznikne, nic se nespouští a BACKUP zůstává N/A.
+        monitors.append(BackupMonitor(validity_seconds=validity, unit=backup.unit, timer=backup.timer,
+                                      timeout_seconds=backup.timeout_seconds))
     return Collectors(*monitors)
 
 

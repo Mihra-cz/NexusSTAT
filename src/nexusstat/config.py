@@ -40,11 +40,13 @@ KNOWN_NETWORK_KEYS = {"interface"}
 KNOWN_HISTORY_KEYS = {"enabled", "path", "snapshot"}
 KNOWN_SNAPSHOT_KEYS = {"enabled", "work_dir", "published_dir", "daily_time", "timezone"}
 KNOWN_RULE_KEYS = {"enabled", "warning", "error", "hysteresis", "confirm_count", "clear_count"}
-# Jen služby se skutečným kolektorem (AnimeDB od SERVICES-1, NAS od SERVICES-2).
-# Další služby se přidají až s vlastním kolektorem, ne předem jako nefunkční volby.
-KNOWN_SERVICES_KEYS = {"animedb", "nas"}
+# Jen služby se skutečným kolektorem (AnimeDB od SERVICES-1, NAS od SERVICES-2,
+# zálohy od SERVICES-3). Další služby se přidají až s vlastním kolektorem, ne
+# předem jako nefunkční volby.
+KNOWN_SERVICES_KEYS = {"animedb", "nas", "backup"}
 KNOWN_ANIMEDB_KEYS = {"enabled", "url", "timeout_seconds"}
 KNOWN_NAS_KEYS = {"enabled", "host", "port", "timeout_seconds"}
+KNOWN_BACKUP_KEYS = {"enabled", "unit", "timer", "timeout_seconds"}
 
 # Healthcheck AnimeDB (SERVICES-1): limit celé kontroly v sekundách (spojení,
 # odeslání i příjem dohromady). Měřicí smyčka je jednovláknová, takže se
@@ -58,6 +60,13 @@ MAX_URL_LENGTH = 256
 # jako u healthchecku AnimeDB (HEALTH_TIMEOUT_DEFAULT, HEALTH_TIMEOUT_MAX).
 NAS_PORT_DEFAULT = 445
 MAX_PORT = 65535
+
+# Název jednotky systemd pro kontrolu záloh (SERVICES-3): znaky, které systemd
+# v názvech jednotek povoluje, bez escapovaných sekvencí (např. "\x2d"), nejvýš 255 znaků
+# a s příponou typu. Nesmí začínat "-", aby se název nikdy nemohl stát volbou
+# systemctl (název se navíc předává až za "--").
+UNIT_NAME = re.compile(r"[A-Za-z0-9_:][A-Za-z0-9_:.-]*(?:@[A-Za-z0-9_:.-]+)?\.(service|timer)")
+MAX_UNIT_NAME_LENGTH = 255
 
 # Názvy síťových rozhraní, se kterými NexusSTAT pracuje: nejvýš 15 znaků jako
 # v jádře (IFNAMSIZ − 1), jen písmena, číslice, "_", "." a "-". Jádro povoluje
@@ -499,18 +508,55 @@ class NasConfig:
             raise ConfigError("enabled = true vyžaduje host")
 
 
+def check_unit_name(name, value, kind):
+    """Ověří název jednotky systemd s příponou `kind` ("service" nebo "timer")."""
+    match = UNIT_NAME.fullmatch(value) if isinstance(value, str) else None
+    if match is None or match[1] != kind or len(value) > MAX_UNIT_NAME_LENGTH:
+        raise ConfigError(f"{name} musí být název jednotky systemd s příponou .{kind}, ne {value!r}")
+
+
+@dataclass(frozen=True)
+class BackupConfig:
+    """Volitelná kontrola výsledku existující zálohovací úlohy přes systemd (SERVICES-3).
+
+    Výchozí stav je vypnuto a názvy jednotek nemají výchozí hodnotu: bez
+    výslovného zapnutí se systemd nedotazuje a BACKUP je `N/A`. Skutečné
+    názvy jednotek Nexusu patří jen do lokální konfigurace mimo Git. `timer`
+    je volitelný; existence jednotek se tu nekontroluje (mění se za běhu).
+    """
+
+    enabled: bool = False
+    unit: str | None = None  # zálohovací služba, např. "example-backup.service"
+    timer: str | None = None  # její plán, např. "example-backup.timer"
+    timeout_seconds: float = HEALTH_TIMEOUT_DEFAULT
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(f"enabled musí být true nebo false, ne {self.enabled!r}")
+        if self.unit is not None:
+            check_unit_name("unit", self.unit, "service")
+        if self.timer is not None:
+            check_unit_name("timer", self.timer, "timer")
+        check_health_timeout(self.timeout_seconds)
+        if self.enabled and self.unit is None:
+            raise ConfigError("enabled = true vyžaduje unit")
+
+
 @dataclass(frozen=True)
 class ServicesConfig:
-    """Kolektory služeb: healthcheck AnimeDB a dostupnost NAS, oba výchozí vypnuto."""
+    """Kolektory služeb: healthcheck AnimeDB, dostupnost NAS a výsledek záloh, vše výchozí vypnuto."""
 
     animedb: AnimeDbConfig = field(default_factory=AnimeDbConfig)
     nas: NasConfig = field(default_factory=NasConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
 
     def __post_init__(self):
         if not isinstance(self.animedb, AnimeDbConfig):
             raise ConfigError("[services.animedb] musí být AnimeDbConfig")
         if not isinstance(self.nas, NasConfig):
             raise ConfigError("[services.nas] musí být NasConfig")
+        if not isinstance(self.backup, BackupConfig):
+            raise ConfigError("[services.backup] musí být BackupConfig")
 
 
 @dataclass(frozen=True)
@@ -564,7 +610,7 @@ def history_config_from_dict(section):
 
 
 def services_config_from_dict(section):
-    """Vytvoří ServicesConfig ze slovníku sekce [services] s podsekcemi [services.animedb] a [services.nas]."""
+    """Vytvoří ServicesConfig ze slovníku sekce [services] s podsekcemi animedb, nas a backup."""
     _check_section("services", section, KNOWN_SERVICES_KEYS)
     animedb_section = section.get("animedb", {})
     _check_section("services.animedb", animedb_section, KNOWN_ANIMEDB_KEYS)
@@ -578,7 +624,13 @@ def services_config_from_dict(section):
         nas = NasConfig(**nas_section)
     except ConfigError as error:
         raise ConfigError(f"[services.nas] {error}") from error
-    return ServicesConfig(animedb=animedb, nas=nas)
+    backup_section = section.get("backup", {})
+    _check_section("services.backup", backup_section, KNOWN_BACKUP_KEYS)
+    try:
+        backup = BackupConfig(**backup_section)
+    except ConfigError as error:
+        raise ConfigError(f"[services.backup] {error}") from error
+    return ServicesConfig(animedb=animedb, nas=nas, backup=backup)
 
 
 def alarms_config_from_dict(section):

@@ -840,6 +840,19 @@ class SampleContractTest(RecorderTest):
                          [(None, "OK"), ("OK", "UNKNOWN"), ("UNKNOWN", "ERROR"), ("ERROR", "ERROR"), ("ERROR", "OK")])
         self.assertEqual(sum(self.recorder.rejected.values()), 0)
 
+    def test_backup_result_stores_changes_only(self):
+        # SERVICES-3: výsledek zálohovací úlohy nemá číselnou řadu (stáří je jen v popisu).
+        # Do historie jdou jen změny stavu a důvodu, opakované měření řádky nepřidává.
+        sequence = [(State.UNKNOWN, {"backup": "no_run"}), (State.OK, {"backup": "ok"}), (State.OK, {"backup": "ok"}),
+                    (State.OK, {"backup": "running"}), (State.WARNING, {"backup": "failed"}),
+                    (State.WARNING, {"backup": "failed"}), (State.OK, {"backup": "ok"})]
+        self.write(*[[result("service.backup", state, ts=BASE + 10 * index, details=details)]
+                     for index, (state, details) in enumerate(sequence)])
+        self.assertEqual(self.samples(), [])
+        self.assertEqual([(from_state, to_state) for _, from_state, to_state, _ in self.changes("service.backup")],
+                         [(None, "UNKNOWN"), ("UNKNOWN", "OK"), ("OK", "OK"), ("OK", "WARNING"), ("WARNING", "OK")])
+        self.assertEqual(sum(self.recorder.rejected.values()), 0)
+
     def test_nas_reachability_stores_changes_only(self):
         # SERVICES-2: kontrola NAS je stejný druh výsledku jako healthcheck AnimeDB:
         # bez číselné řady, jen změny stavu a kategorických details, schéma beze změny.

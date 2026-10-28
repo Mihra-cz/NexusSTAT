@@ -286,9 +286,9 @@ class ScenarioTest(unittest.TestCase):
         session, _ = make_session("unconnected")
         now = session.clock.now()
         self.assertEqual(service_rows(session.results, now),
-                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "UNKN")])
+                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
         self.assertEqual(home_symbol(session.results, now), UNKNOWN_SYMBOL)
-        self.assertEqual({p.id for p in active_problems(session.results, now)}, {NEXUS_SERVICES_ID, BACKUP_ID})
+        self.assertEqual({p.id for p in active_problems(session.results, now)}, {NEXUS_SERVICES_ID})
 
     def test_switch_resets_data_and_window(self):
         session, real = make_session("many")
@@ -378,7 +378,7 @@ class LiveTest(unittest.TestCase):
         now = session.clock.now()
         self.assertFalse(any(result.simulated for result in session.results))
         self.assertEqual(service_rows(session.results, now),
-                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "UNKN")])
+                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
 
     def test_live_applies_alarm_rules(self):
         config = Config(alarms=AlarmsConfig(cpu_temp=AlarmRule(True, 70, 80, 5)))

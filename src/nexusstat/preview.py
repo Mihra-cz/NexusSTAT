@@ -7,8 +7,9 @@ Obraz kreslí výhradně render.render_screen(); simulátor jen řídí čas,
 tlačítko, scénáře a zvětšení. LED jsou samostatná plocha pod displejem
 a jejich barvu určuje rgb.py, do bitmapy OLED se nekreslí. Nepřistupuje
 k hardwaru displeje, LED, SPI ani GPIO a do sítě posílá jen zapnuté kontroly
-AnimeDB a NAS v LIVE (síť jinak jen čte jako network_monitor). Scénáře s NAS
-používají podvržené spojení, nikam se nepřipojují. Stavová logika (PreviewSession) nepotřebuje
+AnimeDB a NAS v LIVE (síť jinak jen čte jako network_monitor); se zapnutou
+kontrolou záloh se v LIVE jen čte stav systemd. Scénáře s NAS používají
+podvržené spojení, nikam se nepřipojují. Stavová logika (PreviewSession) nepotřebuje
 tkinter ani grafický displej, takže ji testy ověřují bez X serveru; tkinter
 se načte až při otevření okna.
 """
@@ -161,7 +162,7 @@ def scenario_many(sim):
 
 def scenario_unconnected(sim):
     # Fiktivní systém a síť, služby bez výsledku: doplnění je ukáže jako dnes
-    # ve skutečnosti s výchozí konfigurací (NEXUS, BACKUP UNKNOWN; AnimeDB a NAS
+    # ve skutečnosti s výchozí konfigurací (NEXUS UNKNOWN; AnimeDB, NAS a BACKUP
     # se sledováním vypnutým N/A).
     return system_and_services(sim)[:4] + network(sim, rx=1_234_000, tx=85_300)
 
@@ -508,8 +509,10 @@ class PreviewSession:
                       else "AnimeDB N/A (sledování vypnuto)")
             nas = ("NAS ze spojení TCP na port SMB" if self.config.services.nas.enabled
                    else "NAS N/A (sledování vypnuto)")
+            backup = ("BACKUP z výsledku úlohy v systemd" if self.config.services.backup.enabled
+                      else "BACKUP N/A (sledování vypnuto)")
             return ("LIVE: skutečná read-only měření (systém a síť) tohoto NOTEBOOKU, ne Nexusu. "
-                    f"Služby bez kolektoru UNKNOWN, {source}, {nas}. Čas 1×.")
+                    f"Služby bez kolektoru UNKNOWN, {source}, {nas}, {backup}. Čas 1×.")
         text = f"SIMULACE: fiktivní data (značka SIM), čas {self.clock.speed}×."
         if self.nas is not None:
             # OLED ukazuje u 1. i 2. neúspěšného pokusu stejné NAS FAILING;

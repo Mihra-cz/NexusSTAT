@@ -6,7 +6,7 @@ Na Nexusu zatím neběží žádný kód, service ani port. Není co instalovat,
 
 ## Lokální vývoj (simulace, read-only kolektory a pravidelné měření)
 
-Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku ani NAS a nic neposílá do sítě. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`. Síťový kolektor (v0.6) jen čte `/sys/class/net` a `/proc/net/route` a lokální IPv4 zjistí dotazem na jádro (`ioctl SIOCGIFADDR` na nepřipojeném socketu: žádný paket, žádný port, žádné připojení). Nic nezapisují a nespouštějí žádné příkazy. Výjimkami jsou volitelný healthcheck AnimeDB (SERVICES-1, níže): jen se zapnutým `[services.animedb]` pošle jeden HTTP `GET` na nastavenou adresu `/health`, a volitelná kontrola NAS (SERVICES-2, níže): jen se zapnutým `[services.nas]` jeden pokus o spojení TCP na port SMB, který se hned zavře. Obě jsou ve výchozím stavu vypnuté a nikam se nepřipojují.
+Pouze na vývojovém počítači. Kód nepřistupuje k GPIO, I²C, SPI, tlačítku ani NAS a nic neposílá do sítě. Systémový kolektor jen čte `/proc/stat`, `/proc/meminfo`, `/sys/class/thermal` a `os.statvfs("/")`. Síťový kolektor (v0.6) jen čte `/sys/class/net` a `/proc/net/route` a lokální IPv4 zjistí dotazem na jádro (`ioctl SIOCGIFADDR` na nepřipojeném socketu: žádný paket, žádný port, žádné připojení). Nic nezapisují a nespouštějí žádné příkazy. Výjimkami jsou volitelný healthcheck AnimeDB (SERVICES-1, níže): jen se zapnutým `[services.animedb]` pošle jeden HTTP `GET` na nastavenou adresu `/health`, a volitelná kontrola NAS (SERVICES-2, níže): jen se zapnutým `[services.nas]` jeden pokus o spojení TCP na port SMB, který se hned zavře. Třetí výjimkou je volitelná kontrola záloh (SERVICES-3, níže): jen se zapnutým `[services.backup]` jeden read-only dotaz `/usr/bin/systemctl show` na nastavenou zálohovací službu a timer (žádný jiný příkaz, shell ani sudo). Všechny tři jsou ve výchozím stavu vypnuté.
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
@@ -79,7 +79,28 @@ timeout_seconds = 2
 - NAS může v logu vidět krátké spojení z Nexusu při každém měření; s přihlášením to nesouvisí.
 - Návrat: `enabled = false` nebo odstranění sekce a nové spuštění; nic jiného se nemění.
 
-Ověřeno jen testy nad podvrženým spojením (`tests/test_nas_monitor.py`); proti skutečnému NAS kontrola zatím nebyla spuštěna. Dostupnost sdílených složek SMB a ověřování záloh Restic zatím **nejsou implementované**.
+Ověřeno jen testy nad podvrženým spojením (`tests/test_nas_monitor.py`); proti skutečnému NAS kontrola zatím nebyla spuštěna. Dostupnost sdílených složek SMB a ověření obsahu záloh Restic zatím **nejsou implementované**.
+
+### Kontrola záloh (SERVICES-3, volitelná, výchozí stav vypnuto)
+
+Bez sekce `[services.backup]` (nebo s `enabled = false`) se kolektor nevytvoří a nic se nespouští; BACKUP je na SERVICES `N/A` (do SERVICES-3 `UNKN`). Zapnutí jen ve vlastní kopii konfigurace mimo Git (`config/config.toml`), protože obsahuje skutečné názvy jednotek:
+
+```toml
+[services.backup]
+enabled = true
+unit = "example-backup.service"   # skutečný název zálohovací služby jen v lokální konfiguraci
+timer = "example-backup.timer"    # volitelné
+timeout_seconds = 2
+```
+
+- Při každém měření (výchozí po 10 s) jediný read-only dotaz `/usr/bin/systemctl show --no-pager --no-ask-password --property=… -- <unit> [<timer>]` jako běžný uživatel. Zálohu nespouští, Restic nevolá, repozitář, hesla, journal ani NAS nečte a jednotky nemění. Dotaz zdrží smyčku nejvýš o `timeout_seconds` (výchozí 2 s); s AnimeDB a NAS se limity sčítají.
+- `OK` = úloha naposledy **doloženě skončila úspěšně** (kód 0) před nejvýš 26 h; nad 26 h `WARNING`, nad 50 h `ERROR` (`BACKUP OVERDUE`). Nový neúspěšný pokus je `WARNING` při ještě použitelné záloze, jinak `ERROR` (`BACKUP FAILED`). Chybějící, maskovaná nebo chybně nastavená služba `ERROR` (`BACKUP NO JOB`), neaktivní timer nejméně `WARNING` (`BACKUP NO TIMER`). Přeskočení přes `ExecCondition=` není nový úspěch ani selhání (stav podle předchozího doloženého úspěchu, bez něj `UNKNOWN`, `BACKUP SKIPPED`). Běh bez doloženého předchozího úspěchu, nečitelné, nekonzistentní a ztracené údaje jsou `UNKNOWN`, nikdy automaticky selhání. Význam stavů je v `docs/REQUIREMENTS.md` (Kontrola záloh).
+- **`OK` neznamená ověřený obsah repozitáře Resticu**, jen úspěch úlohy systemd. Úplnou zálohu dokládá teprve tehdy, když skript předává všechny chyby Resticu (ověřit na Nexusu).
+- **Ztráta údajů systemd:** stav posledního běhu systemd neuchovává trvale. Zmizí restartem systému i tehdy, když systemd neaktivní jednotku uvolní z paměti; BACKUP je pak `UNKNOWN` až do dalšího doloženého běhu, i když předchozí záloha proběhla. Kolektor si poslední úspěch pamatuje jen v paměti procesu a nikdy ho nepřenáší přes restart NexusSTATu ani systému.
+- Výsledek `service.backup` jde do řádku `nexusstat.run` (např. `Záloha: úloha naposledy skončila úspěšně před 3.0 h`), se zapnutou historií do SQLite jako změna stavu (bez číselné řady), v živém náhledu LIVE na SERVICES, do STATUS, na symbol stránky NEXUS a do simulovaných LED (kód 4). Názvy jednotek se do výpisu ani historie nezapisují.
+- Návrat: `enabled = false` nebo odstranění sekce a nové spuštění; nic jiného se nemění.
+
+Ověřeno testy nad syntetickým výstupem `systemctl` (`tests/test_backup_monitor.py`, tvar zachycený ze systemd 255) a read-only dotazem na neškodné jednotky notebooku; proti zálohovací úloze Nexusu kontrola zatím nebyla spuštěna.
 
 ### Zkouška historie na notebooku (M3.3b-1, volitelná, výchozí stav vypnuto)
 
@@ -148,6 +169,7 @@ Na cílovém Nexusu před nasazením znovu ověř:
 
 - `systemctl show pironman5.service -p ActiveState -p SubState -p ExecStart`
 - `systemctl show <timer-zálohy>.timer -p ActiveState -p TimersCalendar` pro denní zálohu i týdenní údržbu Resticu
+- pro SERVICES-3 jako budoucí uživatel NexusSTATu: `systemctl show --no-pager -p LoadState,ActiveState,Result,ExecMainCode,ExecMainStatus,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic -- <služba-zálohy>.service`, dále `systemctl cat <služba-zálohy>.service` (typ, `RemainAfterExit`, `Condition…`, `SuccessExitStatus`, skript) a v obsahu skriptu, zda předává chyby Resticu včetně kódu 3; jak dlouho stav jednotky mezi běhy vydrží (uvolnění z paměti) a zda hranice 26/50 h odpovídají plánu a délce běhu
 - `findmnt -M <mountpoint-NAS> -o TARGET,FSTYPE -n` pro každý připojený NAS
 
 Skutečné názvy jednotek a cesty mountů jsou v soukromé dokumentaci Nexusu, ne v tomto repozitáři.

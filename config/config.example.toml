@@ -114,6 +114,24 @@ enabled = false
 port = 445
 timeout_seconds = 2
 
+# Výsledek existující zálohovací úlohy ze systemd (SERVICES-3). Výchozí stav:
+# vypnuto, nic se nespouští a BACKUP je N/A.
+# Při `enabled = true` je povinná `unit` (služba .service), `timer` je volitelný.
+# Skutečné názvy jednotek patří jen do lokální konfigurace mimo Git.
+# Při každém měření jediný read-only dotaz `/usr/bin/systemctl show` (bez shellu,
+# sudo, journalu, Resticu, jeho repozitáře a NAS), limit `timeout_seconds` (0, 5].
+# Stavy: doložený úspěšný konec úlohy (Result=success sám nestačí) nejvýš 26 h
+# = OK, nad 26 h WARNING, nad 50 h ERROR; nový neúspěch při čerstvé záloze
+# WARNING, bez doloženého úspěchu ERROR; neexistující nebo maskovaná jednotka
+# ERROR; neaktivní timer nejméně WARNING; nečitelné údaje, běh bez doloženého
+# úspěchu a údaje ztracené restartem systému nebo uvolněním jednotky z paměti
+# UNKNOWN. OK znamená úspěch úlohy systemd, ne ověřený obsah repozitáře Resticu.
+[services.backup]
+enabled = false
+# unit = "example-backup.service"
+# timer = "example-backup.timer"
+timeout_seconds = 2
+
 # --- Budoucí možnosti: zatím NEIMPLEMENTOVÁNO a nenačítá se ---
 # Nápis na první stránce je pevně NEXUS, hodiny jsou vždy 24h.
 # Symboly na stránce NEXUS (trojúhelník / "?") nelze vypnout.

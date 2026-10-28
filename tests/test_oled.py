@@ -320,7 +320,7 @@ class ServiceConsistencyTest(unittest.TestCase):
     def test_completion_adds_unknown_and_na(self):
         added = complete_service_results([], OBSERVED, 30)
         self.assertEqual([(r.id, r.state) for r in added], [
-            (NEXUS_SERVICES_ID, State.UNKNOWN), (ANIMEDB_ID, State.NA), (NAS_ID, State.NA), (BACKUP_ID, State.UNKNOWN),
+            (NEXUS_SERVICES_ID, State.UNKNOWN), (ANIMEDB_ID, State.NA), (NAS_ID, State.NA), (BACKUP_ID, State.NA),
         ])
         # Od SERVICES-2 je NAS volitelná služba: bez zapnutého sledování N/A, se zapnutým UNKNOWN.
         self.assertEqual(added[2].summary, "NAS: sledování vypnuto")
@@ -331,13 +331,13 @@ class ServiceConsistencyTest(unittest.TestCase):
         self.assertEqual({result.measurement for result in added}, {None})
 
     def test_unmonitored_services_are_unknown_on_all_screens(self):
-        # Skutečný režim dnes: systém měřený bez závady, NEXUS a BACKUP nemají
-        # kolektor, AnimeDB a NAS mají sledování ve výchozím stavu vypnuté.
+        # Skutečný režim dnes: systém měřený bez závady, NEXUS nemá kolektor,
+        # AnimeDB, NAS a zálohy mají sledování ve výchozím stavu vypnuté.
         results = complete_service_results(real_system_results(), OBSERVED, 30)
         self.assertEqual(service_rows(results, 10),
-                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "UNKN")])
+                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
         self.assertEqual(home_symbol(results, 10), UNKNOWN_SYMBOL)  # "?", ne trojúhelník
-        self.assertEqual(problem_states(results), {NEXUS_SERVICES_ID: State.UNKNOWN, BACKUP_ID: State.UNKNOWN})
+        self.assertEqual(problem_states(results), {NEXUS_SERVICES_ID: State.UNKNOWN})
         # UNKNOWN není potvrzená závada.
         self.assertFalse(any(state in (State.WARNING, State.ERROR, State.CRITICAL) for state in problem_states(results).values()))
 
@@ -440,7 +440,7 @@ class SimulatorScenarioTest(unittest.TestCase):
             simulate.main(["/neexistujici-vystup", "--live"])
         lines = {line.split()[0]: line.split()[1] for line in output.getvalue().splitlines()}
         self.assertEqual({service_id: lines[service_id] for service_id in SERVICE_LABELS}, {
-            NEXUS_SERVICES_ID: "UNKNOWN", ANIMEDB_ID: "N/A", NAS_ID: "N/A", BACKUP_ID: "UNKNOWN",
+            NEXUS_SERVICES_ID: "UNKNOWN", ANIMEDB_ID: "N/A", NAS_ID: "N/A", BACKUP_ID: "N/A",
         })
 
     def test_scenario_visits_all_pages_and_keeps_timeouts(self):

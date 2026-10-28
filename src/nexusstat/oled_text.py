@@ -12,6 +12,7 @@ KB/s a MB/s (výslovně zadané pro stránku NETWORK).
 
 import hashlib
 
+from .backup_monitor import BACKUP, FAILED, NO_JOB, NO_TIMER, RUNNING, SKIPPED
 from .core import ALERT_STATES, State, effective
 from .fan_monitor import CPU_FAN_ID, FAN_ON, FAN_STATE, SOURCE, SOURCE_REQUEST
 from .network_monitor import ADDRESS, BYTES_PER_SECOND, INTERFACE, IPV4_ID, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
@@ -83,6 +84,17 @@ HEALTH_TEXT = {
     (State.UNKNOWN, DOWN): "FAILING",
     (State.UNKNOWN, INVALID): "INVALID",
     (State.ERROR, UP): "RECOVER",  # odpovídá, ale výpadek ještě neodezněl
+}
+
+# Důvod stavu kontroly záloh (SERVICES-3) pro STATUS podle details["backup"],
+# nejvýš 8 znaků, aby se "BACKUP NO TIMER" vešlo do 15 znaků. Stará záloha nemá
+# vlastní text: ukáže BACKUP OVERDUE z FAULT_TEXT.
+BACKUP_TEXT = {
+    FAILED: "FAILED",  # poslední pokus selhal
+    NO_JOB: "NO JOB",  # nastavená služba neexistuje, je maskovaná nebo nejde načíst
+    NO_TIMER: "NO TIMER",  # nastavený timer neexistuje, je maskovaný nebo není aktivní
+    RUNNING: "RUNNING",  # úloha běží a předchozí úspěch není doložený (UNKNOWN)
+    SKIPPED: "SKIPPED",  # ExecCondition úlohu přeskočila a předchozí úspěch není doložený (UNKNOWN)
 }
 
 # Proč je stav UNKNOWN, rozlišené jen podle času, ne podle textu summary.
@@ -257,7 +269,8 @@ def status_texts(result, now):
     # (SERVICES-1, SERVICES-2); prošlý výsledek je nemá (effective() je smaže),
     # takže zůstane STALE.
     health = current.details.get(HEALTH)
-    reason = HEALTH_TEXT.get((current.state, health))
+    # Výsledky kontroly záloh mají místo "health" details "backup" (SERVICES-3).
+    reason = HEALTH_TEXT.get((current.state, health)) or BACKUP_TEXT.get(current.details.get(BACKUP))
     if current.measurement is not None:
         detail = measurement_text(current.measurement)  # potvrzená závada ukáže naměřenou hodnotu
     elif current.state is State.UNKNOWN:
@@ -265,12 +278,14 @@ def status_texts(result, now):
         # prošlá data poznají z času, ne z textu. Nepotvrzený výpadek (FAILING)
         # a neplatná odpověď (INVALID) nejsou totéž co chybějící data (NO DATA).
         detail = STALE if now >= current.expires_monotonic else (reason or NO_DATA)
-    elif current.state in ALERT_STATES and current.id in FAULT_TEXT and health != UP:
+    elif current.state in ALERT_STATES and current.id in FAULT_TEXT and health != UP and (
+            reason is None or health == DOWN):
         # NAS OFFLINE i při potvrzeném výpadku z kontroly NAS; když už NAS
         # odpovídá a výpadek jen odeznívá, hláška by neplatila (NAS RECOVER níže).
+        # BACKUP OVERDUE jen u staré zálohy, ne u jiného doloženého důvodu (FAILED).
         return [FAULT_TEXT[current.id], name]
     elif current.state in ALERT_STATES and reason is not None:
-        detail = reason  # ANIMEDB DOWN, ANIMEDB RECOVER, NAS RECOVER
+        detail = reason  # ANIMEDB DOWN, ANIMEDB RECOVER, NAS RECOVER, BACKUP FAILED
     elif current.state is State.NA:
         detail = STATE_TEXT[State.NA]
     else:

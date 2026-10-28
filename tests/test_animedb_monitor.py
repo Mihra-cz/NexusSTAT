@@ -579,7 +579,7 @@ class DisplayAndRgbTest(unittest.TestCase):
                     self.assertEqual(signal.steps, ((State.ERROR, 3),))
                     self.assertEqual(symbol, ALERT_SYMBOL)
                 else:
-                    # NEXUS a BACKUP nemají kolektor (UNKNOWN), proto "?" i při zdravé AnimeDB.
+                    # NEXUS nemá kolektor (UNKNOWN), proto "?" i při zdravé AnimeDB.
                     self.assertEqual(symbol, UNKNOWN_SYMBOL)
 
     def test_expired_result_is_unknown_never_ok(self):

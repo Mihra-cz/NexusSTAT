@@ -2,10 +2,11 @@
 
 Definice id výsledků služeb (služby Nexusu, AnimeDB, NAS, zálohy) a krátké
 názvy pro displej. Sám nesbírá žádná data. Skutečné kolektory služeb jsou
-zatím dva, oba jen po výslovném zapnutí v konfiguraci: healthcheck AnimeDB
-přes HTTP /health (animedb_monitor.py, SERVICES-1) a dostupnost NAS spojením
-TCP na port SMB (nas_monitor.py, SERVICES-2). Sdílené SMB složky, Restic ani
-služby Nexusu se nečtou.
+zatím tři, všechny jen po výslovném zapnutí v konfiguraci: healthcheck AnimeDB
+přes HTTP /health (animedb_monitor.py, SERVICES-1), dostupnost NAS spojením
+TCP na port SMB (nas_monitor.py, SERVICES-2) a výsledek existující zálohovací
+úlohy ze systemd (backup_monitor.py, SERVICES-3). Sdílené SMB složky, repozitář
+Resticu ani služby Nexusu se nečtou.
 """
 
 import errno
@@ -16,7 +17,7 @@ from .core import CheckResult, State
 NEXUS_SERVICES_ID = "service.nexus"  # souhrn služeb hostitele Nexus
 ANIMEDB_ID = "service.animedb"
 NAS_ID = "service.nas"  # dostupnost NAS; jiné kontroly NAS dostanou vlastní id
-BACKUP_ID = "service.backup"  # stáří poslední zálohy (Restic)
+BACKUP_ID = "service.backup"  # výsledek a stáří poslední zálohovací úlohy (systemd, ne obsah Resticu)
 
 # Řádky stránky SERVICES v tomto pořadí; krátké anglické názvy i pro STATUS.
 SERVICE_LABELS = {
@@ -33,6 +34,7 @@ SERVICE_LABELS = {
 OPTIONAL_SERVICES = {
     ANIMEDB_ID: "AnimeDB: sledování vypnuto",
     NAS_ID: "NAS: sledování vypnuto",
+    BACKUP_ID: "Záloha: sledování vypnuto",
 }
 
 # Výsledek jedné kontroly dostupnosti služby (AnimeDB, NAS); zároveň hodnota
