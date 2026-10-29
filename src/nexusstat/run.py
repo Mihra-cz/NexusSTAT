@@ -12,6 +12,9 @@ na nastavenou adresu /health zkontroluje dostupnost AnimeDB, se zapnutým
 dostupnost NAS (bez přihlášení, bez sdílených složek a mountů), se zapnutým
 [services.backup] (výchozí vypnuto) jedním read-only dotazem `systemctl show`
 výsledek existující zálohovací úlohy (bez spouštění zálohy a bez Resticu).
+Služby se přitom skutečně kontrolují jen ve svém termínu (SCHED-1, Scheduled):
+AnimeDB po 15 min, NAS po 30 min, zálohy podle plánu timeru; mezi termíny
+se ukazuje poslední výsledek se svou původní platností.
 Ukončení: Ctrl+C nebo SIGTERM.
 Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nepřistupuje
 k displeji, mountům NAS ani jinému hardwaru a do sítě posílá jen zapnuté kontroly AnimeDB a NAS. Se zapnutou historií
@@ -116,8 +119,59 @@ class Collectors:
         return results
 
 
+class Scheduled:
+    """Kolektor služby, který skutečně měří jen ve svém termínu (SCHED-1).
+
+    Smyčka volá collect() každý takt, ale kontrola služby proběhne jen při
+    dosažení termínu, který kolektor určí po každé skutečné kontrole
+    (`monitor.next_check(now)`). Mezi termíny se vrací poslední výsledky beze
+    změny, tedy se stejným časem měření i platností: nic se neprodlužuje
+    a AlarmEvaluator, RGB i historie je podle expires_monotonic poznají jako
+    totéž měření. Kolektor může mezi termíny výsledek jen přepočítat bez
+    nového měření (`monitor.between`, u záloh stáří posledního úspěchu).
+    Zmeškaný termín (pozastavený proces) se nedohání: proběhne jedna kontrola
+    a další termín se počítá od ní. Neočekávaná výjimka kolektoru je UNKNOWN
+    do dalšího termínu, nikdy důvod k častějšímu měření.
+    """
+
+    def __init__(self, monitor, validity_seconds):
+        self.monitor = monitor
+        self.labels = monitor.labels
+        self.simulated = monitor.simulated
+        # Rezerva za termínem další kontroly pro výsledky po výjimce; zároveň
+        # platnost, jakou mají ostatní kolektory (Collectors ji vyžaduje shodnou).
+        self.validity_seconds = validity_seconds
+        self.results = None
+        self.due = None
+        self.checks = 0  # počet skutečných kontrol od spuštění
+
+    def collect(self, now, observed_utc):
+        if self.results is not None and now < self.due:
+            between = getattr(self.monitor, "between", None)
+            if between is not None:
+                self.results = between(self.results, now, observed_utc)
+            return self.results
+        self.checks += 1
+        error = None
+        try:
+            results = self.monitor.collect(now, observed_utc)
+        except Exception as caught:
+            # Ctrl+C (KeyboardInterrupt) není Exception a projde až do smyčky.
+            error = caught
+        self.due = self.monitor.next_check(now)
+        if error is not None:
+            results = failed_results(self.monitor, now, observed_utc, self.due - now + self.validity_seconds,
+                                     f"měření selhalo ({type(error).__name__})", failure=failure_name(error))
+        self.results = results
+        return results
+
+
 def live_monitor(config):
-    """Skutečné read-only kolektory: systém, ventilátor CPU, síť a volitelně AnimeDB, NAS a zálohy podle konfigurace."""
+    """Skutečné read-only kolektory: systém, ventilátor CPU, síť a volitelně AnimeDB, NAS a zálohy podle konfigurace.
+
+    Kolektory služeb běží přes Scheduled: skutečně se kontrolují jen ve svém
+    termínu (SCHED-1), ne při každém taktu smyčky.
+    """
     validity = config.collector.validity_seconds
     monitors = [
         SystemMonitor(validity_seconds=validity),
@@ -129,28 +183,38 @@ def live_monitor(config):
     if animedb.enabled:
         # Healthcheck se volá jen při výslovně zapnutém sledování (SERVICES-1);
         # jinak kolektor vůbec nevznikne, nic se nepřipojuje a AnimeDB zůstává N/A.
-        monitors.append(AnimeDbMonitor(validity_seconds=validity, url=animedb.url,
-                                       timeout_seconds=animedb.timeout_seconds))
+        # Výsledek platí do další plánované kontroly a ještě obvyklou platnost.
+        monitors.append(Scheduled(AnimeDbMonitor(
+            validity_seconds=animedb.interval_seconds + validity, url=animedb.url,
+            timeout_seconds=animedb.timeout_seconds, interval_seconds=animedb.interval_seconds), validity))
     nas = config.services.nas
     if nas.enabled:
         # Pokus o spojení TCP jen při výslovně zapnutém sledování (SERVICES-2);
         # jinak kolektor vůbec nevznikne, nic se nepřipojuje a NAS zůstává N/A.
-        monitors.append(NasMonitor(validity_seconds=validity, host=nas.host, port=nas.port,
-                                   timeout_seconds=nas.timeout_seconds))
+        monitors.append(Scheduled(NasMonitor(
+            validity_seconds=nas.interval_seconds + validity, host=nas.host, port=nas.port,
+            timeout_seconds=nas.timeout_seconds, interval_seconds=nas.interval_seconds), validity))
     backup = config.services.backup
     if backup.enabled:
         # Dotaz na systemd jen při výslovně zapnutém sledování (SERVICES-3); jinak
         # kolektor vůbec nevznikne, nic se nespouští a BACKUP zůstává N/A.
-        monitors.append(BackupMonitor(validity_seconds=validity, unit=backup.unit, timer=backup.timer,
-                                      timeout_seconds=backup.timeout_seconds))
+        # Platnost výsledku určuje plán dalšího dotazu (BackupMonitor.plan).
+        monitors.append(Scheduled(BackupMonitor(validity_seconds=validity, unit=backup.unit, timer=backup.timer,
+                                                timeout_seconds=backup.timeout_seconds), validity))
     return Collectors(*monitors)
 
 
-def result_text(result):
+def result_text(result, observed_utc=None):
     # U závady je ve výpisu vidět, které hodnoty se týká; ostatní text beze změny.
-    if result.state in ALERT_STATES:
-        return f"{result.summary} [{result.state.value}]"
-    return result.summary
+    text = f"{result.summary} [{result.state.value}]" if result.state in ALERT_STATES else result.summary
+    # Výsledek služby z dřívější kontroly (SCHED-1) nesmí vedle času řádku
+    # vypadat jako právě ověřený: řádek přizná jeho stáří.
+    age = 0 if observed_utc is None else (observed_utc - result.observed_utc).total_seconds()
+    if age >= 3600:
+        return f"{text} (ověřeno před {age / 3600:.1f} h)"
+    if age >= 60:
+        return f"{text} (ověřeno před {age // 60:.0f} min)"
+    return text
 
 
 def format_line(results, now, observed_utc, text):
@@ -263,7 +327,7 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
                 results = [*results, history_link.check(now, observed_utc),
                            history_link.snapshot_check(now, observed_utc)]
             if text is None:
-                text = " | ".join(result_text(result) for result in results)
+                text = " | ".join(result_text(result, observed_utc) for result in results)
             measurements += 1
             output(format_line(results, now, observed_utc, text))
 

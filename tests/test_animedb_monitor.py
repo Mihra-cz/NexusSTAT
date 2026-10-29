@@ -22,7 +22,7 @@ from nexusstat.core import CheckResult, State, active_problems, effective
 from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, home_symbol
 from nexusstat.oled_text import service_rows, status_texts
 from nexusstat.preview import LIVE, PreviewSession, SessionClock
-from nexusstat.run import COLLECTOR_FAILURE, Collectors, live_monitor, run_loop
+from nexusstat.run import COLLECTOR_FAILURE, Collectors, Scheduled, live_monitor, run_loop
 from nexusstat.services import ANIMEDB_ID, complete_service_results
 from nexusstat.system_monitor import LABELS as SYSTEM_LABELS
 
@@ -637,11 +637,16 @@ class ConfigurationTest(unittest.TestCase):
         config = Config(collector=CollectorConfig(interval_seconds=5),
                         services=ServicesConfig(AnimeDbConfig(enabled=True, url=URL, timeout_seconds=1.5)))
         monitor = live_monitor(config)  # jen vytvoření, nic se nepřipojuje
-        health = monitor.monitors[-1]
+        scheduled = monitor.monitors[-1]
+        self.assertIsInstance(scheduled, Scheduled)  # kontrola jen jednou za interval (SCHED-1)
+        health = scheduled.monitor
         self.assertIsInstance(health, AnimeDbMonitor)
-        self.assertEqual((health.url, health.timeout_seconds, health.validity_seconds), (URL, 1.5, 15))
+        # Výsledek platí do další kontroly (výchozí 15 min) a ještě obvyklou platnost 3 taktů.
+        self.assertEqual((health.url, health.timeout_seconds, health.interval_seconds, health.validity_seconds),
+                         (URL, 1.5, 900, 900 + 15))
+        self.assertEqual(scheduled.validity_seconds, 15)
         self.assertIs(health.connect, socket.create_connection)
-        self.assertEqual(sum(isinstance(m, AnimeDbMonitor) for m in monitor.monitors), 1)
+        self.assertEqual(sum(isinstance(getattr(m, "monitor", m), AnimeDbMonitor) for m in monitor.monitors), 1)
         self.assertIn(ANIMEDB_ID, monitor.labels)
         self.assertFalse(monitor.simulated)
 

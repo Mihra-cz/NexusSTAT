@@ -24,11 +24,17 @@ Potvrzování je společné s healthcheckem AnimeDB (services.OutageConfirmation
 výpadek po DEFAULT_CONFIRM_COUNT po sobě jdoucích kontrolách s výpadkem,
 odeznění po DEFAULT_CLEAR_COUNT úspěšných; neznámý výsledek ani mezera
 v měření výpadek nepotvrdí ani nevyřeší, jen přeruší řadu.
+
+Od SCHED-1 se kontroluje jen jednou za `interval_seconds` (výchozí 30 min,
+run.Scheduled); po prvním neúspěchu nejvýš dva rychlé pokusy s odstupem 30 s
+a po prvním úspěchu po potvrzeném výpadku jeden.
+Výsledek platí do další plánované kontroly plus rezervu (`validity_seconds`
+nastaví run.live_monitor).
 """
 
 import socket
 
-from .config import check_health_timeout, check_nas_host, check_port
+from .config import NAS_INTERVAL_DEFAULT, check_health_timeout, check_nas_host, check_port, check_service_interval
 from .core import CheckResult, is_finite_number
 from .services import CAUSE, DOWN, HEALTH, NAS_ID, UNREACHABLE_ERRNOS, UP, OutageConfirmation
 
@@ -55,16 +61,19 @@ class NasMonitor:
 
     labels = LABELS  # id výsledků, které collect() vrací (pro run.failed_results)
 
-    def __init__(self, validity_seconds, host, port, timeout_seconds, connect=socket.create_connection):
+    def __init__(self, validity_seconds, host, port, timeout_seconds, connect=socket.create_connection,
+                 interval_seconds=NAS_INTERVAL_DEFAULT):
         if not is_finite_number(validity_seconds) or validity_seconds <= 0:
             raise ValueError(f"validity_seconds musí být kladný počet sekund, ne {validity_seconds!r}")
         check_nas_host(host)  # ConfigError je ValueError
         check_port(port)
         check_health_timeout(timeout_seconds)
+        check_service_interval(interval_seconds)
         self.validity_seconds = validity_seconds
         self.host = host
         self.port = port
         self.timeout_seconds = timeout_seconds
+        self.interval_seconds = interval_seconds
         self.connect = connect
         self.simulated = connect is not socket.create_connection
         self.outage = OutageConfirmation(validity_seconds)
@@ -75,6 +84,10 @@ class NasMonitor:
         state, text, details = self.outage.check(self.probe, now)
         return [CheckResult(NAS_ID, state, f"{LABELS[NAS_ID]}: {text}", observed_utc,
                             now + self.validity_seconds, simulated=self.simulated, details=details)]
+
+    def next_check(self, now):
+        """Monotónní čas další skutečné kontroly (run.Scheduled); rychle jen při podezření na výpadek."""
+        return now + self.outage.next_delay(self.interval_seconds)
 
     def probe(self):
         """(výsledek, popis, details) jednoho pokusu o spojení; None = výsledek nic nedokládá."""

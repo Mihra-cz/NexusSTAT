@@ -1220,6 +1220,17 @@ class LossSummaryTest(RecorderTest):
         self.recorder.finish_run(at(BASE + 10))
         self.assertEqual(len(self.summaries()), 1)  # nic se nezapočetlo dvakrát
 
+    def test_long_service_validity_does_not_delay_summary(self):
+        # SCHED-1: výsledek služby platí až do své další kontroly (u záloh až den). Kdyby
+        # posunul čas měření, další souhrn ztrát by přišel až za den místo za hodinu.
+        backup = CheckResult("service.backup", State.OK, "Záloha: ok", at(BASE), BASE + 24 * 3600 + VALIDITY,
+                             simulated=False)
+        self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS), backup],
+                   [result(CPU_TEMP_ID, State.INFO, 51.0, CELSIUS, cycle=BASE + 0.4)])  # same_second: první souhrn
+        self.write([result(CPU_TEMP_ID, State.INFO, 52.0, CELSIUS, ts=BASE + 3610), backup],
+                   [result(CPU_TEMP_ID, State.INFO, 53.0, CELSIUS, ts=BASE + 3610, cycle=BASE + 3610.4)])
+        self.assertEqual([ts for ts, _ in self.summaries()], [BASE, BASE + 3610])
+
     def test_simulated_result_does_not_move_summary_clock(self):
         self.write([result(CPU_TEMP_ID, State.INFO, 50.0, CELSIUS),
                     result(CPU_TEMP_ID, State.INFO, 51.0, CELSIUS, cycle=BASE + 0.4)])  # same_second: první souhrn

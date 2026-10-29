@@ -26,7 +26,7 @@ from nexusstat.core import CheckResult, State, active_problems, effective
 from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, home_symbol
 from nexusstat.oled_text import service_rows, status_texts
 from nexusstat.preview import LIVE, PreviewSession, SessionClock
-from nexusstat.run import COLLECTOR_FAILURE, Collectors, live_monitor, run_loop
+from nexusstat.run import COLLECTOR_FAILURE, Collectors, Scheduled, live_monitor, run_loop
 from nexusstat.services import BACKUP_ID, complete_service_results
 from nexusstat.system_monitor import LABELS as SYSTEM_LABELS
 
@@ -141,11 +141,13 @@ class CommandTest(unittest.TestCase):
         [(args, kwargs)] = systemctl.calls
         self.assertEqual(args, [SYSTEMCTL, "show", "--no-pager", "--no-ask-password",
                                 "--property=Id,Names,LoadState,ActiveState,SubState,Result,ExecMainCode,"
-                                "ExecMainStatus,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic",
+                                "ExecMainStatus,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic,"
+                                "NextElapseUSecRealtime",
                                 "--", UNIT, TIMER])
         self.assertEqual(SYSTEMCTL, "/usr/bin/systemctl")  # nehledá se v PATH
+        # TZ=UTC jen pro jednoznačný tvar plánu timeru (SCHED-1); prostředí je jinak prázdné.
         self.assertEqual(kwargs, {"stdin": subprocess.DEVNULL, "capture_output": True, "timeout": TIMEOUT,
-                                  "env": {"LC_ALL": "C"}, "check": False})
+                                  "env": {"LC_ALL": "C", "TZ": "UTC"}, "check": False})
         self.assertNotIn("shell", kwargs)
         # Žádný příkaz, který by jednotku spustil, zastavil nebo změnil.
         for word in ("start", "stop", "restart", "reset-failed", "enable", "disable", "kill", "sudo"):
@@ -227,8 +229,9 @@ class StateTest(unittest.TestCase):
         result = check(FakeSystemctl(SUCCESS))
         self.assertEqual(outcome(result), (State.OK, SUCCEEDED))
         self.assertEqual(result.summary, "Záloha: úloha naposledy skončila úspěšně před 3.0 h")
+        # Bez timeru není plán: výsledek platí do náhradního dotazu za den a ještě VALIDITY (SCHED-1).
         self.assertEqual((result.id, result.observed_utc, result.expires_monotonic),
-                         (BACKUP_ID, OBSERVED, END + 3 * HOUR + VALIDITY))
+                         (BACKUP_ID, OBSERVED, END + 3 * HOUR + 24 * HOUR + VALIDITY))
 
     def test_failed_last_attempt_without_known_success_is_error(self):
         for block in (FAILURE, service(result="signal", code=2, status=15, active="failed", sub="failed"),
@@ -717,12 +720,15 @@ class ConfigurationTest(unittest.TestCase):
                         services=ServicesConfig(backup=BackupConfig(True, UNIT, TIMER, 1.5)))
         with mock.patch("subprocess.Popen", side_effect=AssertionError("nic se nespouští")):
             monitor = live_monitor(config)  # jen vytvoření
-        backup = monitor.monitors[-1]
+        scheduled = monitor.monitors[-1]
+        self.assertIsInstance(scheduled, Scheduled)  # dotaz jen v plánovaném termínu (SCHED-1)
+        backup = scheduled.monitor
         self.assertIsInstance(backup, BackupMonitor)
         self.assertEqual((backup.unit, backup.timer, backup.timeout_seconds, backup.validity_seconds),
                          (UNIT, TIMER, 1.5, 15))
+        self.assertEqual(scheduled.validity_seconds, 15)
         self.assertIs(backup.run, subprocess.run)
-        self.assertEqual(sum(isinstance(m, BackupMonitor) for m in monitor.monitors), 1)
+        self.assertEqual(sum(isinstance(getattr(m, "monitor", m), BackupMonitor) for m in monitor.monitors), 1)
         self.assertIn(BACKUP_ID, monitor.labels)
         self.assertFalse(monitor.simulated)
 

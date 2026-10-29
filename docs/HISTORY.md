@@ -6,7 +6,7 @@ Vychází z požadavků v `REQUIREMENTS.md` (Historie a databáze SQLite) a ze s
 
 ## 1. Co dnes existuje a co se bude ukládat
 
-`CheckResult` má `id`, `state`, `summary` (česky, jen k zobrazení), `observed_utc` (UTC), `expires_monotonic` (monotónní čas běžícího procesu), `simulated`, volitelně `measurement` (`value`, `unit`) a `details` (krátké texty ASCII). Smyčka `run_loop` změří všechny kontroly jednou za interval (výchozí 10 s) se společným `observed_utc` a výsledky projdou `AlarmEvaluator`em.
+`CheckResult` má `id`, `state`, `summary` (česky, jen k zobrazení), `observed_utc` (UTC), `expires_monotonic` (monotónní čas běžícího procesu), `simulated`, volitelně `measurement` (`value`, `unit`) a `details` (krátké texty ASCII). Smyčka `run_loop` změří všechny kontroly jednou za interval (výchozí 10 s) se společným `observed_utc` a výsledky projdou `AlarmEvaluator`em. Od SCHED-1 jsou výjimkou kontroly služeb (`service.animedb`, `service.nas`, `service.backup`): skutečně se měří jen ve svém termínu a mezi termíny smyčka předává tentýž výsledek se starším `observed_utc` a původní `expires_monotonic`. Zapisovač ho pozná jako totéž měření (`ChangeTracker` při předání nevytvoří změnu, `HistoryRecorder` ho započte jako duplicitu) a číselnou řadu služby nemají, takže se nic nezapíše znovu jako nové. Časovou základnu souhrnu ztrát (`history.rejected`, nejvýš jednou za hodinu) určuje jen první výsledek měření, protože platnost výsledků služeb sahá až k jejich další kontrole.
 
 | Kontrola (`id`) | Údaj | Kam v historii |
 | --- | --- | --- |

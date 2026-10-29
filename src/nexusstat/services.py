@@ -49,6 +49,12 @@ INVALID = "invalid"
 # Chyby spojení, které dokládají nedostupnost adresy nebo sítě (ne chybu na této straně).
 UNREACHABLE_ERRNOS = (errno.EHOSTUNREACH, errno.ENETUNREACH)
 
+# Odstup rychlých potvrzovacích pokusů (SCHED-1) po prvním neúspěchu a po prvním
+# úspěchu po potvrzeném výpadku. Jinak se služba kontroluje jen jednou za svůj
+# interval, takže by potvrzení výpadku třemi kontrolami trvalo hodinu i déle
+# a potvrzení obnovy dvěma další celý interval.
+CONFIRM_RETRY_SECONDS = 30
+
 
 class OutageConfirmation:
     """Potvrzení výpadku služby opakovanými kontrolami, stejným principem jako alarmové prahy.
@@ -110,6 +116,28 @@ class OutageConfirmation:
         # Neplatná odpověď nebo nemožná kontrola: výpadek nepotvrdí ani nevyřeší.
         self.failures = self.successes = 0
         return State.UNKNOWN, ""
+
+    def next_delay(self, interval_seconds):
+        """Za kolik sekund má přijít další skutečná kontrola (run.Scheduled, SCHED-1).
+
+        Rychle (CONFIRM_RETRY_SECONDS) jen tehdy, když rozpracované potvrzení
+        čeká na další shodný výsledek:
+
+        * začatý, ještě nepotvrzený výpadek: nejvýš DEFAULT_CONFIRM_COUNT − 1
+          = 2 pokusy, pak je výpadek potvrzený (`down`),
+        * první úspěch po potvrzeném výpadku: nejvýš DEFAULT_CLEAR_COUNT − 1
+          = 1 pokus, pak je obnova potvrzená.
+
+        Opačný nebo neznámý výsledek rozpracovanou řadu ukončí (confirm() vynuluje
+        její počítadlo) a další kontrola jde pomalým intervalem služby, takže se
+        rychlé pokusy nemohou opakovat donekonečna: novou řadu může začít jen
+        pomalá kontrola.
+        """
+        if self.down:
+            confirming = self.successes > 0  # obnova začala, ještě není potvrzená
+        else:
+            confirming = self.failures > 0  # výpadek začal, ještě není potvrzený
+        return CONFIRM_RETRY_SECONDS if confirming else interval_seconds
 
 
 def complete_service_results(results, observed_utc, expires_monotonic, monitored=()):

@@ -85,16 +85,21 @@ enabled = false
 # Při `enabled = true` je povinná `url`: jen http://<IP adresa>[:port]/…/health
 # (název hostitele ne, DNS by nemělo časový limit; bez přihlašovacích údajů,
 # query a fragmentu). Skutečná adresa patří jen do lokální konfigurace mimo Git.
-# Při každém měření jediný GET bez proxy z prostředí a bez přesměrování;
+# Při každé kontrole jediný GET bez proxy z prostředí a bez přesměrování;
 # celá kontrola nejvýš `timeout_seconds` (číslo v rozsahu (0, 5], výchozí 2).
+# Kontroluje se jen jednou za `interval_seconds` (celé sekundy 60–3600,
+# výchozí 900 = 15 min; SCHED-1), mezi kontrolami platí poslední výsledek.
 # Stavy: HTTP 200 a {"status": "ok"} = OK; výpadek (odmítnuto, timeout,
 # přerušeno, nedostupná adresa, HTTP 5xx) = ERROR až po 3 po sobě jdoucích
-# kontrolách (do té doby UNKNOWN, bez blikání), odezní po 2 úspěšných;
+# kontrolách (do té doby UNKNOWN, bez blikání; po prvním neúspěchu nejvýš dva
+# rychlé pokusy po 30 s), odezní po 2 úspěšných kontrolách po sobě (po prvním
+# úspěchu jeden rychlý pokus za 30 s);
 # jiná nebo neplatná odpověď = UNKNOWN. Docker ani jeho socket se nepoužívá.
 [services.animedb]
 enabled = false
 # url = "http://192.0.2.10:8080/health"
 timeout_seconds = 2
+interval_seconds = 900
 
 # Dostupnost NAS spojením TCP na port SMB (SERVICES-2). Výchozí stav: vypnuto,
 # nikam se nepřipojuje a NAS je N/A.
@@ -102,24 +107,34 @@ timeout_seconds = 2
 # (název hostitele ne, DNS by nemělo časový limit; bez zóny %rozhraní, ne 0.0.0.0
 # ani ::). Skutečná adresa patří jen do lokální konfigurace mimo Git.
 # `port` celé číslo 1–65535 (výchozí 445), `timeout_seconds` číslo v rozsahu (0, 5].
-# Při každém měření jediný pokus o spojení TCP, který se hned zavře: žádné
+# Při každé kontrole jediný pokus o spojení TCP, který se hned zavře: žádné
 # přihlášení SMB, sdílené složky, čtení souborů ani přístup k mountům (autofs).
+# Kontroluje se jen jednou za `interval_seconds` (celé sekundy 60–3600,
+# výchozí 1800 = 30 min; SCHED-1), mezi kontrolami platí poslední výsledek.
 # Stavy: spojení navázáno = OK (jen „služba SMB přijímá spojení“, ne dostupnost
 # sdílených složek, čitelnost dat ani zápis záloh); odmítnuto, timeout nebo
 # nedostupná síť či adresa = ERROR až po 3 po sobě jdoucích kontrolách (do té
-# doby UNKNOWN, bez blikání), odezní po 2 úspěšných; chyba na této straně = UNKNOWN.
+# doby UNKNOWN, bez blikání; po prvním neúspěchu nejvýš dva rychlé pokusy po
+# 30 s), odezní po 2 úspěšných po sobě (po prvním úspěchu jeden rychlý pokus
+# za 30 s); chyba na této straně = UNKNOWN.
 [services.nas]
 enabled = false
 # host = "192.0.2.20"
 port = 445
 timeout_seconds = 2
+interval_seconds = 1800
 
 # Výsledek existující zálohovací úlohy ze systemd (SERVICES-3). Výchozí stav:
 # vypnuto, nic se nespouští a BACKUP je N/A.
 # Při `enabled = true` je povinná `unit` (služba .service), `timer` je volitelný.
 # Skutečné názvy jednotek patří jen do lokální konfigurace mimo Git.
-# Při každém měření jediný read-only dotaz `/usr/bin/systemctl show` (bez shellu,
+# Při každé kontrole jediný read-only dotaz `/usr/bin/systemctl show` (bez shellu,
 # sudo, journalu, Resticu, jeho repozitáře a NAS), limit `timeout_seconds` (0, 5].
+# Dotaz se neopakuje periodicky (SCHED-1): po spuštění, po předpokládaném konci
+# příštího běhu podle plánu timeru, při běžící úloze po 15 min a bez spolehlivého
+# plánu nejvýš jednou denně, po přechodném selhání dotazu jeden opravný za
+# 60 min; interval se proto nenastavuje. Přechod přes 26/50 h
+# se mezi dotazy přepočítá z posledního doloženého úspěchu.
 # Stavy: doložený úspěšný konec úlohy (Result=success sám nestačí) nejvýš 26 h
 # = OK, nad 26 h WARNING, nad 50 h ERROR; nový neúspěch při čerstvé záloze
 # WARNING, bez doloženého úspěchu ERROR; neexistující nebo maskovaná jednotka

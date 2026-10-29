@@ -1395,7 +1395,7 @@ class HistoryRecorder:
         self._gate = None
         self._loss = {}  # důvod -> [počet, první ts, poslední ts]: ztráty ještě nezapsané v souhrnu
         self._loss_reported = None  # monotónní čas posledního souhrnu
-        self._monotonic = None  # nejnovější monotónní čas měření (expires_monotonic)
+        self._monotonic = None  # nejnovější monotónní čas měření (expires_monotonic prvního výsledku)
         self._latest = None  # (ts, kvalita) nejnovějšího výsledku: čas souhrnu ztrát
         self._seen = {}  # (check_id, simulated) -> poslední zpracovaný výsledek: opakované odeslání
         self._committing = None  # (číslo dávky, výsledek pokusu) posledního pokusu, který došel ke COMMIT
@@ -1540,12 +1540,16 @@ class HistoryRecorder:
                     max(_utc_seconds(result.observed_utc), 1), "unsynced", "history.simulated_rejected", "WARNING",
                     "simulovaná data se do historie nezapisují", check_id=result.id))
                 continue
-            if self._monotonic is None or result.expires_monotonic > self._monotonic:
-                self._monotonic = result.expires_monotonic
             ts = _utc_seconds(result.observed_utc)
             quality = _trusted_quality(ts, ts_quality)
             self._latest = (ts, quality)
             if not clock_checked:
+                # Časová základna měření je jen první skutečný výsledek (systémový
+                # kolektor se stálou platností). Služby mají od SCHED-1 platnost
+                # až do své další kontroly (u záloh až den), takže maximum přes
+                # všechny výsledky by čas měření posunulo o hodiny dopředu.
+                if self._monotonic is None or result.expires_monotonic > self._monotonic:
+                    self._monotonic = result.expires_monotonic
                 self._check_clock(batch, result, ts, quality)
                 clock_checked = True
             if track_changes:

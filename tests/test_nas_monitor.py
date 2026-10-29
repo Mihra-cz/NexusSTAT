@@ -25,7 +25,7 @@ from nexusstat.nas_monitor import NasMonitor, connect_once
 from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, home_symbol
 from nexusstat.oled_text import service_rows, status_texts
 from nexusstat.preview import LIVE, PreviewSession, ScriptedConnection, SessionClock
-from nexusstat.run import COLLECTOR_FAILURE, Collectors, live_monitor, run_loop
+from nexusstat.run import COLLECTOR_FAILURE, Collectors, Scheduled, live_monitor, run_loop
 from nexusstat.services import (ANIMEDB_ID, CAUSE, DOWN, HEALTH, NAS_ID, UP, OutageConfirmation,
                                 complete_service_results)
 from nexusstat.system_monitor import LABELS as SYSTEM_LABELS
@@ -675,19 +675,24 @@ class ConfigurationTest(unittest.TestCase):
                         services=ServicesConfig(nas=NasConfig(enabled=True, host=HOST, port=4450,
                                                               timeout_seconds=1.5)))
         monitor = live_monitor(config)  # jen vytvoření, nic se nepřipojuje
-        nas = monitor.monitors[-1]
+        scheduled = monitor.monitors[-1]
+        self.assertIsInstance(scheduled, Scheduled)  # kontrola jen jednou za interval (SCHED-1)
+        nas = scheduled.monitor
         self.assertIsInstance(nas, NasMonitor)
-        self.assertEqual((nas.host, nas.port, nas.timeout_seconds, nas.validity_seconds), (HOST, 4450, 1.5, 15))
+        # Výsledek platí do další kontroly (výchozí 30 min) a ještě obvyklou platnost 3 taktů.
+        self.assertEqual((nas.host, nas.port, nas.timeout_seconds, nas.interval_seconds, nas.validity_seconds),
+                         (HOST, 4450, 1.5, 1800, 1800 + 15))
         self.assertIs(nas.connect, socket.create_connection)
-        self.assertEqual(sum(isinstance(m, NasMonitor) for m in monitor.monitors), 1)
+        inner = [getattr(m, "monitor", m) for m in monitor.monitors]
+        self.assertEqual(sum(isinstance(m, NasMonitor) for m in inner), 1)
         # AnimeDB zůstává vypnutá a N/A: zapnutí NAS ji nijak neovlivní.
-        self.assertFalse(any(isinstance(m, AnimeDbMonitor) for m in monitor.monitors))
+        self.assertFalse(any(isinstance(m, AnimeDbMonitor) for m in inner))
         self.assertEqual(set(monitor.labels) & {NAS_ID, ANIMEDB_ID}, {NAS_ID})
         self.assertFalse(monitor.simulated)
 
     def test_both_services_enabled(self):
         config = Config(services=ServicesConfig(AnimeDbConfig(True, ANIMEDB_URL), NasConfig(True, HOST)))
-        kinds = [type(m) for m in live_monitor(config).monitors]
+        kinds = [type(getattr(m, "monitor", m)) for m in live_monitor(config).monitors]
         self.assertEqual(kinds[-2:], [AnimeDbMonitor, NasMonitor])  # pořadí jako katalog služeb
 
     def test_terminal_lines_show_confirmation(self):

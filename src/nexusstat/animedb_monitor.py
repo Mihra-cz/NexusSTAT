@@ -23,6 +23,12 @@ DEFAULT_CONFIRM_COUNT po sobě jdoucích kontrolách s výpadkem a odezní po
 DEFAULT_CLEAR_COUNT po sobě jdoucích úspěšných kontrolách; neznámý výsledek ani
 mezera v měření výpadek nepotvrdí ani nevyřeší, jen přeruší řadu. Logika je
 společná s kontrolou NAS (services.OutageConfirmation).
+
+Od SCHED-1 se kontroluje jen jednou za `interval_seconds` (výchozí 15 min,
+run.Scheduled); po prvním neúspěchu nejvýš dva rychlé pokusy s odstupem 30 s
+a po prvním úspěchu po potvrzeném výpadku jeden.
+Výsledek platí do další plánované kontroly plus rezervu (`validity_seconds`
+nastaví run.live_monitor).
 """
 
 import http.client
@@ -32,7 +38,7 @@ import socket
 import time
 
 from . import __version__
-from .config import check_health_timeout, check_health_url
+from .config import ANIMEDB_INTERVAL_DEFAULT, check_health_timeout, check_health_url, check_service_interval
 from .core import CheckResult, is_finite_number
 # Pevné texty `health`/`cause` a chyby nedostupnosti jsou společné s kontrolou NAS.
 from .services import ANIMEDB_ID, CAUSE, DOWN, HEALTH, INVALID, UNREACHABLE_ERRNOS, UP, OutageConfirmation
@@ -134,14 +140,17 @@ class AnimeDbMonitor:
 
     labels = LABELS  # id výsledků, které collect() vrací (pro run.failed_results)
 
-    def __init__(self, validity_seconds, url, timeout_seconds, connect=socket.create_connection, clock=time.monotonic):
+    def __init__(self, validity_seconds, url, timeout_seconds, connect=socket.create_connection, clock=time.monotonic,
+                 interval_seconds=ANIMEDB_INTERVAL_DEFAULT):
         if not is_finite_number(validity_seconds) or validity_seconds <= 0:
             raise ValueError(f"validity_seconds musí být kladný počet sekund, ne {validity_seconds!r}")
         check_health_url(url)  # ConfigError je ValueError
         check_health_timeout(timeout_seconds)
+        check_service_interval(interval_seconds)
         self.validity_seconds = validity_seconds
         self.url = url
         self.timeout_seconds = timeout_seconds
+        self.interval_seconds = interval_seconds
         self.connect = connect
         self.clock = clock
         self.simulated = connect is not socket.create_connection
@@ -152,6 +161,10 @@ class AnimeDbMonitor:
         state, text, details = self.outage.check(self.probe, now)
         return [CheckResult(ANIMEDB_ID, state, f"{LABELS[ANIMEDB_ID]}: {text}", observed_utc,
                             now + self.validity_seconds, simulated=self.simulated, details=details)]
+
+    def next_check(self, now):
+        """Monotónní čas další skutečné kontroly (run.Scheduled); rychle jen při podezření na výpadek."""
+        return now + self.outage.next_delay(self.interval_seconds)
 
     def probe(self):
         """(výsledek, popis, details) jednoho dotazu; None = kontrolu nešlo provést."""

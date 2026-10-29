@@ -1,11 +1,18 @@
 """Read-only kontrola výsledku existující zálohovací úlohy přes systemd (SERVICES-3).
 
-Při každém měření jediný dotaz `systemctl show` na výslovně nastavenou službu
+Při každé skutečné kontrole jediný dotaz `systemctl show` na výslovně nastavenou službu
 zálohy (`[services.backup] unit`) a volitelně její timer, s pevnými argumenty,
 bez shellu, s limitem `timeout_seconds` a jako běžný uživatel (bez sudo,
 polkit ani skupin). Nic se nespouští ani nemění: ani zálohovací úloha, ani
 Restic, jeho repozitář, přihlašovací údaje, NAS nebo journal. Při vypnutém
 sledování (výchozí stav) kolektor vůbec nevznikne (run.live_monitor).
+
+Od SCHED-1 se systemd neptá periodicky (run.Scheduled): hned po spuštění, pak
+po předpokládaném konci příštího běhu podle plánu timeru, při běžící úloze po
+15 min a bez spolehlivého plánu nejvýš jednou denně (`plan`); přechodně
+selhaný dotaz dostane jediný opravný pokus za 60 min. Mezi dotazy se
+jen přepočítá stáří posledního doloženého úspěchu, takže přechod přes 26/50 h
+se ukáže včas bez dalšího dotazu (`between`).
 
 Výsledkem je jediná kontrola `service.backup`. Kontroluje **úspěch úlohy
 systemd, ne obsah repozitáře Resticu**: OK znamená, že úloha naposledy doloženě
@@ -31,6 +38,7 @@ jako time.monotonic), takže ho nerozhodí posun systémového času.
 
 import subprocess
 import time
+from datetime import datetime, timezone
 
 from .config import check_health_timeout, check_unit_name
 from .core import SEVERITY_ORDER, CheckResult, State, is_finite_number
@@ -41,12 +49,26 @@ LABELS = {BACKUP_ID: "Záloha"}
 # Pevná cesta: systemctl se nehledá v PATH. Debian 13 má sloučené /usr.
 SYSTEMCTL = "/usr/bin/systemctl"
 # Vlastnosti jednotek. Pořadí ve výstupu systemd neodpovídá pořadí dotazu
-# a blok timeru obsahuje jen obecné vlastnosti (ověřeno se systemd 255).
-PROPERTIES = ("Id", "Names", "LoadState", "ActiveState", "SubState", "Result", "ExecMainCode",
-              "ExecMainStatus", "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic")
+# a každý blok obsahuje jen vlastnosti, které jednotka má: služba bez plánu
+# timeru, timer jen obecné a plán (ověřeno se systemd 255).
+SERVICE_PROPERTIES = ("Id", "Names", "LoadState", "ActiveState", "SubState", "Result", "ExecMainCode",
+                      "ExecMainStatus", "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic")
 TIMER_PROPERTIES = ("Id", "Names", "LoadState", "ActiveState")
-ENV = {"LC_ALL": "C"}
-MAX_OUTPUT_BYTES = 8192  # běžný výstup dvou jednotek má asi 600 B
+# Plán timeru slouží jen k plánování dotazů (SCHED-1), proto není povinný:
+# bez něj je plán neznámý a stav zálohy se nemění.
+PLAN_PROPERTY = "NextElapseUSecRealtime"
+PROPERTIES = SERVICE_PROPERTIES + (PLAN_PROPERTY,)
+# TZ=UTC: plán timeru se vypíše jako "Thu 2026-10-29 23:00:00 UTC" bez závislosti
+# na pásmu systému (monotónní časy v µs se tím nemění).
+ENV = {"LC_ALL": "C", "TZ": "UTC"}
+MAX_OUTPUT_BYTES = 8192  # běžný výstup dvou jednotek má asi 650 B
+
+# Plánování dotazů (SCHED-1): ne periodicky, ale podle údajů systemd.
+RECHECK_SECONDS = 15 * 60  # úloha běží, nebo plánovaný start právě nastal
+SETTLE_SECONDS = 5 * 60  # rezerva po předpokládaném konci (zpoždění spuštění, AccuracySec)
+PENDING_SECONDS = 3600  # jak dlouho po plánovaném startu ještě čekat, než se úloha ukáže
+FALLBACK_SECONDS = 24 * 3600  # bez spolehlivého plánu nejvýš jeden dotaz denně; delší odstup nikdy
+QUERY_RETRY_SECONDS = 3600  # jediný opravný dotaz po přechodném selhání samotného dotazu
 
 # Stáří posledního doloženého úspěchu, hranice včetně jako u history.snapshot:
 # přesně 26 h je ještě OK, přesně 50 h ještě WARNING (denní záloha s rezervou).
@@ -81,6 +103,14 @@ RUNNING_STATES = {"activating", "deactivating", "reloading", "refreshing"}
 
 class QueryError(ValueError):
     """Výstup systemctl nejde věrohodně přečíst."""
+
+
+class QueryFailed(QueryError):
+    """Dotaz sám neproběhl (systemctl skončil nenulovým kódem, např. nedostupná D-Bus).
+
+    Na rozdíl od neplatného nebo rozporného výstupu nic nedokládá o jednotce,
+    takže smí dostat jeden opravný pokus (SCHED-1).
+    """
 
 
 def parse_blocks(text, count):
@@ -122,6 +152,29 @@ def age_state(age):
     return State.OK
 
 
+def job_running(active, start, end):
+    """Úloha právě běží, i ve fázi ExecStartPre (systemd pak ukazuje ještě časy předchozího běhu)."""
+    return active in RUNNING_STATES or (active == "active" and start > 0 and end == 0)
+
+
+def next_elapse(props):
+    """Plánovaný příští start timeru v sekundách UTC, nebo None (plán neznámý).
+
+    Systemd ho s TZ=UTC vypíše jako "Thu 2026-10-29 23:00:00 UTC" (ověřeno se
+    systemd 255). Prázdná hodnota (neaktivní timer, timer jen s monotónním
+    plánem OnBootSec/OnUnitActiveSec) ani jiný tvar se nevyvozují. Den v týdnu
+    se nečte, aby rozbor nezávisel na národním nastavení procesu.
+    """
+    parts = props.get(PLAN_PROPERTY, "").split(" ")
+    if len(parts) != 4 or parts[3] != "UTC":
+        return None
+    try:
+        moment = datetime.strptime(f"{parts[1]} {parts[2]}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return moment.replace(tzinfo=timezone.utc).timestamp()
+
+
 def worse(first, second):
     """Závažnější ze dvou stavů podle core.SEVERITY_ORDER (doložená závada před UNKNOWN)."""
     return min(first, second, key=SEVERITY_ORDER.index)
@@ -137,6 +190,8 @@ class BackupMonitor:
     `run` je subprocess.run a `clock` time.monotonic; testy dodají syntetický
     výstup systemctl a výsledky jsou pak fiktivní data (simulated=True), stejně
     jako u ostatních kolektorů se vzorovými soubory.
+    Výsledek platí do dalšího plánovaného dotazu (`next_check`) a ještě
+    `validity_seconds` (stejná rezerva jako u ostatních kolektorů).
     """
 
     labels = LABELS  # id výsledků, které collect() vrací (pro run.failed_results)
@@ -158,6 +213,14 @@ class BackupMonitor:
         # Konec posledního doloženého úspěšného běhu (monotónní s), jen z tohoto
         # procesu. Nepřežije restart a zahodí se, jakmile ho systemd přestane dokládat.
         self.last_success = None
+        # Plánování (SCHED-1): termín dalšího dotazu, čas posledního dotazu
+        # a jeho věrohodně přečtené bloky (None = dotaz nic nedoložil).
+        self.due = None
+        self.queried = None
+        self.blocks = None
+        # Přechodné selhání samotného dotazu a zda je další dotaz už opravný pokus.
+        self.query_failed = False
+        self.retrying = False
 
     def units(self):
         return [self.unit] + ([self.timer] if self.timer else [])
@@ -168,17 +231,89 @@ class BackupMonitor:
                 "--", *self.units()]
 
     def collect(self, now, observed_utc):
-        """Jeden výsledek `service.backup`. `now` je monotónní čas měření, `observed_utc` čas UTC."""
+        """Jeden výsledek `service.backup` z dotazu. `now` je monotónní čas měření, `observed_utc` čas UTC.
+
+        Selhal-li přechodně samotný dotaz (`query_failed`), přijde jediný opravný
+        pokus za QUERY_RETRY_SECONDS; selže-li i ten, platí běžný plán (bez
+        přečtených údajů nejvýš jednou denně). Výsledek je mezitím UNKNOWN,
+        nikdy dřívější úspěch.
+        """
+        retried, self.retrying = self.retrying, False
+        # Náhradní termín předem: ani neočekávaná výjimka nevede k častějšímu dotazování.
+        self.blocks, self.queried, self.due = None, now, now + FALLBACK_SECONDS
         state, text, details = self.evaluate()
+        if self.query_failed and not retried:
+            self.retrying = True
+            self.due = now + QUERY_RETRY_SECONDS
+            text = f"{text}; opravný dotaz za {QUERY_RETRY_SECONDS // 60} min"
+        else:
+            self.due = now + self.plan(observed_utc.timestamp())
         return [CheckResult(BACKUP_ID, state, f"{LABELS[BACKUP_ID]}: {text}", observed_utc,
-                            now + self.validity_seconds, simulated=self.simulated, details=details)]
+                            self.due + self.validity_seconds, simulated=self.simulated, details=details)]
+
+    def next_check(self, now):
+        """Monotónní čas dalšího dotazu (run.Scheduled); určil ho poslední dotaz."""
+        return self.due
+
+    def plan(self, utc_now):
+        """Za kolik sekund se systemd zeptat znovu, podle bloků posledního dotazu.
+
+        Běžící úloha za RECHECK_SECONDS. Jinak po předpokládaném konci příštího
+        běhu podle timeru: plánovaný start + délka posledního běhu + rezerva.
+        Když plánovaný start už nastal a úloha se ještě neukázala, za
+        RECHECK_SECONDS, ale jen PENDING_SECONDS od plánu. Bez spolehlivého
+        plánu (nečitelný dotaz, chybějící služba, bez timeru, neaktivní nebo
+        jen monotónní timer) za FALLBACK_SECONDS a nikdy později. Nepředpokládá
+        se denní plán: týdenní timer dá týdenní termín, omezený na jeden den.
+        `utc_now` jen převede plán timeru na odstup; stav se z něj nikdy neurčuje.
+        """
+        if self.blocks is None or self.blocks[0]["LoadState"] != "loaded":
+            return FALLBACK_SECONDS
+        service = self.blocks[0]
+        start = number(service, "ExecMainStartTimestampMonotonic") / 1e6
+        end = number(service, "ExecMainExitTimestampMonotonic") / 1e6
+        if job_running(service["ActiveState"], start, end):
+            return RECHECK_SECONDS
+        elapse = None if self.timer is None else next_elapse(self.blocks[1])
+        if elapse is None:
+            return FALLBACK_SECONDS
+        wait = elapse - utc_now
+        if wait > 0:
+            duration = max(0.0, end - start) if start and end else 0.0
+            return min(wait + duration + SETTLE_SECONDS, FALLBACK_SECONDS)
+        if -wait <= PENDING_SECONDS:
+            return RECHECK_SECONDS
+        return FALLBACK_SECONDS
+
+    def between(self, results, now, observed_utc):
+        """Výsledek mezi dotazy (run.Scheduled): přechod stáří přes 26/50 h bez dotazu na systemd.
+
+        Přepočítají se jen bloky posledního věrohodně přečteného dotazu k času
+        `now`: stáří posledního doloženého úspěchu roste i bez dotazu, nic
+        jiného se tím nezjistí. Nový výsledek vznikne jen při změně stavu nebo
+        důvodu; má čas tohoto přepočtu, původní platnost (nic se neprodlužuje)
+        a popis přizná, z jak starého dotazu vychází. Jinak se vrací poslední
+        výsledek beze změny.
+        """
+        if self.blocks is None:
+            return results
+        [last] = results
+        try:
+            state, text, details = self.assess(self.blocks, now)
+        except QueryError:
+            return results
+        if state is last.state and details == dict(last.details):
+            return results
+        note = f" (přepočet bez dotazu, údaje systemd z dotazu před {hours(now - self.queried)})"
+        return [CheckResult(BACKUP_ID, state, f"{LABELS[BACKUP_ID]}: {text}{note}", observed_utc,
+                            last.expires_monotonic, simulated=self.simulated, details=details)]
 
     def query(self):
         """Bloky vlastností nastavených jednotek v pořadí dotazu, nebo výjimka."""
         completed = self.run(self.command(), stdin=subprocess.DEVNULL, capture_output=True,
                              timeout=self.timeout_seconds, env=ENV, check=False)
         if completed.returncode != 0:
-            raise QueryError(f"systemctl skončil kódem {completed.returncode}")
+            raise QueryFailed(f"systemctl skončil kódem {completed.returncode}")
         if len(completed.stdout) > MAX_OUTPUT_BYTES:
             raise QueryError("neočekávaně dlouhý výstup")
         try:
@@ -186,7 +321,7 @@ class BackupMonitor:
         except UnicodeDecodeError:
             raise QueryError("výstup není ASCII") from None
         blocks = parse_blocks(text, len(self.units()))
-        for name, props, names in zip(self.units(), blocks, (PROPERTIES, TIMER_PROPERTIES)):
+        for name, props, names in zip(self.units(), blocks, (SERVICE_PROPERTIES, TIMER_PROPERTIES)):
             required(props, names)
             # Blok patří k dotazované jednotce i u aliasu (Id je pak hlavní název).
             if name not in props["Names"].split():
@@ -194,24 +329,41 @@ class BackupMonitor:
         return blocks
 
     def evaluate(self):
-        """(stav, popis, details) z jediného dotazu na systemd."""
+        """(stav, popis, details) z jediného dotazu na systemd; věrohodné bloky si uloží.
+
+        `query_failed` rozliší přechodné selhání samotného dotazu (timeout,
+        nenulový kód systemctl, nedostatek prostředků) od neplatných nebo
+        rozporných údajů a od skutečného stavu jednotky.
+        """
+        self.query_failed = False
         try:
             blocks = self.query()
         except subprocess.TimeoutExpired:
+            self.query_failed = True
             return State.UNKNOWN, f"systemd neodpověděl do {self.timeout_seconds:g} s", {}
         except QueryError as error:
+            # Neplatný, cizí nebo neúplný výstup přechodné selhání není.
+            self.query_failed = isinstance(error, QueryFailed)
             return State.UNKNOWN, f"stav úlohy nelze věrohodně přečíst: {error}", {}
         except OSError as error:
-            # Např. chybějící systemctl nebo nedostatek prostředků na této straně.
+            # Např. nedostatek prostředků na této straně. Chybějící nebo nespustitelný
+            # systemctl se opravným pokusem nezmění, proto ten se neopakuje.
+            self.query_failed = not isinstance(error, (FileNotFoundError, PermissionError))
             return State.UNKNOWN, f"stav úlohy nelze přečíst ({type(error).__name__})", {}
         checked = self.clock()  # po dotazu: všechny časy systemd musí být starší
         try:
-            service = self.service_state(blocks[0], checked)
-            if self.timer is None:
-                return service
-            timer = self.timer_state(blocks[1])
+            result = self.assess(blocks, checked)
         except QueryError as error:
             return State.UNKNOWN, f"stav úlohy nelze věrohodně přečíst: {error}", {}
+        self.blocks = blocks
+        return result
+
+    def assess(self, blocks, checked):
+        """(stav, popis, details) z přečtených bloků k monotónnímu času `checked`, bez dotazu."""
+        service = self.service_state(blocks[0], checked)
+        if self.timer is None:
+            return service
+        timer = self.timer_state(blocks[1])
         first, second = service, timer
         if SEVERITY_ORDER.index(timer[0]) < SEVERITY_ORDER.index(service[0]):
             # Závažnější stav timeru rozhoduje; aktivní timer stav služby nikdy nezlepší.
@@ -233,7 +385,7 @@ class BackupMonitor:
         if start > checked or end > checked:
             # Čas z budoucnosti: jiný boot nebo jiné hodiny, nic se z něj nevyvozuje.
             raise QueryError("časy systemd nejsou věrohodné")
-        if active in RUNNING_STATES or (active == "active" and start and not end):
+        if job_running(active, start, end):
             # Před spuštěním hlavního procesu (ExecStartPre) ukazuje systemd ještě
             # časy předchozího běhu; zapamatovaný úspěch nesmí být novější než ony.
             return self.running(end or start, checked)

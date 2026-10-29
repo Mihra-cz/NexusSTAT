@@ -44,8 +44,8 @@ KNOWN_RULE_KEYS = {"enabled", "warning", "error", "hysteresis", "confirm_count",
 # zálohy od SERVICES-3). Další služby se přidají až s vlastním kolektorem, ne
 # předem jako nefunkční volby.
 KNOWN_SERVICES_KEYS = {"animedb", "nas", "backup"}
-KNOWN_ANIMEDB_KEYS = {"enabled", "url", "timeout_seconds"}
-KNOWN_NAS_KEYS = {"enabled", "host", "port", "timeout_seconds"}
+KNOWN_ANIMEDB_KEYS = {"enabled", "url", "timeout_seconds", "interval_seconds"}
+KNOWN_NAS_KEYS = {"enabled", "host", "port", "timeout_seconds", "interval_seconds"}
 KNOWN_BACKUP_KEYS = {"enabled", "unit", "timer", "timeout_seconds"}
 
 # Healthcheck AnimeDB (SERVICES-1): limit celé kontroly v sekundách (spojení,
@@ -60,6 +60,15 @@ MAX_URL_LENGTH = 256
 # jako u healthchecku AnimeDB (HEALTH_TIMEOUT_DEFAULT, HEALTH_TIMEOUT_MAX).
 NAS_PORT_DEFAULT = 445
 MAX_PORT = 65535
+
+# Šetrné plánování služeb (SCHED-1): smyčka tiká po [collector] interval_seconds,
+# ale AnimeDB a NAS se skutečně kontrolují jen jednou za svůj interval
+# (run.Scheduled). Dolní mez drží odstup i při překlepu, horní je stejná jako
+# u taktu smyčky: služba kontrolovaná řidčeji než jednou za hodinu by o
+# výpadku řekla příliš pozdě.
+ANIMEDB_INTERVAL_DEFAULT = 15 * 60
+NAS_INTERVAL_DEFAULT = 30 * 60
+SERVICE_INTERVAL_MIN = 60
 
 # Název jednotky systemd pro kontrolu záloh (SERVICES-3): znaky, které systemd
 # v názvech jednotek povoluje, bez escapovaných sekvencí (např. "\x2d"), nejvýš 255 znaků
@@ -432,6 +441,14 @@ def check_health_timeout(value):
         raise ConfigError(f"timeout_seconds musí být číslo v rozsahu (0, {HEALTH_TIMEOUT_MAX}] s, ne {value!r}")
 
 
+def check_service_interval(value):
+    """Interval skutečných kontrol služby (SCHED-1): celé sekundy SERVICE_INTERVAL_MIN–MAX_SECONDS."""
+    # bool je v Pythonu podtřída int, takže TOML `true` by jinak prošlo jako 1 s.
+    if isinstance(value, bool) or not isinstance(value, int) or not SERVICE_INTERVAL_MIN <= value <= MAX_SECONDS:
+        raise ConfigError(f"interval_seconds musí být celé číslo sekund {SERVICE_INTERVAL_MIN}–{MAX_SECONDS}, "
+                          f"ne {value!r}")
+
+
 @dataclass(frozen=True)
 class AnimeDbConfig:
     """Volitelné sledování AnimeDB přes její HTTP endpoint /health (SERVICES-1).
@@ -440,11 +457,13 @@ class AnimeDbConfig:
     zapnutí se nikam nepřipojuje a AnimeDB je `N/A`. Skutečná adresa patří
     jen do lokální konfigurace mimo Git. Dostupnost endpointu se tu
     nekontroluje (mění se za běhu), jen tvar adresy a limit.
+    `interval_seconds` je odstup skutečných kontrol (SCHED-1, výchozí 15 min).
     """
 
     enabled: bool = False
     url: str | None = None
     timeout_seconds: float = HEALTH_TIMEOUT_DEFAULT
+    interval_seconds: int = ANIMEDB_INTERVAL_DEFAULT
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
@@ -452,6 +471,7 @@ class AnimeDbConfig:
         if self.url is not None:
             check_health_url(self.url)
         check_health_timeout(self.timeout_seconds)
+        check_service_interval(self.interval_seconds)
         if self.enabled and self.url is None:
             raise ConfigError("enabled = true vyžaduje url")
 
@@ -490,12 +510,14 @@ class NasConfig:
     zapnutí se nikam nepřipojuje a NAS je `N/A`. Skutečná adresa patří jen
     do lokální konfigurace mimo Git. Dostupnost se tu nekontroluje (mění se
     za běhu), jen tvar adresy, port a limit.
+    `interval_seconds` je odstup skutečných kontrol (SCHED-1, výchozí 30 min).
     """
 
     enabled: bool = False
     host: str | None = None
     port: int = NAS_PORT_DEFAULT
     timeout_seconds: float = HEALTH_TIMEOUT_DEFAULT
+    interval_seconds: int = NAS_INTERVAL_DEFAULT
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
@@ -504,6 +526,7 @@ class NasConfig:
             check_nas_host(self.host)
         check_port(self.port)
         check_health_timeout(self.timeout_seconds)
+        check_service_interval(self.interval_seconds)
         if self.enabled and self.host is None:
             raise ConfigError("enabled = true vyžaduje host")
 
