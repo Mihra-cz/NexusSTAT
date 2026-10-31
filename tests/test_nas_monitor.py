@@ -700,7 +700,7 @@ class ConfigurationTest(unittest.TestCase):
         clock = FakeClock(NOW)
 
         def sleep(seconds):
-            if len(lines) > 3:
+            if clock.now >= NOW + 2 * INTERVAL:
                 raise KeyboardInterrupt  # po třech měřeních
             clock.advance(seconds)
 
@@ -708,10 +708,10 @@ class ConfigurationTest(unittest.TestCase):
         results = run_loop(monitor, CollectorConfig(), AlarmEvaluator(AlarmsConfig()), clock=clock,
                            utc_clock=lambda: OBSERVED, sleep=sleep, output=lines.append)
         self.assertIn("NAS: spojení odmítnuto (výpadek zatím nepotvrzen, 1/3)", lines[1])
-        self.assertIn("NAS: spojení odmítnuto (výpadek zatím nepotvrzen, 2/3)", lines[2])
-        self.assertNotIn("[ERROR]", lines[2])
-        self.assertIn("NAS: spojení odmítnuto [ERROR]", lines[3])
-        self.assertIn("UTC  SIM ERROR", lines[3])  # podvržené spojení = fiktivní data
+        # Druhá kontrola (2/3) stav ani důvod nezmění: řádek nevznikne (SCHED-2).
+        self.assertIn("NAS: spojení odmítnuto [ERROR]", lines[2])
+        self.assertIn("UTC  SIM ERROR", lines[2])  # podvržené spojení = fiktivní data
+        self.assertEqual(lines[3], "\nUkončeno (Ctrl+C), počet měření: 3.")
         self.assertFalse(any(HOST in line for line in lines))
         self.assertIs({r.id: r for r in results}[NAS_ID].state, State.ERROR)
 

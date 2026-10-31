@@ -372,6 +372,26 @@ class HistoryConfigTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             history_config_from_dict("zapnuto")
 
+    def test_history_interval_must_align_with_cpu_measurement(self):
+        # SCHED-2: okno vytížení CPU (po 5 s) je přesné jen při zápisu v násobku 5 s;
+        # při 7 nebo 11 s by hodnota s časem zápisu pokrývala jiný úsek.
+        history = HistoryConfig(enabled=True, path="/x/history.sqlite3")
+        for interval, allowed in ((5, True), (10, True), (15, True), (3600, True), (1, False), (2, False),
+                                  (7, False), (11, False), (3599, False)):
+            with self.subTest(interval=interval):
+                if allowed:
+                    Config(collector=CollectorConfig(interval), history=history)
+                else:
+                    with self.assertRaisesRegex(ConfigError, "násobkem 5 s"):
+                        Config(collector=CollectorConfig(interval), history=history)
+                Config(collector=CollectorConfig(interval))  # bez historie se okno nepoužívá
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text('[collector]\ninterval_seconds = 7\n[history]\nenabled = true\npath = "/x/h.sqlite3"\n',
+                            encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "násobkem 5 s"):
+                load_config(path)
+
     def test_role_is_fixed_to_development(self):
         # Roli nelze konfigurovat, takže produkční databázi nelze otevřít omylem.
         self.assertEqual(HISTORY_ROLE, "development")

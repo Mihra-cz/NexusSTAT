@@ -100,7 +100,7 @@ Body 1–17 popisují implementovanou v0.6 s pěti stránkami NEXUS, SYSTEM, DIS
 ## Pravidelné měření (potvrzeno pro v0.3)
 
 - Jedna přehledná smyčka pravidelně měří CPU, teplotu CPU, RAM a obsazenost `/`; výsledky stručně vypisuje do terminálu, bez vlastního logování.
-- Interval `[collector] interval_seconds`, výchozí 10 s. Platnost výsledků je trojnásobek intervalu a samostatně se nenastavuje.
+- Interval `[collector] interval_seconds`, výchozí 10 s. Platnost výsledků je trojnásobek intervalu a samostatně se nenastavuje. Od SCHED-2 určuje jen zápis do historie a její kontroly; živé měření má takt 1 s a vlastní intervaly kolektorů (sekce Živé měření a šetrné ukládání).
 - Plánování v monotónním čase, čas měření v UTC. Plánované termíny postupně neujíždějí; při zpoždění se nespouští několik doháněcích měření najednou.
 - Selhání měření nesmí vést k falešnému stavu OK. Žádné aktivní čekání vytěžující procesor. Čisté ukončení pomocí Ctrl+C.
 - Zatím jen terminál: bez OLED hardware, služby a webu; SQLite historie je od M3.3b-1 volitelná (výchozí vypnuto).
@@ -245,6 +245,27 @@ Cílem je výrazně snížit počet skutečných kontrol služeb bez nového fra
 - **Zálohy:** `service.backup`, kontroly systemd a hranice 26/50 h beze změny. Další dotaz po plánovaném startu z `NextElapseUSecRealtime` timeru (čte se se `TZ=UTC`, převede se na monotónní odstup) + délka posledního běhu + 5 min rezerva. Běžící úloha nebo plánovaný start, který nastal před nejvýš hodinou, a úloha se zatím neukázala: další dotaz za 15 min. Bez timeru, s neaktivním nebo jen monotónním timerem, s nečitelným dotazem či chybějící službou nejvýš jednou denně; žádný odstup není delší než den, takže se nepředpokládá denní plán. **Opravný dotaz:** jen když selhal samotný dotaz přechodně (timeout, nenulový kód `systemctl`, např. nedostupná D-Bus, nebo nedostatek prostředků), přijde jediný opravný dotaz za 60 min; selže-li i ten, platí běžný plán (bez přečtených údajů nejvýš jednou denně, při trvalém selhání tedy nejvýš 2 dotazy denně). Neplatné nebo rozporné údaje, chybějící či nespustitelný `systemctl` a skutečný stav jednotky (chybějící, maskovaná služba, neaktivní timer) opravný dotaz nedostanou. Mezitím je výsledek `UNKNOWN` s poznámkou o opravném dotazu, nikdy dřívější úspěch. Přechod přes 26/50 h se mezi dotazy přepočítá z bloků posledního věrohodně přečteného dotazu bez volání systemd; nový výsledek má čas přepočtu, původní platnost a popis „přepočet bez dotazu, údaje systemd z dotazu před … h“. Týdenní záloha se jako nová kontrola nepřidává (vyžaduje vlastní pravidla stáří).
 - **Zmeškané kontroly** (pozastavený proces) se nedohánějí: proběhne jedna a další termín se počítá od ní. Restart monitoringu kontroluje hned a bez paměti předchozího procesu. Selhání jedné služby nezastaví ostatní kolektory.
 - Ověřeno jen testy se simulovaným časem a podvrženými odpověďmi (`tests/test_service_schedule.py`) a read-only dotazem `systemctl show` na neškodné jednotky notebooku; proti AnimeDB, NAS ani zálohovací úloze Nexusu nespuštěno.
+
+## Živé měření a šetrné ukládání (SCHED-2, implementováno lokálně, nenasazeno)
+
+Svižné živé hodnoty bez zbytečné zátěže Raspberry Pi, SSD a NAS. Lehký takt smyčky je 1 s kvůli síti, ale kolektory měří jen ve svých termínech (stávající `run.Scheduled` s pevným intervalem na společné mřížce), nic se nepřekrývá ani nedohání a výsledky jsou v paměti pro výpis, OLED, RGB i budoucí web, které vlastní měření nespouštějí.
+
+| Kontrola | Interval | Platnost výsledku | Skutečná měření za 24 h (dřív) |
+| --- | --- | --- | --- |
+| vytížení CPU, teplota CPU, RAM | 5 s | 15 s | 17 280 (8 640) |
+| ventilátor CPU | 10 s | 30 s | 8 640 (8 640) |
+| síť RX/TX (čítače jádra) | 1 s | 3 s | 86 400 (8 640) |
+| síťové rozhraní, linka, IPv4 | 60 s, a hned po zmizení nebo novém vzniku rozhraní | 180 s | 1 440 (8 640) |
+| disk `/` | 1 800 s | 5 400 s | 48 (8 640) |
+| AnimeDB, NAS, zálohy | beze změny SCHED-1 | beze změny | 96, 48, 2 |
+
+- Intervaly jsou schválené pevné hodnoty v kódu (`config.py`), zatím nenastavitelné. Platnost výsledku je 3 × interval kolektoru: vynechaný termín nezpůsobí `UNKNOWN`, zastavený kolektor zestárne a nikdy nevypadá jako `OK`.
+- **NETWORK:** rychlost RX/TX každou sekundu z čítačů `/sys/class/net/<rozhraní>/statistics` ze skutečně uplynulého monotónního času; výběr rozhraní, linka a IPv4 (`/proc/net/route`, `ioctl`) jen jednou za minutu a hned, když rozhraní zmizí nebo vznikne znovu (jiný `ifindex`). Reset čítače, změna rozhraní, nečitelný čítač nebo mezera nad 30 s dají `UNKNOWN`, nikdy falešnou rychlost; zdržení smyčky (např. timeout služby) do 30 s dá platný průměr za skutečnou dobu. Žádné síťové požadavky kvůli RX/TX.
+- **Alarmy:** `AlarmEvaluator` dál vyhodnocuje každé skutečné měření právě jednou (identita `expires_monotonic`), např. teplota potvrdí `WARNING` třetím měřením po 5 s, ne třetím taktem.
+- **Historie:** schéma v1 beze změny a zápis jen jednou za `[collector] interval_seconds` (výchozí 10 s), ne každou sekundu. Vytížení CPU a RX/TX jdou do historie jako měření za celé okno od minulého zápisu (součet čítačů), takže řada má stejný význam jako dřív; teplota, RAM a ventilátor poslední měření, disk jen svá měření, linka, IPv4 a služby jen změny. Okno platí jen za přesně pokrytý úsek od minulého zápisu (jinak `UNKNOWN`); se zapnutou historií proto musí být `[collector] interval_seconds` násobkem 5 s (7 nebo 11 s se odmítne) a kolektory i zápis mají společnou mřížku, která se sejde i po zdržení smyčky. 30sekundové souhrny vyžadují změnu schématu: samostatný návrh v `HISTORY.md` 12.5 (ke schválení, neimplementováno).
+- **Výpis:** řádek jen při prvním měření, při provozně významné změně (stav nebo `details` kontroly, i vypršení výsledku) a jinak souhrnně nejvýš jednou za 30 min; hláška o zpoždění jen při zpoždění o celý interval historie. Žádné zápisy na SSD kvůli živému zobrazení, žádné další přístupy na NAS ani systémové příkazy.
+- **Režie** (notebook x86_64, výchozí konfigurace bez služeb, 60 s read-only): asi 3 ms CPU za sekundu, tj. 0,3 % jednoho jádra (dřív asi 0,4 ms/s), 26 MB RSS, 3 řádky výpisu za minutu místo 6. Na Raspberry Pi neověřeno.
+- Ověřeno jen testy se simulovaným časem a podvrženými daty a krátkým read-only během na notebooku.
 
 ## Živý simulátor OLED (potvrzeno pro v0.5)
 

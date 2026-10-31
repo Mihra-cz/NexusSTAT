@@ -9,10 +9,12 @@ Adresy jsou z dokumentačních rozsahů RFC 5737 (192.0.2.0/24, 198.51.100.0/24)
 import errno
 import ipaddress
 import re
+import shutil
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from nexusstat.config import CollectorConfig, OledConfig
 from nexusstat.core import CheckResult, State, active_problems, effective, overall_state
@@ -649,6 +651,79 @@ class PublicDataTest(unittest.TestCase):
         for address in addresses:
             with self.subTest(address=address):
                 self.assertIn(ipaddress.ip_address(address), ipaddress.ip_network("192.0.2.0/24"))
+
+
+class LiveScheduleTest(FixtureCase):
+    """SCHED-2: čítače po 1 s, výběr rozhraní, linka a IPv4 po 60 s a okno pro historii."""
+
+    def live(self, interface=None):
+        return NetworkMonitor(3, interface=interface, net_dir=self.fx.net, route_path=self.fx.route,
+                              ipv4_lookup=self.fx.ipv4, details_interval=60, gap_seconds=30)
+
+    def step(self, monitor, now, rx=None):
+        if rx is not None:
+            self.fx.write("wlp2s0", rx=rx)
+        return self.by_id(monitor.collect(now, OBSERVED))
+
+    def test_counters_every_second_details_every_minute(self):
+        monitor = self.live()
+        first = self.step(monitor, 0)
+        rates = []
+        for second in range(1, 181):
+            results = self.step(monitor, second, rx=1_000_000 + 1500 * second)
+            rates.append(results[RX_RATE_ID].measurement.value)
+            if second < 60:
+                self.assertIs(results[IPV4_ID], first[IPV4_ID])  # tentýž výsledek, nic se nezjišťuje znovu
+        self.assertEqual(set(rates), {1500.0})  # ze skutečně uplynulého času, každou sekundu
+        self.assertEqual(self.fx.lookups, ["wlp2s0"] * 4)  # IPv4 jen v 0, 60, 120 a 180 s
+        self.assertEqual((results[RX_RATE_ID].expires_monotonic, results[IPV4_ID].expires_monotonic),
+                         (180 + 3, 180 + 180))
+
+    def test_changed_or_vanished_interface_refreshes_details_at_once(self):
+        monitor = self.live("wlp2s0")
+        for second in range(11):
+            self.step(monitor, second)
+        self.fx.write("wlp2s0", ifindex=9)  # rozhraní vzniklo znovu (např. USB adaptér)
+        results = self.step(monitor, 11)
+        self.assertEqual(results[RX_RATE_ID].summary, "Síť RX: změna rozhraní")  # žádná falešná rychlost
+        self.assertEqual(len(self.fx.lookups), 2)  # linka a IPv4 hned, ne až za minutu
+        self.assertIs(self.step(monitor, 12)[RX_RATE_ID].state, State.INFO)
+        shutil.rmtree(self.fx.net / "wlp2s0")
+        with mock.patch.object(monitor, "_refresh", wraps=monitor._refresh) as refresh:
+            results = self.step(monitor, 13)
+            for second in range(14, 71):
+                self.step(monitor, second)
+        self.assertEqual(refresh.call_count, 1)  # zmizení hned, pak až v termínu (13 + 60 s)
+        self.assertEqual(results[LINK_ID].summary, "Síť wlp2s0: rozhraní nenalezeno")
+        self.assertEqual(results[RX_RATE_ID].summary, "Síť RX wlp2s0: rozhraní nenalezeno")
+
+    def test_window_for_history_is_measured_over_the_whole_window(self):
+        monitor = self.live()
+        self.step(monitor, 0, rx=1_000_000)
+        ids, results = monitor.window_results(0, OBSERVED, 30)
+        self.assertEqual(ids, {RX_RATE_ID, TX_RATE_ID})
+        self.assertEqual([r.summary for r in results], ["Síť RX: první vzorek", "Síť TX: první vzorek"])
+        for second in range(1, 11):
+            self.step(monitor, second, rx=1_000_000 + 2000 * second)
+        _, [rx, tx] = monitor.window_results(10, OBSERVED, 30)
+        # 20 000 B za 10 s: stejné měření jako dřív jeden 10s vzorek (a skutečný objem dat).
+        self.assertEqual((rx.measurement.value, tx.measurement.value), (2000.0, 0.0))
+        self.assertEqual((rx.expires_monotonic, dict(rx.details)), (10 + 30, {INTERFACE: "wlp2s0"}))
+        cases = (  # (kroky, RX, stav TX): reset RX se TX netýká, mezera obou směrů ano
+            ("reset čítače", [(11, 50), (12, 2050)], (State.UNKNOWN, "Síť RX: reset čítače v okně zápisu"),
+             State.INFO),
+            ("zdržení smyčky 5 s", [(17, 7050)], (State.INFO, "Síť RX 1,0 kB/s"), State.INFO),
+            ("mezera nad 30 s", [(60, 9050)], (State.UNKNOWN, "Síť RX: mezera v datech v okně zápisu"),
+             State.UNKNOWN),
+        )
+        for name, steps, expected, tx_state in cases:
+            with self.subTest(case=name):
+                for second, counter in steps:
+                    self.step(monitor, second, rx=counter)
+                _, [rx, tx] = monitor.window_results(steps[-1][0], OBSERVED, 30)
+                self.assertEqual((rx.state, rx.summary), expected)
+                self.assertIs(tx.state, tx_state)
+        self.assertEqual(monitor.window_results(60, OBSERVED, 30), (ids, []))  # okno bez kroků: mezera
 
 
 if __name__ == "__main__":

@@ -481,5 +481,53 @@ class CoreAndOledIntegrationTest(FixtureCase):
         self.assertFalse(any(result.state in ALERT_STATES for result in results))
 
 
+class LiveScheduleTest(FixtureCase):
+    """SCHED-2: výběr kontrol a vytížení CPU za celé okno zápisu do historie."""
+
+    def stat(self, idle, total):
+        write_files(self.proc, {"stat": f"cpu  {total - idle} 0 0 {idle} 0 0 0 0 0 0\n"})
+
+    def test_checks_subset(self):
+        fast = SystemMonitor(15, proc_dir=self.proc, thermal_dir=self.thermal, statvfs=self.fake_statvfs,
+                             checks=(CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID))
+        self.assertEqual([r.id for r in fast.collect(0, OBSERVED)], [CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID])
+        self.assertEqual(self.statvfs_calls, [])  # disk se v rychlém kolektoru neměří
+        disk = SystemMonitor(5400, proc_dir=self.proc, thermal_dir=self.thermal, statvfs=self.fake_statvfs,
+                             checks=(DISK_ROOT_ID,))
+        self.assertEqual((list(disk.labels), disk.window_results(0, OBSERVED, 30)), ([DISK_ROOT_ID], (set(), [])))
+        for checks in ((), ("system.neznamy",), (CPU_USAGE_ID, CPU_USAGE_ID)):
+            with self.subTest(checks=checks), self.assertRaises(ValueError):
+                SystemMonitor(15, proc_dir=self.proc, checks=checks)
+
+    def test_cpu_window_sums_every_step(self):
+        monitor = SystemMonitor(15, proc_dir=self.proc, thermal_dir=self.thermal, statvfs=self.fake_statvfs,
+                                checks=(CPU_USAGE_ID,))
+
+        def window(now):
+            ids, results = monitor.window_results(now, OBSERVED, 30)
+            self.assertEqual(ids, {CPU_USAGE_ID})
+            return [(r.state, r.summary, r.expires_monotonic) for r in results]
+
+        self.stat(800, 1000)
+        monitor.collect(0, OBSERVED)
+        self.assertEqual(window(0), [(State.UNKNOWN, "CPU: první vzorek", 30)])
+        self.stat(890, 1100)  # krok 1: 10 %
+        monitor.collect(5, OBSERVED)
+        self.stat(910, 1200)  # krok 2: 80 %
+        monitor.collect(10, OBSERVED)
+        self.assertEqual(window(10), [(State.INFO, "CPU 45 %", 40)])  # 90 z 200, ne jen poslední krok
+        (self.proc / "stat").unlink()
+        self.assertIs(monitor.collect(15, OBSERVED)[0].state, State.UNKNOWN)
+        self.stat(1000, 1400)  # další krok přesně překlene selhané čtení: 110 ze 200
+        monitor.collect(20, OBSERVED)
+        self.assertEqual(window(20), [(State.INFO, "CPU 55 %", 50)])
+        self.stat(900, 1300)  # čítače zpět: krok se zahodí
+        monitor.collect(25, OBSERVED)
+        self.stat(950, 1400)
+        monitor.collect(30, OBSERVED)
+        self.assertEqual(window(30), [(State.UNKNOWN, "CPU: neplatný interval v okně zápisu", 60)])
+        self.assertEqual(window(30), [])  # okno bez kroků: mezera, ne opakovaný vzorek
+
+
 if __name__ == "__main__":
     unittest.main()

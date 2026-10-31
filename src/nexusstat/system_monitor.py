@@ -170,12 +170,16 @@ class SystemMonitor:
     """Čte systémové údaje a vrací je jako CheckResult.
 
     Pamatuje si jen předchozí vzorek CPU, protože vytížení vyžaduje dva vzorky.
+    `checks` vybere jen některé kontroly (SCHED-2: CPU, teplota a RAM po 5 s
+    odděleně od disku / po 1800 s); bez něj měří všechny čtyři.
+
+    Pro historii sčítá rozdíly čítačů CPU všech platných měření od posledního
+    zápisu (`window_results`): vytížení za celé okno zápisu je pak stejné
+    měření jako dřív jeden 10s vzorek, ne jeden z kratších vzorků.
     """
 
-    labels = LABELS  # id výsledků, které collect() vrací (pro run.failed_results)
-
     def __init__(self, validity_seconds, proc_dir=DEFAULT_PROC_DIR, thermal_dir=DEFAULT_THERMAL_DIR,
-                 statvfs=os.statvfs):
+                 statvfs=os.statvfs, checks=None):
         # Platnost výsledků dodává volající z konfigurace (CollectorConfig, trojnásobek
         # intervalu měření). Kolektor nemá vlastní výchozí hodnotu, aby se nemohla
         # rozejít s intervalem spouštění. Když měření přestanou přicházet, hodnoty
@@ -194,16 +198,64 @@ class SystemMonitor:
             and self.thermal_dir == Path(DEFAULT_THERMAL_DIR)
             and statvfs is os.statvfs
         )
+        checks = tuple(LABELS) if checks is None else tuple(checks)
+        if not checks or not set(checks) <= set(LABELS) or len(set(checks)) != len(checks):
+            raise ValueError(f"checks musí být neprázdný výběr z {', '.join(LABELS)}, ne {checks!r}")
+        self.checks = checks
+        self.labels = {check_id: LABELS[check_id] for check_id in checks}  # pro run.failed_results
         self.previous_cpu = None
+        self.previous_cpu_time = None  # monotónní čas předchozího vzorku CPU
+        # Okno zápisu historie (SCHED-2): součty rozdílů čítačů CPU od posledního
+        # zápisu, počet platných kroků, jimi pokrytý úsek monotónního času
+        # (začátek prvního, konec posledního), důvod, proč okno nelze použít,
+        # a čas minulého zápisu.
+        self.window_idle = self.window_total = self.window_steps = 0
+        self.window_span = None
+        self.window_broken = None
+        self.window_mark = None
 
     def collect(self, now, observed_utc):
-        """Změří všechny kontroly. `now` je monotónní čas, `observed_utc` skutečný čas UTC."""
-        return [
-            self._check(CPU_USAGE_ID, self._cpu_usage, now, observed_utc),
-            self._check(CPU_TEMP_ID, self._cpu_temperature, now, observed_utc),
-            self._check(MEMORY_ID, self._memory, now, observed_utc),
-            self._check(DISK_ROOT_ID, self._disk_root, now, observed_utc),
-        ]
+        """Změří vybrané kontroly. `now` je monotónní čas, `observed_utc` skutečný čas UTC."""
+        measures = {CPU_USAGE_ID: lambda: self._cpu_usage(now), CPU_TEMP_ID: self._cpu_temperature,
+                    MEMORY_ID: self._memory, DISK_ROOT_ID: self._disk_root}
+        return [self._check(check_id, measures[check_id], now, observed_utc) for check_id in self.checks]
+
+    def window_results(self, now, observed_utc, validity_seconds):
+        """Vytížení CPU za okno od posledního zápisu do historie (SCHED-2); okno začne znovu.
+
+        Vrací (id nahrazených živých výsledků, výsledky). Hodnota je ze součtu
+        rozdílů čítačů všech platných měření v okně, čas a platnost jsou okamžik
+        zápisu (`now`, `observed_utc`) + `validity_seconds`. Platí jen tehdy,
+        když kroky přesně pokrývají úsek od minulého zápisu do `now` (skutečně
+        uplynulý monotónní čas, ne nominální interval); jinak (zahozený krok,
+        chybějící měření v taktu zápisu, posunutá mřížka) je UNKNOWN, nikdy
+        odhad za jiný úsek. Selhané čtení mimo takt zápisu přesně překlene
+        další krok. Okno bez měření nevrací nic: v historii zůstane mezera
+        místo opakovaného nebo vymyšleného vzorku; jen první okno je UNKNOWN
+        „první vzorek“ jako dřív první měření.
+        """
+        if CPU_USAGE_ID not in self.checks:
+            return set(), []
+        idle, total, steps, broken = self.window_idle, self.window_total, self.window_steps, self.window_broken
+        span, mark = self.window_span, self.window_mark
+        self.window_idle = self.window_total = self.window_steps = 0
+        self.window_span = self.window_broken = None
+        self.window_mark = now
+        label = LABELS[CPU_USAGE_ID]
+        expires = now + validity_seconds
+        if broken is not None:
+            state, summary, measurement = State.UNKNOWN, f"{label}: {broken} v okně zápisu", None
+        elif steps and mark is not None and span != (mark, now):
+            state, summary, measurement = State.UNKNOWN, f"{label}: měření nepokrývá celé okno zápisu", None
+        elif steps:
+            percent = 100 * (total - idle) / total
+            state, summary, measurement = State.INFO, f"{label} {percent:.0f} %", Measurement(percent, PERCENT)
+        elif mark is None:
+            state, summary, measurement = State.UNKNOWN, f"{label}: první vzorek", None
+        else:
+            return {CPU_USAGE_ID}, []
+        return {CPU_USAGE_ID}, [CheckResult(CPU_USAGE_ID, state, summary, observed_utc, expires,
+                                            simulated=self.simulated, measurement=measurement)]
 
     def _check(self, check_id, measure, now, observed_utc):
         # Každá kontrola ošetřuje své chyby sama, aby selhání jedné neshodilo ostatní.
@@ -228,14 +280,22 @@ class SystemMonitor:
 
     # Každé měření vrací (Measurement, text pro displej). Text se zaokrouhluje,
     # hodnota pro prahy ne.
-    def _cpu_usage(self):
+    def _cpu_usage(self, now):
+        # Selhané čtení okno nepřeruší: předchozí vzorek zůstane a další platný
+        # krok mezeru přesně překlene. Zahozený krok (čítače zpět) ano.
         current = parse_cpu_sample(read_text(self.proc_dir / "stat"))
-        previous, self.previous_cpu = self.previous_cpu, current
+        previous, start = self.previous_cpu, self.previous_cpu_time
+        self.previous_cpu, self.previous_cpu_time = current, now
         if previous is None:
             raise Unavailable("první vzorek")
         percent = cpu_usage_percent(previous, current)
         if percent is None:
+            self.window_broken = self.window_broken or "neplatný interval"
             raise Unavailable("neplatný interval")
+        self.window_span = (start if self.window_span is None else self.window_span[0], now)
+        self.window_idle += current.idle - previous.idle
+        self.window_total += current.total - previous.total
+        self.window_steps += 1
         return Measurement(percent, PERCENT), f"{percent:.0f} %"
 
     def _cpu_temperature(self):

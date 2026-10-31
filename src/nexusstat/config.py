@@ -25,6 +25,17 @@ MAX_SECONDS = 3600
 # data nejpozději po třech intervalech zestárnou.
 VALIDITY_INTERVALS = 3
 
+# Živé měření (SCHED-2): takt smyčky a schválené intervaly kolektorů v sekundách.
+# Takt 1 s je kvůli rychlosti sítě; kolektor se ale spustí jen ve svém termínu
+# (run.Scheduled). Platnost výsledku je VALIDITY_INTERVALS × interval kolektoru.
+# Zápis do historie a její kontroly běží dál po [collector] interval_seconds.
+LIVE_TICK_SECONDS = 1
+CPU_INTERVAL_SECONDS = 5  # vytížení CPU, teplota CPU, RAM
+FAN_INTERVAL_SECONDS = 10  # ventilátor CPU
+NETWORK_RATE_INTERVAL_SECONDS = 1  # rychlost RX/TX z čítačů jádra
+NETWORK_DETAILS_INTERVAL_SECONDS = 60  # výběr rozhraní, linka a IPv4
+DISK_INTERVAL_SECONDS = 1800  # obsazenost disku /
+
 # Jen klíče, které kód skutečně používá. Neznámý klíč je chyba, aby se překlep
 # (např. "page_second") tiše nenahradil výchozí hodnotou a aby nefunkční
 # volba (např. budoucí "home_title") nevypadala, že něco dělá.
@@ -180,6 +191,13 @@ class OledConfig:
 
 @dataclass(frozen=True)
 class CollectorConfig:
+    """Základní interval: zápis do historie, kontroly historie a plán snímků (výchozí 10 s).
+
+    Od SCHED-2 neurčuje takt živého měření: ten je LIVE_TICK_SECONDS a každý
+    kolektor má vlastní interval (konstanty výše). Platnost výsledků kontrol
+    vázaných na tento interval (historie, doplněné služby) je 3 × interval.
+    """
+
     interval_seconds: int = 10
 
     def __post_init__(self):
@@ -592,6 +610,15 @@ class Config:
     network: NetworkConfig = field(default_factory=NetworkConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
     services: ServicesConfig = field(default_factory=ServicesConfig)
+
+    def __post_init__(self):
+        # Vytížení CPU jde do historie jako měření za celé okno zápisu (SCHED-2).
+        # Okno je přesné jen tehdy, když zápis padne do taktu s měřením CPU (po
+        # 5 s): při 7 nebo 11 s by hodnota s časem zápisu pokrývala jiný úsek
+        # (5 nebo 10 s posunutých o několik sekund) a význam řady by se tiše měnil.
+        if self.history.enabled and self.collector.interval_seconds % CPU_INTERVAL_SECONDS:
+            raise ConfigError(f"[collector] interval_seconds musí být se zapnutou historií násobkem "
+                              f"{CPU_INTERVAL_SECONDS} s (intervalu měření CPU), ne {self.collector.interval_seconds}")
 
 
 def oled_config_from_dict(section):

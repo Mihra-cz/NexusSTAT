@@ -20,7 +20,7 @@ from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol
 from nexusstat.oled_text import page_rows
 from nexusstat.config import Config, HistoryConfig, NetworkConfig, SnapshotConfig
 from nexusstat.fan_monitor import LABELS as FAN_LABELS, FanMonitor
-from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
+from nexusstat.network_monitor import LABELS as NETWORK_LABELS, LINK_ID, NetworkMonitor
 from nexusstat.run import (COLLECTOR_FAILURE, Collectors, Stopper, failed_results, failure_name,
                           format_line, live_monitor, main, run_loop, start_history)
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS, MEMORY_ID, SystemMonitor
@@ -130,6 +130,17 @@ def run(clock, collector, config=CONFIG, utc_clock=None, alarms=AlarmsConfig()):
 TEMP_RULE = AlarmsConfig(cpu_temp=AlarmRule(enabled=True, warning=70, error=80, hysteresis=5))
 
 
+def printed_states(lines):
+    """(sekunda od startu, celkový stav) vypsaných řádků měření."""
+    printed = []
+    for line in lines:
+        if " UTC  SIM " in line:
+            stamp, rest = line.split(" UTC  SIM ")
+            second = (datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) - START_UTC)
+            printed.append((int(second.total_seconds()), rest.split()[0]))
+    return printed
+
+
 def offsets(times):
     """Časy relativně k START, aby se v testech daly číst plánované sekundy."""
     return [time - START for time in times]
@@ -179,7 +190,7 @@ class ScheduleTest(unittest.TestCase):
         _, lines = run(clock, collector, utc_clock=utc_clock)
         self.assertEqual(offsets(collector.calls), [0, 10, 20, 30])
         self.assertEqual([results[0].observed_utc for results in collector.returned], utc_values)
-        self.assertTrue(lines[2].startswith("2026-10-19 11:00:00 UTC"))
+        self.assertTrue(lines[1].startswith("2026-10-19 12:00:00 UTC"))
 
 
 class DelayTest(unittest.TestCase):
@@ -392,15 +403,24 @@ class CollectorsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Collectors(FakeNetwork(), other)
 
-    def test_live_monitor_reads_system_and_configured_network(self):
+    def test_live_monitor_measures_each_collector_on_its_own_interval(self):
+        # SCHED-2: schválené intervaly; platnost výsledku 3 × interval kolektoru.
         monitor = live_monitor(Config(collector=CollectorConfig(interval_seconds=5), network=NetworkConfig("end0")))
-        system, fan, network = monitor.monitors
-        self.assertIsInstance(system, SystemMonitor)
-        self.assertIsInstance(network, NetworkMonitor)
-        self.assertEqual(network.interface, "end0")
-        self.assertEqual((system.validity_seconds, network.validity_seconds, monitor.validity_seconds), (15, 15, 15))
+        wiring = [(type(scheduled.monitor), tuple(scheduled.monitor.labels), scheduled.interval_seconds,
+                   scheduled.monitor.validity_seconds) for scheduled in monitor.monitors]
+        self.assertEqual(wiring, [
+            (SystemMonitor, (CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID), 5, 15),
+            (SystemMonitor, (DISK_ROOT_ID,), 1800, 5400),
+            (FanMonitor, tuple(FAN_LABELS), 10, 30),
+            (NetworkMonitor, tuple(NETWORK_LABELS), 1, 3),
+        ])
+        network = monitor.monitors[3].monitor
+        self.assertEqual((network.interface, network.details_interval, network.details_validity), ("end0", 60, 180))
+        self.assertEqual(network.gap_seconds, 15)  # rychlost i po zdržení smyčky do obvyklé platnosti
+        self.assertEqual({scheduled.validity_seconds for scheduled in monitor.monitors}, {15})
+        self.assertEqual(monitor.validity_seconds, 15)
         self.assertFalse(monitor.simulated)  # skutečné zdroje, nic se při vytvoření nečte
-        self.assertIsNone(live_monitor(Config()).monitors[2].interface)  # výchozí: automatický výběr
+        self.assertIsNone(live_monitor(Config()).monitors[3].monitor.interface)  # výchozí: automatický výběr
 
 
 class TerminationTest(unittest.TestCase):
@@ -434,14 +454,16 @@ class OutputTest(unittest.TestCase):
     def test_header_and_measurement_lines(self):
         clock = FakeClock(stop_at=START + 15)
         _, lines = run(clock, FakeCollector(clock))
-        self.assertIn("každých 10 s, platnost výsledků 30 s", lines[0])
+        self.assertIn("takt 10 s, historie a její kontroly každých 10 s, platnost jejich výsledků 30 s", lines[0])
         self.assertIn("Prahy: Teplota CPU vypnuto; Disk / vypnuto", lines[0])
+        self.assertIn("Výpis při změně stavu, jinak nejvýš jednou za 30 min", lines[0])
         self.assertIn("Ctrl+C", lines[0])
         self.assertEqual(
             lines[1],
             "2026-10-19 12:00:00 UTC  SIM INFO     CPU 5 % | Teplota CPU 48 °C | RAM 24 % z 7,9 GiB | Disk / 31 % z 117 GiB",
         )
-        self.assertTrue(lines[2].startswith("2026-10-19 12:00:10 UTC  SIM INFO "))
+        # Druhé měření nic významného nezměnilo (jen čas): řádek nevznikne (SCHED-2).
+        self.assertEqual(lines[2:], ["\nUkončeno (Ctrl+C), počet měření: 2."])
 
     def test_real_results_have_no_sim_mark(self):
         result = CheckResult(CPU_USAGE_ID, State.INFO, "CPU 5 %", START_UTC, START + 30, simulated=False)
@@ -467,11 +489,11 @@ class AlarmLoopTest(unittest.TestCase):
         collector.temperatures = [60, 72, 72, 72, 85, 85]
         results, lines = run(clock, collector, alarms=TEMP_RULE)
         self.assertIn("Prahy: Teplota CPU WARNING od 70 °C, ERROR od 80 °C; Disk / vypnuto", lines[0])
-        states = [line.split()[4] for line in lines[1:7]]  # za "UTC  SIM"
-        self.assertEqual(states, ["INFO", "INFO", "INFO", "WARNING", "WARNING", "WARNING"])
-        self.assertIn("Teplota CPU 72 °C [WARNING]", lines[4])
-        self.assertIn("CPU 5 % |", lines[4])  # ostatní hodnoty beze značky
-        self.assertTrue(lines[4].startswith("2026-10-19 12:00:30 UTC  SIM WARNING"))  # simulace je vidět
+        # Řádek jen při změně stavu (SCHED-2): první měření a potvrzený WARNING.
+        self.assertEqual(printed_states(lines), [(0, "INFO"), (30, "WARNING")])
+        self.assertIn("Teplota CPU 72 °C [WARNING]", lines[2])
+        self.assertIn("CPU 5 % |", lines[2])  # ostatní hodnoty beze značky
+        self.assertTrue(lines[2].startswith("2026-10-19 12:00:30 UTC  SIM WARNING"))  # simulace je vidět
         temperature = results[1]
         self.assertEqual((temperature.state, temperature.measurement.value), (State.WARNING, 85))
 
@@ -481,9 +503,8 @@ class AlarmLoopTest(unittest.TestCase):
         collector.temperatures = [72, 72, None, 72, 72, 72]
         collector.errors = {3: RuntimeError("simulovaný výpadek")}
         _, lines = run(clock, collector, alarms=TEMP_RULE)
-        states = [line.split()[4] for line in lines[1:7]]
         # Výpadek přeruší řadu: WARNING až po třech platných měřeních po něm.
-        self.assertEqual(states, ["INFO", "INFO", "UNKNOWN", "INFO", "INFO", "WARNING"])
+        self.assertEqual(printed_states(lines), [(0, "INFO"), (20, "UNKNOWN"), (30, "INFO"), (50, "WARNING")])
 
     def test_collector_failure_does_not_resolve_alarm(self):
         clock = FakeClock(stop_at=START + 65)
@@ -491,8 +512,84 @@ class AlarmLoopTest(unittest.TestCase):
         collector.temperatures = [72, 72, 72, None, 50, 50, 50]
         collector.errors = {4: RuntimeError("simulovaný výpadek")}
         _, lines = run(clock, collector, alarms=TEMP_RULE)
-        states = [line.split()[4] for line in lines[1:8]]
-        self.assertEqual(states, ["INFO", "INFO", "WARNING", "UNKNOWN", "WARNING", "INFO", "INFO"])
+        self.assertEqual(printed_states(lines),
+                         [(0, "INFO"), (20, "WARNING"), (30, "UNKNOWN"), (40, "WARNING"), (50, "INFO")])
+
+
+class TickCollector:
+    """Kolektor pro takt 1 s: CPU a RAM při každém volání, okno CPU pro historii, volitelně změna linky."""
+
+    simulated = True
+    labels = {CPU_USAGE_ID: "CPU", MEMORY_ID: "RAM", LINK_ID: "Síť"}
+    validity_seconds = 30
+
+    def __init__(self, link_down=(), stalls=None):
+        self.calls, self.windows = [], []
+        self.link_down = link_down  # (od, do) sekund od START: linka DOWN
+        self.stalls = stalls or {}  # sekunda od START -> zdržení měření (pomalá služba)
+        self.clock = None
+
+    def collect(self, now, observed_utc):
+        self.calls.append(now)
+        if self.clock is not None:
+            self.clock.now += self.stalls.get(now - START, 0)
+        down = bool(self.link_down) and self.link_down[0] <= now - START < self.link_down[1]
+        return [
+            CheckResult(CPU_USAGE_ID, State.INFO, "CPU 5 %", observed_utc, now + 15, simulated=True,
+                        measurement=Measurement(5, "%")),
+            CheckResult(MEMORY_ID, State.INFO, "RAM 24 %", observed_utc, now + 15, simulated=True,
+                        measurement=Measurement(24, "%")),
+            CheckResult(LINK_ID, State.INFO, "Síť eth0", observed_utc, now + 180, simulated=True,
+                        details={"link": "DOWN" if down else "UP"}),
+        ]
+
+    def window_results(self, now, observed_utc, validity_seconds):
+        self.windows.append(now)
+        return {CPU_USAGE_ID}, [CheckResult(CPU_USAGE_ID, State.INFO, "CPU okno", observed_utc, now + validity_seconds,
+                                            simulated=True, measurement=Measurement(7, "%"))]
+
+
+class LiveLoopTest(unittest.TestCase):
+    """SCHED-2: takt 1 s, historie a její kontroly po intervalu, výpis jen při změně."""
+
+    def run_live(self, collector, seconds, link=None):
+        clock = FakeClock(stop_at=START + seconds)
+        collector.clock = clock
+        lines = []
+        results = run_loop(collector, CONFIG, AlarmEvaluator(AlarmsConfig()), clock=clock, utc_clock=clock.utc,
+                           sleep=clock.sleep, output=lines.append, history_link=link, tick_seconds=1)
+        return results, lines
+
+    def test_every_tick_measures_but_history_only_every_interval(self):
+        collector, link = TickCollector(), FakeLink()
+        results, _ = self.run_live(collector, 35, link)
+        self.assertEqual(offsets(collector.calls), list(range(35)))  # takty 0–34 s
+        for times in ([measured for _, measured in link.recorded], link.plans, link.checks, link.snapshot_checks,
+                      collector.windows):
+            self.assertEqual(offsets(times), [0, 10, 20, 30])
+        # Okno CPU nahradí živé měření a jde první (časová základna historie); RAM beze změny.
+        for recorded, measured in link.recorded:
+            self.assertEqual([(r.id, r.summary) for r in recorded],
+                             [(CPU_USAGE_ID, "CPU okno"), (MEMORY_ID, "RAM 24 %"), (LINK_ID, "Síť eth0")])
+            self.assertEqual(recorded[0].expires_monotonic, measured + CONFIG.validity_seconds)
+        # Kontroly historie mezi zápisy platí dál (3 × interval), nevznikají každý takt.
+        storage = {r.id: r for r in results}["history.storage"]
+        self.assertEqual(storage.expires_monotonic, START + 30 + 30)
+
+    def test_output_only_on_change_or_every_30_minutes(self):
+        _, lines = self.run_live(TickCollector(link_down=(100, 110)), 2 * 3600)
+        printed = [line[11:19] for line in lines if " UTC  SIM " in line]
+        self.assertEqual(printed, ["12:00:00", "12:01:40", "12:01:50", "12:31:50", "13:01:50", "13:31:50"])
+        self.assertEqual(len(lines), 1 + len(printed) + 1)  # úvod, řádky, ukončení: nic za každý takt
+
+    def test_delay_message_only_after_a_whole_history_interval(self):
+        collector = TickCollector(stalls={5: 3, 20: 12})
+        _, lines = self.run_live(collector, 60)
+        delays = [line for line in lines if line.startswith("Zpoždění")]
+        # Zdržení 3 s takt jen posune; 12 s v taktu 20 je 11 s po taktu 21 (nad 10 s), ohlásí se.
+        self.assertEqual(delays, ["Zpoždění 11.0 s: zmeškaná měření se nedohánějí, interval začíná znovu."])
+        calls = offsets(collector.calls)
+        self.assertEqual(calls[5:8], [5, 8, 9])  # zmeškané takty se nedohánějí
 
 
 class OledCompatibilityTest(unittest.TestCase):
@@ -690,8 +787,7 @@ class CollectorFailureTest(unittest.TestCase):
         collector.temperatures = [70.0] * 6
         collector.errors[2] = OSError("čtení selhalo")
         results, lines = run(clock, collector, alarms=AlarmsConfig(cpu_temp=rule))
-        states = [line.split("UTC  SIM ")[1].split()[0] for line in lines[1:-1]]
-        self.assertEqual(states, ["INFO", "UNKNOWN", "INFO", "ERROR", "ERROR"])
+        self.assertEqual(printed_states(lines), [(0, "INFO"), (10, "UNKNOWN"), (20, "INFO"), (30, "ERROR")])
         self.assertIs({result.id: result.state for result in results}[CPU_TEMP_ID], State.ERROR)
 
 
@@ -850,12 +946,13 @@ class MainTest(unittest.TestCase):
         self.assertFalse(any(rule.enabled for rule, _ in evaluator.rules.values()))
         # Smyčka měří systém i síť, rozhraní se vybírá automaticky.
         self.assertEqual(list(monitor.labels), list(LABELS) + list(FAN_LABELS) + list(NETWORK_LABELS))
-        self.assertIsNone(monitor.monitors[2].interface)
+        self.assertIsNone(monitor.monitors[3].monitor.interface)
+        self.assertEqual(run_loop_mock.call_args.kwargs["tick_seconds"], 1)  # živé měření po 1 s
 
     def test_network_interface_from_config(self):
         run_loop_mock, _ = self.run_main(["--config", self.write_config('[network]\ninterface = "eth0"\n')])
         monitor, _, _ = run_loop_mock.call_args.args
-        self.assertEqual(monitor.monitors[2].interface, "eth0")
+        self.assertEqual(monitor.monitors[3].monitor.interface, "eth0")
 
     def test_alarm_rules_from_config(self):
         text = "[alarms.disk_root]\nenabled = true\nwarning = 85\nerror = 95\nhysteresis = 3\n"

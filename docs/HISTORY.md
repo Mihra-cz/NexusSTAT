@@ -6,7 +6,7 @@ Vychází z požadavků v `REQUIREMENTS.md` (Historie a databáze SQLite) a ze s
 
 ## 1. Co dnes existuje a co se bude ukládat
 
-`CheckResult` má `id`, `state`, `summary` (česky, jen k zobrazení), `observed_utc` (UTC), `expires_monotonic` (monotónní čas běžícího procesu), `simulated`, volitelně `measurement` (`value`, `unit`) a `details` (krátké texty ASCII). Smyčka `run_loop` změří všechny kontroly jednou za interval (výchozí 10 s) se společným `observed_utc` a výsledky projdou `AlarmEvaluator`em. Od SCHED-1 jsou výjimkou kontroly služeb (`service.animedb`, `service.nas`, `service.backup`): skutečně se měří jen ve svém termínu a mezi termíny smyčka předává tentýž výsledek se starším `observed_utc` a původní `expires_monotonic`. Zapisovač ho pozná jako totéž měření (`ChangeTracker` při předání nevytvoří změnu, `HistoryRecorder` ho započte jako duplicitu) a číselnou řadu služby nemají, takže se nic nezapíše znovu jako nové. Časovou základnu souhrnu ztrát (`history.rejected`, nejvýš jednou za hodinu) určuje jen první výsledek měření, protože platnost výsledků služeb sahá až k jejich další kontrole.
+`CheckResult` má `id`, `state`, `summary` (česky, jen k zobrazení), `observed_utc` (UTC), `expires_monotonic` (monotónní čas běžícího procesu), `simulated`, volitelně `measurement` (`value`, `unit`) a `details` (krátké texty ASCII). Smyčka `run_loop` změří všechny kontroly jednou za interval (výchozí 10 s) se společným `observed_utc` a výsledky projdou `AlarmEvaluator`em. Od SCHED-1 jsou výjimkou kontroly služeb (`service.animedb`, `service.nas`, `service.backup`): skutečně se měří jen ve svém termínu a mezi termíny smyčka předává tentýž výsledek se starším `observed_utc` a původní `expires_monotonic`. Zapisovač ho pozná jako totéž měření (`ChangeTracker` při předání nevytvoří změnu, `HistoryRecorder` ho započte jako duplicitu) a číselnou řadu služby nemají, takže se nic nezapíše znovu jako nové. Časovou základnu souhrnu ztrát (`history.rejected`, nejvýš jednou za hodinu) určuje jen první výsledek měření, protože platnost výsledků služeb sahá až k jejich další kontrole. Od SCHED-2 měří smyčka v taktu 1 s a kolektory ve vlastních intervalech, ale do historie jde měření dál jen jednou za `[collector] interval_seconds` (výchozí 10 s, `run.interval_s`); vytížení CPU a rychlost RX/TX v něm jsou měření za celé okno od minulého zápisu (11.10).
 
 | Kontrola (`id`) | Údaj | Kam v historii |
 | --- | --- | --- |
@@ -1411,6 +1411,23 @@ Agregace je metoda jediného zapisovače `HistoryRecorder`: používá jeho zapi
 - **Hranice ochrany `adopt` před cizím zapisovačem:** zámek `.lock` zachytí jen zapisovače NexusSTAT; cizí program pracující přímo se SQLite ho nerespektuje. Doloženě se proto kontroluje: existence `-wal`/`-shm` (otevřená databáze ve WAL je po nich vždy poznat), existence `-journal` (nedokončené zotavení), **SHA-256 vstupu před i po kopii** (zápis během čtení = odmítnutí) a úplné ověření výsledku plus nezávislé otevření po zveřejnění. **Výhradní přístup to nedokazuje** a kontrola SHA-256 není záruka konzistentní kopie živé databáze: `adopt` zůstává offline operací nad odstaveným souborem. Vstup se nemění za žádných okolností, takže nejhorším následkem souběhu je odmítnuté nebo zahozené převzetí.
 - **Co se nikdy nedělá:** automatická obnova, automatické nahrazení živé databáze, vytvoření chybějící databáze, převzetí produkční role, převzetí za běhu živého zapisovače, přepsání cíle a mazání generací.
 
+### 11.10 Živé měření a okno zápisu SCHED-2 (`run.py`, `system_monitor.py`, `network_monitor.py`)
+
+Od SCHED-2 tiká měřicí smyčka po 1 s (`LIVE_TICK_SECONDS`) a kolektory měří jen ve svých intervalech (síť RX/TX 1 s, CPU, teplota a RAM 5 s, ventilátor 10 s, rozhraní a IPv4 60 s, disk / 1800 s). **Schéma v1 ani způsob zápisu se nemění:** do historie jde měření jednou za `[collector] interval_seconds` (výchozí 10 s, `run.interval_s` beze změny), aby živé měření nezvýšilo počet řádků ani zápisů na SSD.
+
+| Veličina | Co dostane historie při zápisu po 10 s | Proč |
+| --- | --- | --- |
+| vytížení CPU, rychlost RX/TX | **měření za celé okno od minulého zápisu**: součet rozdílů čítačů všech platných kroků (jiffy, bajty) / změřená doba (`window_results`) | je to průměr za interval; jeden z kratších živých vzorků (5 s, 1 s) by tiše změnil význam řady a průměry v `agg_5m` by byly jen odhadem ze vzorku |
+| teplota, RAM, ventilátor | poslední skutečné měření (při výchozím nastavení měřené ve stejném taktu jako zápis) | okamžitá hodnota; dřív stejně jedno měření za 10 s |
+| disk / | jen jeho vlastní měření po 1800 s; kopie z mezipaměti jsou duplicity | žádný opakovaný vzorek jako nový |
+| linka, IPv4, služby | jen změny (`check_change`) | beze změny |
+
+- Okno má čas a platnost zápisu (`observed_utc` zápisu, `expires_monotonic` = čas zápisu + 3 × interval), stejně jako dřív každé měření; okna jdou v měření první, takže časová základna zapisovače (první výsledek: kontrola skoku hodin, kvalita času, souhrn ztrát) je stejná jako dřív a různé platnosti živých kolektorů nevytvoří falešný `clock.jump` (ověřeno testem se skutečným `HistoryRecorder`).
+- **Okno platí jen za přesně pokrytý úsek:** kroky musí navazovat od minulého zápisu do tohoto zápisu (skutečně uplynulý monotónní čas, ne nominální interval). Proto se zapnutou historií musí být `[collector] interval_seconds` násobkem 5 s (měření CPU); 7 nebo 11 s konfigurace odmítne, protože okno CPU by s časem zápisu pokrývalo jiný úsek (doplněno při review). Pevné intervaly kolektorů i zápis mají společnou mřížku od prvního taktu (`run.grid_after`), takže se CPU po 5 s a zápis po 10 s znovu sejdou i po zdržení smyčky (timeout služby, pozastavení); bez toho by se po zdržení nad 5 s mřížky trvale rozešly. Nepokrytá část okna (např. chybějící měření CPU v taktu zápisu) dá `UNKNOWN`, nikdy hodnotu za jiný úsek.
+- Neplatný krok v okně (reset čítače, změna rozhraní, mezera nad 30 s, nečitelný čítač, čítače CPU zpět) dá celé okno `UNKNOWN`, nikdy odhad. Selhané čtení `/proc/stat` okno nepřeruší: předchozí vzorek zůstává a další krok mezeru přesně překlene. Okno bez kroků (zápis častější než měření) nevrací nic: v historii zůstane mezera, ne opakovaný vzorek.
+- Kolektory, kontroly historie (`history.storage`, `history.snapshot`) i plán denního snímku běží v taktu, který měl dosud každý zápis; snímek SQLite se dál žádá nejvýš jednou denně.
+- Okno je přechodné řešení do schválení 30s souhrnů (12.5); obsah historie se jím proti v0.6 nemění.
+
 ## 12. Rozhodnutí ke schválení
 
 ### 12.1 Už schválené požadavky (nejsou předmětem rozhodnutí)
@@ -1468,6 +1485,34 @@ Než NexusSTAT začne na Nexusu zapisovat produkční historii, musí platit vš
 7. Ostatní podmínky M7 (převzetí funkcí Pironmanu po jedné, rollback) beze změny.
 
 Schválení architektury M2 (2026-10-20) žádnou z těchto podmínek nesplňuje ani nenahrazuje.
+
+### 12.5 Návrh: 30sekundové souhrny (SCHED-2, ke schválení, neimplementováno)
+
+**Cíl:** oddělit rychlé živé měření od historie a ukládat pro CPU, teplotu, RAM, ventilátor a síť souhrn za 30 s (minimum, maximum, průměr; u sítě i skutečný objem dat), aniž by se souhrn vydával za okamžité měření.
+
+**Ověření současné implementace (schéma v1):**
+
+| Možnost | Výsledek |
+| --- | --- |
+| uložit průměr okna do `sample` | **nelze**: tabulka nese jednu hodnotu měření se svým časem; min a max by se ztratily a souhrn by v řadě vypadal jako okamžité měření (porušení 2 a 4.1) |
+| uložit okno do `agg_5m` | **nelze**: pevná 5min okna (`bucket % 300 = 0`), posun `done_until`, agregace ze `sample`; 30s okno by porušilo kontrakt i ochranu proti přepisu (6.2) |
+| uložit souhrn jako `event` (JSON) | **nevhodné**: není to událost, nešlo by z něj agregovat ani mazat podle retence vzorků |
+| dočasné okno za interval zápisu (11.10) | **implementováno**: přesné jen pro průměr, min a max za 30 s neuchová |
+
+Ukládání 30s souhrnů proto **vyžaduje změnu schématu (v2)**. Žádná automatická migrace se neprovádí; tento oddíl je samostatný návrh ke schválení.
+
+**Nejmenší bezpečný postup (návrh):**
+
+1. **Souhrn v RAM hlavního vlákna**, žádné nové vlákno: pro každou řadu katalogu okno `[b, b + 30)` zarovnané na UTC (`b % 30 = 0`) jen ze skutečných živých měření (identita `expires_monotonic`, kopie z mezipaměti se nezapočtou). Uchová `n_samples`, `n_valid`, `min`, `max`, `sum` jako `agg_5m`. Vytížení CPU a RX/TX: průměr ze součtu čítačů (jiffy, bajty) za změřenou dobu, min a max z jednotlivých kroků (1 s, 5 s).
+2. **NETWORK navíc** `bytes` (skutečný přenesený objem z rozdílů čítačů) a `covered_s` (změřená doba v okně): přesný objem i průměrná rychlost; mezera, reset čítače nebo změna rozhraní kroky nezapočte a nižší `covered_s` to přizná.
+3. **Nová tabulka `agg_30s`** (`metric_id`, `bucket`, `n_samples`, `n_valid`, `min`, `max`, `sum`, `bytes` NULL, `covered_s`), `STRICT`, WITHOUT ROWID, PK (`metric_id`, `bucket`), `CHECK (bucket % 30 = 0)`. Zápis jen uzavřeného okna, předání vláknu zapisovače jako dnes (dávka 60 s), kvalita času jako u vzorků (`synced`/`derived`, `unsynced` čeká nebo je doložená ztráta), konflikt se nikdy nepřepíše (`ERROR`, 6.2).
+4. **`agg_5m` ze `agg_30s`** místo ze `sample` (přesné součty `sum(sum)`, `sum(n_valid)`, `min(min)`, `max(max)`); hodinové beze změny. Pro tyto řady by `sample` přestal vznikat; `disk.root` a další pomalé řady zůstanou v `sample`.
+5. **Retence:** `agg_30s` nejméně 30 dní jako dnes surové vzorky (R1), mazání jen pod hotovou agregací 5 min (7).
+6. **Beze změny:** `check_change` (každá změna stavu a provozních údajů s přesným časem), `event`, kvalita času, evidence výpadků a ztrát, snímky. Web zobrazí souhrn jako průměr, min a max okna, nikdy jako okamžitou hodnotu.
+7. **Migrace v1 → v2** jen ručním příkazem správce nad zastavenou databází (jako `adopt`: vstup beze změny, nový soubor, ověření), `user_version` 2 a záznam v `schema_migration`; aplikace sama nemigruje a v1 dál otevře jen pro čtení. Snímky, `info` a test obnovy musí znát obě verze.
+8. **Objem:** 6 řad (CPU, teplota, RAM, ventilátor, RX, TX) × 2 880 oken denně = 17 280 řádků proti dnešním 51 840 surovým vzorkům těchto řad, přitom s min a max každé sekundy u sítě; méně zápisů na SSD i menší snímek.
+
+**Rozhodnutí ke schválení:** (S1) tabulka `agg_30s` a schéma v2; (S2) zda pro tyto řady ukončit `sample`, nebo ho krátce ponechat souběžně; (S3) retence `agg_30s`; (S4) ruční migrace a její test na kopii; (S5) sloupce `bytes`/`covered_s` jen pro síť. Do schválení platí dočasné okno 11.10.
 
 ## 13. Revize
 

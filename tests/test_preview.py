@@ -365,12 +365,14 @@ class LiveTest(unittest.TestCase):
         self.assertIn("NOTEBOOKU, ne Nexusu", session.source_text())
         self.assertIn("SIMULACE", make_session("ok")[0].source_text())
 
-    def test_live_uses_collector_interval_and_session_time(self):
+    def test_live_refreshes_every_tick_and_uses_session_time(self):
+        # SCHED-2: LIVE se ptá kolektorů každý takt (1 s); skutečně měří jen
+        # kolektory, které mají termín (Scheduled v live_monitor).
         session, real = make_session(LIVE)
         monitor = session.monitor
         run_for(session, real, 25, step=1)
-        self.assertEqual([now for now, _ in monitor.calls], [0, 10, 20])  # interval kolektoru 10 s
-        self.assertEqual({r.expires_monotonic for r in session.results}, {20 + 30})
+        self.assertEqual([now for now, _ in monitor.calls], list(range(26)))
+        self.assertEqual({r.expires_monotonic for r in session.results}, {25 + 30})
         self.assertEqual({utc for _, utc in monitor.calls}, {START_UTC})  # skutečný UTC čas měření
 
     def test_live_results_are_real_with_unconnected_services(self):
@@ -418,8 +420,10 @@ class LiveTest(unittest.TestCase):
         self.assertIs(inspect.signature(PreviewSession).parameters["monitor_factory"].default, live_monitor)
         monitor = live_monitor(config)
         self.assertIsInstance(monitor, Collectors)
-        self.assertEqual([type(m) for m in monitor.monitors], [SystemMonitor, FanMonitor, NetworkMonitor])
-        self.assertEqual(monitor.monitors[2].interface, "end0")
+        # Kolektory přes Scheduled (SCHED-2): systém zvlášť rychlý a disk, ventilátor, síť.
+        self.assertEqual([type(m.monitor) for m in monitor.monitors],
+                         [SystemMonitor, SystemMonitor, FanMonitor, NetworkMonitor])
+        self.assertEqual(monitor.monitors[3].monitor.interface, "end0")
         self.assertEqual(list(monitor.labels),
                          list(SYSTEM_LABELS) + list(FAN_LABELS) + list(NETWORK_LABELS))
 

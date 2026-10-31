@@ -19,7 +19,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import Config, load_config
+from .config import CPU_INTERVAL_SECONDS, LIVE_TICK_SECONDS, Config, load_config
 from .core import CheckResult, Measurement, State, active_problems
 from .fan_monitor import CPU_FAN_ID, DEVICE, FAN_ON, FAN_STATE, RPM, SOURCE, SOURCE_RPM
 from .network_monitor import (
@@ -157,16 +157,21 @@ def run_live(output_dir, config):
     výsledků, [network] pro sledované rozhraní, [services] pro AnimeDB, NAS a zálohy.
     """
     monitor = live_monitor(config)
-    monitor.collect(time.monotonic(), datetime.now(timezone.utc))  # první vzorek CPU a síťových čítačů
-    time.sleep(1)
-    now = time.monotonic()
-    observed_utc = datetime.now(timezone.utc)
+    # Kolektory měří ve svých intervalech (SCHED-2): síť po 1 s, CPU po 5 s.
+    # Proto se měří v taktu, dokud CPU nemá druhý vzorek, a snímek je z posledního.
+    taken = 0
+    while True:
+        now = time.monotonic()
+        observed_utc = datetime.now(timezone.utc)
+        results = monitor.collect(now, observed_utc)
+        if taken >= CPU_INTERVAL_SECONDS:
+            break
+        time.sleep(LIVE_TICK_SECONDS)
+        taken += LIVE_TICK_SECONDS
     # Kolektor NEXUS zatím není: je UNKNOWN (bez dat) na všech obrazovkách.
     # AnimeDB, NAS a BACKUP jsou N/A, ledaže je zapnutá jejich kontrola.
-    results = complete_service_results(
-        monitor.collect(now, observed_utc), observed_utc, now + config.collector.validity_seconds,
-        monitored=monitor.labels,
-    )
+    results = complete_service_results(results, observed_utc, now + config.collector.validity_seconds,
+                                       monitored=monitor.labels)
     for result in results:
         print(f"{result.id:<17} {result.state.value:<8} {result.summary}")
 

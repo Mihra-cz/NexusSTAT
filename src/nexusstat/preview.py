@@ -25,7 +25,7 @@ from pathlib import Path
 
 from . import rgb
 from .alarms import AlarmEvaluator
-from .config import HEALTH_TIMEOUT_DEFAULT, NAS_PORT_DEFAULT, Config, ConfigError, load_config
+from .config import HEALTH_TIMEOUT_DEFAULT, LIVE_TICK_SECONDS, NAS_PORT_DEFAULT, Config, ConfigError, load_config
 from .core import CheckResult, Measurement, State, active_problems
 from .nas_monitor import NasMonitor
 from .network_monitor import (
@@ -439,7 +439,9 @@ class PreviewSession:
         # Služba se zapnutým kolektorem (LIVE, např. AnimeDB) bez výsledku je UNKNOWN, ne N/A.
         enabled = self.monitor.labels if self.monitor is not None else ()
         self.results = complete_service_results(measured, observed_utc, now + self.validity, monitored=enabled)
-        self.next_refresh = now + self.interval
+        # LIVE obnovuje v taktu živého měření (SCHED-2); kolektory samy měří jen ve
+        # svých termínech. Fiktivní scénáře dál po intervalu kolektoru.
+        self.next_refresh = now + (LIVE_TICK_SECONDS if self.is_live else self.interval)
 
     def _refresh_if_due(self, now):
         if now >= self.next_refresh:

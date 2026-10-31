@@ -9,7 +9,10 @@ page_seconds = 10         # celé sekundy 1–3600, nejvýše carousel_seconds
 status_idle_seconds = 30  # celé sekundy 1–3600
 
 [collector]
-interval_seconds = 10  # celé sekundy 1–3600; platnost výsledků = 3 × interval (nenastavuje se zvlášť)
+# Zápis do historie, její kontroly a plán snímků (výchozí 10 s; platnost jejich výsledků 3 × interval).
+# Živé měření má od SCHED-2 takt 1 s a pevné intervaly kolektorů (síť 1 s, CPU/RAM/teplota 5 s,
+# ventilátor 10 s, rozhraní a IPv4 60 s, disk 1800 s); ty se zatím nenastavují.
+interval_seconds = 10  # celé sekundy 1–3600; se zapnutou historií násobek 5 s (okno CPU)
 
 # Síťové rozhraní pro stránku NETWORK a výpis. Bez klíče interface se vybírá
 # automaticky: fyzické rozhraní s výchozí trasou IPv4 (nejnižší metrika), jinak

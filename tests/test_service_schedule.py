@@ -1,4 +1,4 @@
-"""Testy šetrného plánování kontrol služeb (SCHED-1) se simulovaným časem.
+"""Testy šetrného plánování kontrol služeb (SCHED-1) a živého měření (SCHED-2) se simulovaným časem.
 
 Žádné skutečné čekání, síť ani systemd: spojení AnimeDB a NAS i výstup
 systemctl jsou podvržené a počítají skutečná volání, čas je číslo. Kolektory
@@ -7,9 +7,11 @@ a obal Scheduled jako v provozu); vymění se jen spojení, systemctl a hodiny.
 """
 
 import errno
+import math
 import subprocess
 import tempfile
 import unittest
+from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,10 +26,14 @@ from nexusstat.config import (ANIMEDB_INTERVAL_DEFAULT, NAS_INTERVAL_DEFAULT, Al
                               AnimeDbConfig, BackupConfig, CollectorConfig, Config, ConfigError, NasConfig,
                               ServicesConfig, load_config)
 from nexusstat.core import CheckResult, Measurement, State, effective
+from nexusstat.fan_monitor import CPU_FAN_ID, RPM
+from nexusstat.network_monitor import (BYTES_PER_SECOND, INTERFACE, IPV4_ID, LINK_ID, RX_RATE_ID, TX_RATE_ID,
+                                       NetworkMonitor)
 from nexusstat.nas_monitor import NasMonitor
-from nexusstat.run import COLLECTOR_FAILURE, Collectors, Scheduled, live_monitor, run_loop
+from nexusstat.run import COLLECTOR_FAILURE, Collectors, Scheduled, live_monitor, result_text, run_loop
 from nexusstat.services import ANIMEDB_ID, BACKUP_ID, CONFIRM_RETRY_SECONDS, NAS_ID, OutageConfirmation
-from nexusstat.system_monitor import CELSIUS, CPU_TEMP_ID, LABELS as SYSTEM_LABELS
+from nexusstat.system_monitor import (CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, LABELS as SYSTEM_LABELS,
+                                      MEMORY_ID, PERCENT, SystemMonitor)
 
 URL = "http://192.0.2.10:8080/health"  # dokumentační rozsah RFC 5737
 HOST = "192.0.2.20"
@@ -236,8 +242,10 @@ def wired(config, clock, animedb=None, nas=None, systemctl=None):
     """
     live = live_monitor(config)  # jen vytvoření: nic se nepřipojuje ani nespouští
     services = {}
-    for scheduled in live.monitors[3:]:
+    for scheduled in live.monitors:
         inner = scheduled.monitor
+        if not isinstance(inner, (AnimeDbMonitor, NasMonitor, BackupMonitor)):
+            continue  # systém, ventilátor a síť (SCHED-2) nahradí FakeSystem
         if isinstance(inner, AnimeDbMonitor):
             inner.connect, inner.clock = animedb, clock
         elif isinstance(inner, NasMonitor):
@@ -279,7 +287,8 @@ class FakeLink:
                            simulated=False)
 
 
-def run_for(monitor, clock, seconds, history_link=None, pause=None):
+def run_for(monitor, clock, seconds, history_link=None, pause=None, tick_seconds=None, alarms=None,
+            config=None):
     """Smyčka run_loop po simulovanou dobu; vrací (poslední výsledky, řádky, výsledky po taktech).
 
     `pause` = (od, délka): proces je jednou pozastavený (hodiny poskočí).
@@ -305,9 +314,12 @@ def run_for(monitor, clock, seconds, history_link=None, pause=None):
             ticks.append((now, {result.id: result for result in results}))
             return results
 
-    results = run_loop(Recording(), CollectorConfig(), AlarmEvaluator(AlarmsConfig()), clock=clock,
+        def window_results(self, now, observed_utc, validity_seconds):
+            return monitor.window_results(now, observed_utc, validity_seconds)
+
+    results = run_loop(Recording(), config or CollectorConfig(), AlarmEvaluator(alarms or AlarmsConfig()), clock=clock,
                        utc_clock=lambda: utc_at(clock.now), sleep=sleep, output=lines.append,
-                       history_link=history_link)
+                       history_link=history_link, tick_seconds=tick_seconds)
     return results, lines, ticks
 
 
@@ -435,7 +447,10 @@ class OutageScheduleTest(unittest.TestCase):
         nas, ticks, lines, _ = self.nas(lambda now: REFUSED if now < START + 100 else HEALTHY)
         self.assertEqual([call - START for call in nas.calls][:7], [0, 30, 60, 1860, 1890, 3690, 5490])
         self.assertEqual(self.states(ticks)[2:5], [(60, State.ERROR), (1860, State.ERROR), (1890, State.OK)])
-        self.assertIn("(výpadek odeznívá, 1/2) [ERROR]", lines[1 + 186])  # první úspěch nic nevyřeší
+        # První úspěch nic nevyřeší; řádek vznikne, protože se změnil důvod (details).
+        [recovering] = [line for line in lines if "odeznívá" in line]
+        self.assertIn("(výpadek odeznívá, 1/2) [ERROR]", recovering)
+        self.assertTrue(recovering.startswith(f"{utc_at(START + 1860):%Y-%m-%d %H:%M:%S} UTC"))
 
     def test_failed_or_unknown_recovery_retry_returns_to_slow_interval(self):
         for name, outcome, state in (("neúspěch", REFUSED, State.ERROR), ("UNKNOWN", NO_DESCRIPTORS, State.UNKNOWN)):
@@ -557,13 +572,19 @@ class CacheAndValidityTest(unittest.TestCase):
         clock = FakeClock()
         monitor, _ = wired(services_config(nas=False, timer=None), clock, Endpoint(clock),
                            systemctl=DailyBackup(clock, timer=False))
-        _, lines, _ = run_for(monitor, clock, 2 * HOUR)
+        _, lines, ticks = run_for(monitor, clock, 2 * HOUR)
         self.assertIn("AnimeDB: /health odpovídá, status ok |", lines[1])  # právě ověřeno: bez poznámky
-        self.assertNotIn("ověřeno před", lines[6])  # 50 s: méně než minuta
-        self.assertIn("AnimeDB: /health odpovídá, status ok (ověřeno před 5 min)", lines[1 + 30])
-        self.assertIn("AnimeDB: /health odpovídá, status ok |", lines[1 + 90])  # nová kontrola v 15. minutě
-        # Popis nese stáří z okamžiku dotazu; poznámka přizná, že dotaz je 1,5 h starý.
-        self.assertIn("Záloha: úloha naposledy skončila úspěšně před 7.8 h (ověřeno před 1.5 h)", lines[1 + 540])
+        # Souhrnný řádek po 30 min (SCHED-2): AnimeDB právě zkontrolovaná, záloha z dotazu po
+        # spuštění; popis nese stáří z okamžiku dotazu a poznámka přizná stáří dotazu.
+        [summary] = [line for line in lines if line.startswith(f"{utc_at(START + 1800):%Y-%m-%d %H:%M:%S} UTC")]
+        self.assertIn("AnimeDB: /health odpovídá, status ok |", summary)
+        self.assertIn("Záloha: úloha naposledy skončila úspěšně před 7.8 h (ověřeno před 30 min)", summary)
+        animedb = ticks[0][1][ANIMEDB_ID]
+        for seconds, note in ((59, ""), (60, " (ověřeno před 1 min)"), (5 * 60 + 30, " (ověřeno před 5 min)"),
+                              (90 * 60, " (ověřeno před 1.5 h)")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(result_text(animedb, animedb.observed_utc + timedelta(seconds=seconds)),
+                                 animedb.summary + note)
 
     def test_rgb_acknowledgement_needs_three_real_clean_checks(self):
         clock = FakeClock()
@@ -610,17 +631,271 @@ class CacheAndValidityTest(unittest.TestCase):
                 return now + 60
 
         rule = AlarmRule(enabled=True, warning=70, error=80, hysteresis=2)
-        hot = Hot()
+        # (termín, takt smyčky, doba, třetí skutečné měření): služba ze SCHED-1 a teplota po 5 s v taktu 1 s.
+        for interval, tick, seconds, third in ((None, None, 3 * 60, 120), (5, 1, 15, 10)):
+            with self.subTest(interval=interval, tick=tick):
+                hot = Hot()
+                clock = FakeClock()
+                _, _, ticks = run_for(Collectors(Scheduled(hot, GRACE, interval_seconds=interval)), clock, seconds,
+                                      tick_seconds=tick)
+                evaluated = []
+                evaluator = AlarmEvaluator(AlarmsConfig(cpu_temp=rule))
+                for now, results in ticks:
+                    [result] = evaluator.evaluate([results[CPU_TEMP_ID]], now)
+                    evaluated.append((now - START, result.state))
+                self.assertEqual(len(hot.calls), 3)
+                first_error = next(offset for offset, state in evaluated if state is State.ERROR)
+                self.assertEqual(first_error, third)  # třetí skutečné měření, ne třetí takt
+
+
+class Counting:
+    """Náhrada živého kolektoru v Scheduled (SCHED-2): stejná id a platnost, počítá skutečná měření.
+
+    Hodnoty jsou ve správných jednotkách katalogu historie; `window_ids` vede
+    okno zápisu jako skutečné kolektory (vytížení CPU, RX/TX).
+    """
+
+    simulated = False
+    MEASUREMENTS = {CPU_USAGE_ID: (5.0, PERCENT), CPU_TEMP_ID: (48.0, CELSIUS), MEMORY_ID: (24.0, PERCENT),
+                    DISK_ROOT_ID: (31.0, PERCENT), CPU_FAN_ID: (3200.0, RPM), RX_RATE_ID: (1200.0, BYTES_PER_SECOND),
+                    TX_RATE_ID: (300.0, BYTES_PER_SECOND)}
+    DETAILS = {CPU_FAN_ID: {"fan": "ON"}, RX_RATE_ID: {INTERFACE: "eth0"}, TX_RATE_ID: {INTERFACE: "eth0"},
+               LINK_ID: {INTERFACE: "eth0", "link": "UP"}, IPV4_ID: {INTERFACE: "eth0", "ipv4": "192.0.2.10"}}
+
+    def __init__(self, original, window_ids=()):
+        self.labels, self.validity_seconds = original.labels, original.validity_seconds
+        self.window_ids = set(window_ids)
+        self.calls = 0
+
+    def result(self, check_id, observed_utc, expires):
+        value = self.MEASUREMENTS.get(check_id)
+        return CheckResult(check_id, State.INFO, self.labels.get(check_id, check_id), observed_utc, expires,
+                           simulated=False, measurement=None if value is None else Measurement(*value),
+                           details=self.DETAILS.get(check_id, {}))
+
+    def collect(self, now, observed_utc):
+        self.calls += 1
+        return [self.result(check_id, observed_utc, now + self.validity_seconds) for check_id in self.labels]
+
+    def window_results(self, now, observed_utc, validity_seconds):
+        return self.window_ids, [self.result(check_id, observed_utc, now + validity_seconds)
+                                 for check_id in sorted(self.window_ids)]
+
+
+def live_counted(config, clock, animedb, nas, systemctl):
+    """Celé zapojení run.live_monitor (SCHED-2), živé kolektory nahrazené počítadly, služby podvržené."""
+    live = live_monitor(config)
+    counters = {}
+    for scheduled in live.monitors:
+        inner = scheduled.monitor
+        if isinstance(inner, AnimeDbMonitor):
+            inner.connect, inner.clock = animedb, clock
+        elif isinstance(inner, NasMonitor):
+            inner.connect = nas
+        elif isinstance(inner, BackupMonitor):
+            inner.run, inner.clock = systemctl, clock
+        else:
+            windows = {CPU_USAGE_ID, RX_RATE_ID, TX_RATE_ID} & set(inner.labels)
+            scheduled.monitor = Counting(inner, windows)
+            counters[tuple(inner.labels)] = scheduled.monitor
+    return live, counters
+
+
+class LiveMeasurementTest(unittest.TestCase):
+    """SCHED-2: takt 1 s, kolektory v intervalech 1/5/10/60/1800 s, historie po 10 s."""
+
+    def test_real_measurements_in_24_hours(self):
         clock = FakeClock()
-        _, _, ticks = run_for(Collectors(Scheduled(hot, GRACE)), clock, 3 * 60)
-        evaluated = []
-        evaluator = AlarmEvaluator(AlarmsConfig(cpu_temp=rule))
-        for now, results in ticks:
-            [result] = evaluator.evaluate([results[CPU_TEMP_ID]], now)
-            evaluated.append((now - START, result.state))
-        self.assertEqual(len(hot.calls), 3)
-        first_error = next(offset for offset, state in evaluated if state is State.ERROR)
-        self.assertEqual(first_error, 120)  # třetí skutečné měření, ne třetí takt
+        animedb, nas, systemctl = Endpoint(clock), Endpoint(clock), DailyBackup(clock)
+        monitor, counters = live_counted(services_config(), clock, animedb, nas, systemctl)
+        link, lines = FakeLink(), []
+
+        def sleep(delay):
+            clock.advance(delay)
+            if clock.now >= START + DAY:
+                raise KeyboardInterrupt
+
+        run_loop(monitor, CollectorConfig(), AlarmEvaluator(AlarmsConfig()), clock=clock,
+                 utc_clock=lambda: utc_at(clock.now), sleep=sleep, output=lines.append, history_link=link,
+                 tick_seconds=1)
+        self.assertEqual({labels: counter.calls for labels, counter in counters.items()}, {
+            (CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID): 17_280,  # po 5 s
+            (DISK_ROOT_ID,): 48,  # po 1800 s
+            (CPU_FAN_ID,): 8_640,  # po 10 s
+            (LINK_ID, RX_RATE_ID, TX_RATE_ID, IPV4_ID): 86_400,  # čítače po 1 s (rozhraní a IPv4 uvnitř po 60 s)
+        })
+        self.assertEqual((len(animedb.calls), len(nas.calls), len(systemctl.calls)), (96, 48, 2))  # SCHED-1
+        self.assertEqual(len(link.recorded), 8_640)  # zápis do historie po 10 s jako dřív
+        self.assertEqual(link.requested, [datetime(2026, 10, 30, 3, 0, tzinfo=timezone.utc)])  # denní snímek
+        printed = [line for line in lines if " UTC  " in line]
+        self.assertEqual(len(printed), 48)  # beze změny jen souhrn po 30 min, ne 86 400 řádků
+        self.assertIn("počet měření: 86400", lines[-1])
+
+    def test_history_gets_windows_and_keeps_its_time_base(self):
+        clock = FakeClock()
+        monitor, _ = live_counted(services_config(), clock, Endpoint(clock), Endpoint(clock), DailyBackup(clock))
+        link = FakeLink()
+        run_for(monitor, clock, 2 * HOUR, history_link=link, tick_seconds=1)
+        self.assertEqual(len(link.recorded), 720)
+        for results, measured in link.recorded[:3]:
+            # Okna (CPU, RX, TX) jdou první se stejnou platností jako dřív každé měření.
+            self.assertEqual([r.id for r in results[:3]], [CPU_USAGE_ID, RX_RATE_ID, TX_RATE_ID])
+            self.assertEqual({r.expires_monotonic - measured for r in results[:3]}, {GRACE})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            base = int(START_UTC.timestamp())
+            history.create_database(path, "test", "0123456789abcdef", now_utc=base - 3600)
+            database = history.open_writer(path, "test", "0123456789abcdef")
+            try:
+                recorder = history.HistoryRecorder(database)
+                recorder.start_run("test", 10, utc_at(START - 60))
+                for start in range(0, len(link.recorded), 6):  # dávky po 60 s jako vlákno zapisovače
+                    batch = recorder.begin_batch()
+                    for results, _ in link.recorded[start:start + 6]:
+                        recorder.add_results(batch, results)
+                    recorder.write(batch)
+                count = database.connection.execute
+                jumps = count("SELECT count(*) FROM event WHERE kind = 'clock.jump'").fetchone()[0]
+                samples = dict(count("SELECT m.check_id, count(*) FROM sample s JOIN metric m ON m.id = s.metric_id "
+                                     "GROUP BY m.check_id").fetchall())
+            finally:
+                database.close()
+        self.assertEqual(jumps, 0)  # různé intervaly a platnosti nevytvoří falešný skok hodin
+        self.assertEqual(dict(recorder.rejected), {})  # žádná odmítnutá data
+        # Každý zápis jedno okno a čerstvé měření; disk po 1800 s jen jednou za své měření.
+        self.assertEqual(samples, {CPU_USAGE_ID: 720, RX_RATE_ID: 720, TX_RATE_ID: 720, CPU_TEMP_ID: 720,
+                                   MEMORY_ID: 720, CPU_FAN_ID: 720, DISK_ROOT_ID: 4})
+
+
+Statvfs = namedtuple("Statvfs", "f_frsize f_blocks f_bfree f_bavail")
+
+
+class LiveFixture:
+    """Skutečné SystemMonitor a NetworkMonitor (SCHED-2) nad soubory, jejichž hodnoty jsou funkcí času.
+
+    Před každým taktem zapíše /proc/stat, /proc/meminfo, teplotu a čítače sítě
+    pro simulovaný čas, takže přesnou hodnotu za libovolný úsek jde spočítat:
+    jiffy CPU busy(t) a total(t), bajty rx(t). Nic se nečte ze skutečného systému.
+    """
+
+    def __init__(self, directory, clock, temperature=None, stalls=None):
+        base = Path(directory)
+        self.proc, self.thermal, self.net = base / "proc", base / "thermal", base / "net"
+        (self.thermal / "thermal_zone0").mkdir(parents=True)
+        (self.thermal / "thermal_zone0" / "type").write_text("x86_pkg_temp\n", encoding="ascii")
+        (self.net / "eth0" / "statistics").mkdir(parents=True)
+        (self.net / "eth0" / "device").mkdir()
+        for name, value in (("operstate", "up"), ("carrier", "1"), ("ifindex", "2")):
+            (self.net / "eth0" / name).write_text(f"{value}\n", encoding="ascii")
+        self.route = base / "route"
+        self.route.write_text("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+                              "eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n", encoding="ascii")
+        self.proc.mkdir()
+        self.clock = clock
+        self.temperature = temperature or (lambda t: 50 + (int(t) // 5) % 7 - 3)  # kolísá o ±3 °C
+        self.stalls = stalls or {}  # sekunda -> zdržení měření (pomalá služba)
+        statvfs = lambda path: Statvfs(4096, 50_000_000, 40_000_000, 37_500_000)
+        self.monitor = Collectors(
+            Scheduled(SystemMonitor(15, proc_dir=self.proc, thermal_dir=self.thermal, statvfs=statvfs,
+                                    checks=(CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID)), GRACE, interval_seconds=5),
+            Scheduled(SystemMonitor(5400, proc_dir=self.proc, thermal_dir=self.thermal, statvfs=statvfs,
+                                    checks=(DISK_ROOT_ID,)), GRACE, interval_seconds=1800),
+            Scheduled(NetworkMonitor(3, net_dir=self.net, route_path=self.route, ipv4_lookup=lambda name: "192.0.2.10",
+                                     details_interval=60, gap_seconds=30), GRACE, interval_seconds=1),
+        )
+        self.labels, self.simulated, self.validity_seconds = (self.monitor.labels, self.monitor.simulated,
+                                                              self.monitor.validity_seconds)
+
+    # Takty jsou celé sekundy; čítače jen rostou (pokles by byl reset čítače).
+    @staticmethod
+    def busy(t):  # vytížení po 5 s postupně 10, 20, … 80 % a znovu
+        n = math.floor(t)
+        blocks, rest = divmod(n, 5)
+        level = blocks % 8
+        return 10 * n + 10 * (5 * (28 * (blocks // 8) + level * (level - 1) // 2) + rest * level)
+
+    @staticmethod
+    def total(t):
+        return 100 * math.floor(t)  # USER_HZ 100
+
+    @staticmethod
+    def rx(t):  # každou sekundu jiná rychlost: 1000 až 2500 B/s
+        n = math.floor(t)
+        return 1000 * n + 500 * (6 * (n // 4) + (n % 4) * (n % 4 - 1) // 2)
+
+    def write(self, t):
+        busy, total = round(self.busy(t)), round(self.total(t))
+        (self.proc / "stat").write_text(f"cpu  {busy} 0 0 {total - busy} 0 0 0 0 0 0\n", encoding="ascii")
+        available = 6_000_000 - 50_000 * (int(t) // 5 % 9)  # využití RAM se průběžně mění
+        (self.proc / "meminfo").write_text(f"MemTotal: 8000000 kB\nMemFree: 1000000 kB\nMemAvailable: {available} kB\n",
+                                           encoding="ascii")
+        (self.thermal / "thermal_zone0" / "temp").write_text(f"{round(self.temperature(t) * 1000)}\n", encoding="ascii")
+        statistics = self.net / "eth0" / "statistics"
+        (statistics / "rx_bytes").write_text(f"{self.rx(t)}\n", encoding="ascii")
+        (statistics / "tx_bytes").write_text(f"{200 * round(t)}\n", encoding="ascii")
+
+    def collect(self, now, observed_utc):
+        self.write(now - START)
+        results = self.monitor.collect(now, observed_utc)
+        self.clock.advance(self.stalls.get(now - START, 0))
+        return results
+
+    def window_results(self, now, observed_utc, validity_seconds):
+        return self.monitor.window_results(now, observed_utc, validity_seconds)
+
+
+class LiveFixtureTest(unittest.TestCase):
+    """SCHED-2 se skutečnými kolektory: přesná okna historie a tichý výpis při kolísajících hodnotách."""
+
+    def test_history_windows_cover_exactly_the_record_interval(self):
+        # (interval historie, zdržení smyčky): povolené násobky 5 s i po zdržení 12 s přesně;
+        # 7 a 11 s konfigurace odmítne, ale ani obejitá validace nedá hodnotu za jiný úsek.
+        for interval, stalls in ((10, {}), (10, {40: 12}), (15, {40: 12}), (7, {}), (11, {})):
+            with self.subTest(interval=interval, stalls=stalls), tempfile.TemporaryDirectory() as directory:
+                clock = FakeClock()
+                live, link = LiveFixture(directory, clock, stalls=stalls), FakeLink()
+                run_for(live, clock, 300, history_link=link, tick_seconds=1,
+                        config=CollectorConfig(interval_seconds=interval))
+                previous, cpu_states = None, set()
+                for results, measured in link.recorded:
+                    windows = {r.id: r for r in results[:3]}
+                    if previous is not None:
+                        a, b = previous - START, measured - START
+                        rx = windows[RX_RATE_ID]  # síť po 1 s: vždy přesně skutečný úsek [a, b]
+                        self.assertEqual((rx.state, rx.measurement.value),
+                                         (State.INFO, (LiveFixture.rx(b) - LiveFixture.rx(a)) / (b - a)))
+                        cpu = windows.get(CPU_USAGE_ID)
+                        if cpu is not None:
+                            cpu_states.add(cpu.state)
+                            if cpu.state is State.INFO:  # jen za přesně pokrytý úsek, nikdy za jiný
+                                expected = 100 * (LiveFixture.busy(b) - LiveFixture.busy(a)) / (
+                                    LiveFixture.total(b) - LiveFixture.total(a))
+                                self.assertAlmostEqual(cpu.measurement.value, expected, places=9)
+                    for window in results[:3]:  # čas a platnost zápisu: časová základna historie
+                        self.assertEqual((window.observed_utc, window.expires_monotonic),
+                                         (utc_at(measured), measured + 3 * interval))
+                    previous = measured
+                if interval % 5 == 0:
+                    self.assertEqual(cpu_states, {State.INFO})  # i po zdržení se mřížky znovu sejdou
+                else:
+                    self.assertIn(State.UNKNOWN, cpu_states)  # nepokryté okno přiznané, ne posunutá hodnota
+
+    def test_fluctuating_values_print_only_state_changes(self):
+        rule = AlarmsConfig(cpu_temp=AlarmRule(enabled=True, warning=70, error=80, hysteresis=2))
+        with tempfile.TemporaryDirectory() as directory:
+            clock = FakeClock()
+            live = LiveFixture(directory, clock, temperature=lambda t: (75 if t >= 3600 else 50) + int(t) // 5 % 3)
+            _, lines, ticks = run_for(live, clock, 2 * HOUR, tick_seconds=1, alarms=rule)
+        printed = [line for line in lines if " UTC  " in line]
+        # První měření, první rychlost sítě, první vytížení CPU, souhrny po 30 min a nová závada.
+        self.assertEqual([line[11:19] for line in printed],
+                         ["10:00:00", "10:00:01", "10:00:05", "10:30:05", "11:00:05", "11:00:10", "11:30:10"])
+        self.assertIn("[WARNING]", printed[5])
+        # Hodnoty se přitom měnily: OLED a web je mají aktuální z výsledků každého taktu.
+        for check_id, at_least in ((CPU_USAGE_ID, 5), (MEMORY_ID, 5), (CPU_TEMP_ID, 3), (RX_RATE_ID, 3)):
+            with self.subTest(check_id=check_id):
+                self.assertGreaterEqual(len({results[check_id].summary for _, results in ticks}), at_least)
+        self.assertEqual(len(ticks), 2 * HOUR)  # takt 1 s, ale výpis jen 7 řádků
 
 
 class BackupBetweenQueriesTest(unittest.TestCase):
@@ -826,7 +1101,7 @@ class ConfigurationTest(unittest.TestCase):
     def test_live_monitor_validity_follows_interval(self):
         config = services_config(collector=CollectorConfig(interval_seconds=5), animedb_interval=600, nas_interval=1200)
         monitor = live_monitor(config)  # jen vytvoření
-        animedb, nas, backup = monitor.monitors[3:]
+        animedb, nas, backup = monitor.monitors[4:]
         self.assertEqual((animedb.monitor.validity_seconds, nas.monitor.validity_seconds,
                           backup.monitor.validity_seconds), (615, 1215, 15))
         self.assertEqual({scheduled.validity_seconds for scheduled in (animedb, nas, backup)}, {15})

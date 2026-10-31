@@ -22,7 +22,7 @@ PYTHONPATH=src python3 -m nexusstat.run --config config/config.example.toml
 
 Testy historie a snímků zakládají dočasné databáze v `tempfile.gettempdir()` a část z nich je ověřuje nad skutečnou tabulkou připojení. Na systému, kde je `/tmp` tmpfs (např. výchozí Debian 13), je proto spouštěj s `TMPDIR` na lokálním disku, např. `mkdir -p ~/.cache/nexusstat-tests && TMPDIR=~/.cache/nexusstat-tests PYTHONPATH=src python3 -m unittest discover -s tests`; kontrola úložiště se kvůli testům neoslabuje (simulace tmpfs na `/tmp`: 128 testů by bez toho selhalo, s lokálním `TMPDIR` všech 678 dotčených prošlo).
 
-`nexusstat.run` měří systém a síť v popředí terminálu každých `[collector] interval_seconds` (výchozí 10 s) a vypisuje jeden řádek na měření. Ukončení Ctrl+C **nebo SIGTERM** (kód 0, od M3.3b-1); neplatná nebo chybějící konfigurace skončí kódem 2 bez měření. Neběží jako služba, neotevírá port a bez sekce `[history]` nezapisuje žádné soubory. Interval i prahy jde ověřit vlastní kopií konfigurace mimo Git, např. `config/config.toml` (ignorováno v `.gitignore`).
+`nexusstat.run` měří systém a síť v popředí terminálu. Od SCHED-2 tiká po 1 s a každý kolektor měří ve svém intervalu (síť RX/TX 1 s, CPU, teplota a RAM 5 s, ventilátor 10 s, rozhraní a IPv4 60 s, disk / 1800 s); úvodní řádek „Živé měření …“ intervaly vypíše. Řádek stavu vzniká jen při prvním měření, při změně stavu nebo provozního údaje některé kontroly a jinak nejvýš jednou za 30 min, ne každou sekundu. `[collector] interval_seconds` (výchozí 10 s) určuje zápis do historie a její kontroly. Ukončení Ctrl+C **nebo SIGTERM** (kód 0, od M3.3b-1); neplatná nebo chybějící konfigurace skončí kódem 2 bez měření. Neběží jako služba, neotevírá port a bez sekce `[history]` nezapisuje žádné soubory. Interval i prahy jde ověřit vlastní kopií konfigurace mimo Git, např. `config/config.toml` (ignorováno v `.gitignore`).
 
 Alarmové prahy (`[alarms.cpu_temp]`, `[alarms.disk_root]`) jsou ve výchozím stavu vypnuté a nemají výchozí hodnoty. Zapnutí vyžaduje `enabled = true` a všechny tři hodnoty `warning`, `error`, `hysteresis`; neplatná kombinace ukončí program kódem 2. Konkrétní hodnoty pro Nexus zatím nejsou schválené, pro lokální zkoušku používej jen zjevně ilustrační prahy. Alarm pouze změní stav a ve výpisu označí hodnotu (`[WARNING]`, `[ERROR]`); nic nevypíná, neřídí ventilátory ani neposílá zprávy. Změna prahů se projeví až po novém spuštění (stav potvrzení začne znovu).
 
@@ -113,6 +113,14 @@ Smyčka `nexusstat.run` tiká dál po `[collector] interval_seconds` (výchozí 
 
 - Výchozí stav všech služeb zůstává vypnutý; plánování se týká jen zapnutých kontrol a nic dalšího nespouští (žádné vlákno, služba ani databáze).
 - Návrat: v rámci konfigurace kratší `interval_seconds` (nejméně 60 s); úplný návrat ke kontrole v každém taktu jen vrácením změny v Gitu (`git restore` nebo `git revert` commitu SCHED-1). Na Nexusu není co vracet, protože nic nebylo nasazeno.
+
+### Živé měření (SCHED-2)
+
+- Takt 1 s je jen plánovač: skutečná měření jsou v intervalech kolektorů (tabulka v `docs/REQUIREMENTS.md`, Živé měření a šetrné ukládání). Za 24 h tak vznikne 86 400 čtení čítačů sítě (tři malé soubory v `/sys`), 17 280 měření CPU, teploty a RAM, 8 640 ventilátoru, 1 440 výběrů rozhraní s IPv4 a 48 měření disku; do historie dál 8 640 zápisů jako dřív.
+- Výpis je tichý: při stabilním stavu jeden řádek za 30 min, změna stavu (např. linka `DOWN`, služba `ERROR`, vypršelý výsledek) se vypíše hned. Hodnota z dřívějšího měření má ve výpisu stáří, např. disk `(ověřeno před 25 min)`.
+- Režie na notebooku asi 0,3 % jednoho jádra a 26 MB RAM; na Raspberry Pi neověřeno.
+- **Se zapnutou historií musí být `[collector] interval_seconds` násobkem 5 s** (5, 10, 15 …), jinak program skončí kódem 2: okno vytížení CPU by s časem zápisu pokrývalo jiný úsek. Lokální zkušební konfigurace s 2 s je proto třeba upravit (doporučeno 10 s).
+- Návrat: vrácení commitu SCHED-2 v Gitu; konfigurace se nemění (nové klíče nejsou). Na Nexusu není co vracet.
 
 ### Zkouška historie na notebooku (M3.3b-1, volitelná, výchozí stav vypnuto)
 

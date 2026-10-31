@@ -1592,7 +1592,7 @@ class LoopTest(LinkCase):
         collectors = RealCollectors(self.collectors())
         with mock.patch("sqlite3.connect", side_effect=AssertionError("sqlite3 se nesmí otevřít")):
             results = self.loop(None, collectors)
-        self.assertEqual(len([line for line in self.lines if "UTC" in line]), 3)
+        self.assertIn("počet měření: 3", self.lines[-1])
         self.assertNotIn(HISTORY_STORAGE_ID, {result.id for result in results})
 
     def test_measurement_continues_when_history_fails(self):
@@ -1604,7 +1604,7 @@ class LoopTest(LinkCase):
         for check_id in (CPU_USAGE_ID, MEMORY_ID, DISK_ROOT_ID, LINK_ID):
             self.assertIn(check_id, measured)
         self.assertIs(next(r for r in results if r.id == HISTORY_STORAGE_ID).state, State.ERROR)
-        self.assertEqual(len([line for line in self.lines if "UTC" in line]), 3)  # tři měření proběhla
+        self.assertIn("počet měření: 3", self.lines[-1])  # tři měření proběhla
 
     def test_alarms_are_evaluated_before_history(self):
         rule = AlarmRule(enabled=True, warning=10.0, error=20.0, hysteresis=1.0, confirm_count=1, clear_count=1)

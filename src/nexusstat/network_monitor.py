@@ -16,7 +16,8 @@ Automatický výběr (bez [network] interface), v tomto pořadí:
 při shodě rozhoduje abecední pořadí názvu. Fyzické rozhraní má odkaz na
 hardware /sys/class/net/<název>/device. Loopback, Docker (docker0, br-*,
 veth*), VPN (tun*, wg*) ani jiná virtuální rozhraní ho nemají, takže se
-automaticky nevyberou. Výběr se opakuje při každém měření.
+automaticky nevyberou. Výběr se opakuje při každém měření, v živém měření
+(SCHED-2) jednou za minutu a hned po zmizení nebo novém vzniku rozhraní.
 
 Kolektor prahy nevyhodnocuje: platný údaj má stav INFO (i linka DOWN nebo
 rozhraní bez IPv4), nezjistitelný UNKNOWN.
@@ -35,7 +36,7 @@ from collections import namedtuple
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import CollectorConfig, is_valid_interface_name
+from .config import VALIDITY_INTERVALS, CollectorConfig, is_valid_interface_name
 from .core import CheckResult, Measurement, State, is_finite_number
 from .system_monitor import Unavailable, read_text
 
@@ -188,26 +189,52 @@ def format_rate(bytes_per_second):
     return text.replace(".", ",")
 
 
+class FirstSample(Unavailable):
+    """První vzorek čítačů: rychlost zatím nejde spočítat, okno zápisu tím nekončí."""
+
+
+# Výběr rozhraní a jeho linka a IPv4 z posledního obnovení (SCHED-2). `reason` je
+# důvod, proč čítače nejde číst (rozhraní nevybráno nebo nenalezeno), jinak None.
+Details = namedtuple("Details", "interface ifindex reason link ipv4")
+
+
 class NetworkMonitor:
     """Čte jedno síťové rozhraní a vrací čtyři CheckResult: linka, RX, TX a IPv4.
 
     Pamatuje si jen předchozí vzorek čítačů, protože rychlost vyžaduje dva.
+    Bez `details_interval` vybírá rozhraní a čte linku a IPv4 při každém
+    měření. S ním (SCHED-2, živé měření po 1 s) se čítače čtou při každém
+    měření, ale výběr rozhraní, linka a IPv4 jen jednou za `details_interval`
+    a hned, když rozhraní zmizí nebo vznikne znovu (jiný ifindex); mezi tím se
+    vrací tytéž výsledky s jejich vlastní platností (3 × `details_interval`).
+    `gap_seconds` je nejdelší mezera mezi dvěma vzorky, ze které se rychlost
+    ještě počítá (výchozí `validity_seconds`).
+
+    Pro historii sčítá přenesené bajty a změřenou dobu všech platných kroků od
+    posledního zápisu (`window_results`).
     """
 
     labels = LABELS
 
     def __init__(self, validity_seconds, interface=None, net_dir=DEFAULT_NET_DIR, route_path=DEFAULT_ROUTE_PATH,
-                 ipv4_lookup=interface_ipv4):
+                 ipv4_lookup=interface_ipv4, details_interval=None, gap_seconds=None):
         # Platnost dodává volající z [collector] stejně jako u SystemMonitor.
         if not is_finite_number(validity_seconds) or validity_seconds <= 0:
             raise ValueError(f"validity_seconds musí být kladný počet sekund, ne {validity_seconds!r}")
         if interface is not None and not is_valid_interface_name(interface):
             raise ValueError(f"neplatný název rozhraní {interface!r}")
+        for name, value in (("details_interval", details_interval), ("gap_seconds", gap_seconds)):
+            if value is not None and (not is_finite_number(value) or value <= 0):
+                raise ValueError(f"{name} musí být kladný počet sekund, ne {value!r}")
         self.validity_seconds = validity_seconds
-        self.interface = interface  # None = automatický výběr při každém měření
+        self.interface = interface  # None = automatický výběr
         self.net_dir = Path(net_dir)
         self.route_path = Path(route_path)
         self.ipv4_lookup = ipv4_lookup
+        self.details_interval = details_interval
+        self.details_validity = (validity_seconds if details_interval is None
+                                 else VALIDITY_INTERVALS * details_interval)
+        self.gap_seconds = validity_seconds if gap_seconds is None else gap_seconds
         # Skutečné měření jen ze skutečného systému; vzorové soubory nebo
         # náhradní zjišťování adresy (testy) jsou fiktivní data.
         self.simulated = not (
@@ -216,6 +243,13 @@ class NetworkMonitor:
             and ipv4_lookup is interface_ipv4
         )
         self.previous = None
+        self.details = None
+        self.details_due = None
+        # Okno zápisu historie (SCHED-2): [bajty, sekundy, začátek prvního kroku,
+        # konec posledního] platných kroků, důvod přerušení a čas minulého zápisu.
+        self.window = {check_id: [0, 0.0, None, None] for check_id in COUNTER_FILES}
+        self.window_broken = dict.fromkeys(COUNTER_FILES)
+        self.window_mark = None
 
     def collect(self, now, observed_utc):
         """Změří vybrané rozhraní. `now` je monotónní čas, `observed_utc` skutečný čas UTC.
@@ -223,35 +257,106 @@ class NetworkMonitor:
         Rychlost se počítá z rozdílu čítačů a z rozdílu `now` mezi dvěma
         měřeními, tedy ze skutečně uplynulého času, ne z nominálního intervalu.
         """
+        if self.details is None or self.details_interval is None or now >= self.details_due:
+            self._refresh(now, observed_utc)
+        details = self.details
+        if details.reason is None:
+            sample = self._sample(details.interface, now)
+            if self.details_interval is not None and sample.ifindex != details.ifindex:
+                # Rozhraní zmizelo nebo vzniklo znovu: výběr, linka a IPv4 hned,
+                # ne až v dalším termínu (obnova si nový ifindex zapamatuje).
+                self._refresh(now, observed_utc)
+                details = self.details
+        if details.reason is not None:
+            # Bez rozhraní nejsou čítače: další nalezené rozhraní začne prvním vzorkem.
+            self.previous = None
+            prefix = "" if details.interface is None else f" {details.interface}"
+            extra = {} if details.interface is None else {INTERFACE: details.interface}
+            rates = []
+            for check_id in COUNTER_FILES:
+                self._break(check_id, details.reason)
+                rates.append(self._result(check_id, State.UNKNOWN, f"{LABELS[check_id]}{prefix}: {details.reason}",
+                                          now, observed_utc, details=extra))
+            return [details.link, *rates, details.ipv4]
+        previous, self.previous = self.previous, sample
+        interface = details.interface
+        return [
+            details.link,
+            self._check(RX_RATE_ID, interface, lambda: self._rate(RX_RATE_ID, previous, sample), now, observed_utc),
+            self._check(TX_RATE_ID, interface, lambda: self._rate(TX_RATE_ID, previous, sample), now, observed_utc),
+            details.ipv4,
+        ]
+
+    def window_results(self, now, observed_utc, validity_seconds):
+        """Rychlost RX/TX za okno od posledního zápisu do historie (SCHED-2); okno začne znovu.
+
+        Vrací (id nahrazených živých výsledků, výsledky). Rychlost = přenesené
+        bajty / změřená doba všech platných kroků, tedy stejné měření jako dřív
+        jeden 10s vzorek (a zároveň skutečný objem dat). Čas a platnost jsou
+        okamžik zápisu (`now`, `observed_utc`) + `validity_seconds`; kroky musí
+        přesně pokrývat úsek od minulého zápisu do `now`. Reset čítače, změna
+        rozhraní, mezera, neplatná data nebo nepokrytá část okna dají UNKNOWN,
+        nikdy falešnou rychlost. Okno bez kroků vrací nic (mezera), jen první
+        okno je UNKNOWN „první vzorek“.
+        """
+        mark, self.window_mark = self.window_mark, now
+        interface = None if self.details is None else self.details.interface
+        details = {} if interface is None else {INTERFACE: interface}
+        expires = now + validity_seconds
+        results = []
+        for check_id, (transferred, seconds, start, end) in self.window.items():
+            broken, label = self.window_broken[check_id], LABELS[check_id]
+            self.window[check_id], self.window_broken[check_id] = [0, 0.0, None, None], None
+            if broken is not None:
+                state, summary, measurement = State.UNKNOWN, f"{label}: {broken} v okně zápisu", None
+            elif seconds > 0 and mark is not None and (start, end) != (mark, now):
+                state, summary, measurement = State.UNKNOWN, f"{label}: měření nepokrývá celé okno zápisu", None
+            elif seconds > 0:
+                rate = transferred / seconds
+                state, summary, measurement = State.INFO, f"{label} {format_rate(rate)}", Measurement(
+                    rate, BYTES_PER_SECOND)
+            elif mark is None:
+                state, summary, measurement = State.UNKNOWN, f"{label}: první vzorek", None
+            else:
+                continue
+            results.append(CheckResult(check_id, state, summary, observed_utc, expires, simulated=self.simulated,
+                                       measurement=measurement, details=details))
+        return set(COUNTER_FILES), results
+
+    def _break(self, check_id, reason):
+        """Okno zápisu obsahuje neplatný krok: celé okno bude UNKNOWN (první důvod zůstává)."""
+        self.window_broken[check_id] = self.window_broken[check_id] or reason
+
+    def _refresh(self, now, observed_utc):
+        """Výběr rozhraní, linka a IPv4; výsledky platí `details_validity`."""
+        if self.details_interval is not None:
+            self.details_due = now + self.details_interval
         try:
             interface = self._select_interface()
         except Unavailable as reason:
-            # Bez rozhraní nejsou čítače: další nalezené rozhraní začne prvním vzorkem.
-            self.previous = None
-            return [self._result(check_id, State.UNKNOWN, f"{label}: {reason}", now, observed_utc)
-                    for check_id, label in LABELS.items()]
+            link, ipv4 = (self._result(check_id, State.UNKNOWN, f"{LABELS[check_id]}: {reason}", now, observed_utc,
+                                       validity=self.details_validity) for check_id in (LINK_ID, IPV4_ID))
+            self.details = Details(None, None, str(reason), link, ipv4)
+            return
         if not (self.net_dir / interface).is_dir():
             # Nastavené rozhraní neexistuje (nebo zmizelo mezi výběrem a čtením).
-            self.previous = None
-            details = {INTERFACE: interface}
-            return [self._result(check_id, State.UNKNOWN, f"{label} {interface}: rozhraní nenalezeno", now,
-                                 observed_utc, details=details)
-                    for check_id, label in LABELS.items()]
+            link, ipv4 = (self._result(check_id, State.UNKNOWN, f"{LABELS[check_id]} {interface}: rozhraní nenalezeno",
+                                       now, observed_utc, details={INTERFACE: interface},
+                                       validity=self.details_validity) for check_id in (LINK_ID, IPV4_ID))
+            self.details = Details(interface, None, "rozhraní nenalezeno", link, ipv4)
+            return
+        link = self._check(LINK_ID, interface, lambda: self._link(interface), now, observed_utc,
+                           validity=self.details_validity)
+        ipv4 = self._check(IPV4_ID, interface, lambda: self._ipv4(interface), now, observed_utc,
+                           validity=self.details_validity)
+        self.details = Details(interface, self._ifindex(interface), None, link, ipv4)
 
-        sample = self._sample(interface, now)
-        previous, self.previous = self.previous, sample
-        return [
-            self._check(LINK_ID, interface, lambda: self._link(interface), now, observed_utc),
-            self._check(RX_RATE_ID, interface, lambda: self._rate(RX_RATE_ID, previous, sample), now, observed_utc),
-            self._check(TX_RATE_ID, interface, lambda: self._rate(TX_RATE_ID, previous, sample), now, observed_utc),
-            self._check(IPV4_ID, interface, lambda: self._ipv4(interface), now, observed_utc),
-        ]
-
-    def _result(self, check_id, state, summary, now, observed_utc, measurement=None, details=None):
-        return CheckResult(check_id, state, summary, observed_utc, now + self.validity_seconds,
+    def _result(self, check_id, state, summary, now, observed_utc, measurement=None, details=None, validity=None):
+        validity = self.validity_seconds if validity is None else validity
+        return CheckResult(check_id, state, summary, observed_utc, now + validity,
                            simulated=self.simulated, measurement=measurement, details=details or {})
 
-    def _check(self, check_id, interface, measure, now, observed_utc):
+    def _check(self, check_id, interface, measure, now, observed_utc, validity=None):
         # Každá kontrola ošetřuje své chyby sama, aby selhání jedné neshodilo ostatní.
         # Název rozhraní zůstává v details i u UNKNOWN: víme, co měříme, jen ne
         # hodnotu. Ve výpisu ho nese řádek linky, ostatní by ho jen opakovaly.
@@ -270,7 +375,7 @@ class NetworkMonitor:
         except (ValueError, ArithmeticError):
             # ArithmeticError: obří čítač projde int(), ale dělení na float přeteče.
             state, summary = State.UNKNOWN, f"{label}: neplatná data"
-        return self._result(check_id, state, summary, now, observed_utc, measurement, details)
+        return self._result(check_id, state, summary, now, observed_utc, measurement, details, validity)
 
     def _select_interface(self):
         if self.interface is not None:
@@ -300,6 +405,12 @@ class NetworkMonitor:
         except (Unavailable, OSError, ValueError):
             return None
 
+    def _ifindex(self, interface):
+        try:
+            return read_number(self.net_dir / interface / "ifindex")
+        except (OSError, ValueError):
+            return None
+
     def _sample(self, interface, now):
         statistics = self.net_dir / interface / "statistics"
         counters = {}
@@ -308,11 +419,7 @@ class NetworkMonitor:
                 counters[check_id] = read_number(statistics / file_name)
             except (OSError, ValueError) as error:
                 counters[check_id] = error  # ohlásí se u příslušné kontroly
-        try:
-            ifindex = read_number(self.net_dir / interface / "ifindex")
-        except (OSError, ValueError):
-            ifindex = None
-        return Sample(interface, ifindex, now, counters)
+        return Sample(interface, self._ifindex(interface), now, counters)
 
     # Každé měření vrací (Measurement nebo None, text pro výpis, další údaje details).
     def _link(self, interface):
@@ -320,11 +427,34 @@ class NetworkMonitor:
         return None, state, {LINK: state}
 
     def _rate(self, check_id, previous, current):
+        try:
+            transferred, elapsed = self._transfer(check_id, previous, current)
+        except FirstSample:
+            raise  # okno tím nezačíná ani nekončí
+        except Unavailable as reason:
+            self._break(check_id, str(reason))
+            raise
+        except OSError:
+            self._break(check_id, "nedostupné")
+            raise
+        except (ValueError, ArithmeticError):
+            self._break(check_id, "neplatná data")
+            raise
+        window = self.window[check_id]
+        window[0] += transferred
+        window[1] += elapsed
+        window[2] = previous.time if window[2] is None else window[2]
+        window[3] = current.time
+        rate = transferred / elapsed
+        return Measurement(rate, BYTES_PER_SECOND), format_rate(rate), {}
+
+    def _transfer(self, check_id, previous, current):
+        """(přenesené bajty, uplynulé sekundy) mezi dvěma vzorky, nebo výjimka."""
         value = current.counters[check_id]
         if isinstance(value, Exception):
             raise value
         if previous is None:
-            raise Unavailable("první vzorek")
+            raise FirstSample("první vzorek")
         if (previous.interface, previous.ifindex) != (current.interface, current.ifindex):
             raise Unavailable("změna rozhraní")
         old = previous.counters[check_id]
@@ -333,12 +463,12 @@ class NetworkMonitor:
         elapsed = current.time - previous.time
         if elapsed <= 0:
             raise Unavailable("neplatný interval")
-        if elapsed > self.validity_seconds:
+        if elapsed > self.gap_seconds:
             # Po dlouhé mezeře (zaseknuté měření, uspání) by vyšel průměr
             # za dávno uplynulou dobu, ne aktuální rychlost.
             raise Unavailable("mezera v datech")
-        rate = counter_rate(old, value, elapsed)
-        return Measurement(rate, BYTES_PER_SECOND), format_rate(rate), {}
+        counter_rate(old, value, elapsed)  # reset čítače je Unavailable
+        return value - old, elapsed
 
     def _ipv4(self, interface):
         address = self.ipv4_lookup(interface)
