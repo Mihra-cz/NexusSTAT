@@ -462,11 +462,12 @@ class SafetyTest(unittest.TestCase):
                 read_mountinfo(Path(directory) / "chybi")
 
     def test_used_only_by_storage_checks_and_the_loop(self):
-        # Kontrola cest historie a snímků (storage.py) a od M5-S2 režim / ve smyčce (run.py); displej ne.
+        # Kontrola cest historie a snímků (storage.py), od M5-S2 režim / ve smyčce (run.py) a od M5-S3
+        # identifikace zařízení ROOT na požádání (root_device.py); displej ne.
         users = [path.name for path in SRC.glob("*.py") if path.name != "mounts.py"
                  and "mounts" in {getattr(node, "module", None) for node in ast.walk(ast.parse(path.read_text(
                      encoding="utf-8"))) if isinstance(node, ast.ImportFrom)}]
-        self.assertEqual(sorted(users), ["run.py", "storage.py"])
+        self.assertEqual(sorted(users), ["root_device.py", "run.py", "storage.py"])
 
     def test_manual_listing_never_prints_the_source(self):
         output = io.StringIO()
