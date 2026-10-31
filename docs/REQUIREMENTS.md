@@ -310,6 +310,21 @@ Stránka STORAGE nahradila v kolotoči stránku DISK: **NEXUS → SYSTEM → STO
 - Text velkými písmeny ASCII, typ a sběrnice jen jako jedno slovo `[A-Z0-9._-]`, jinak `UNKN`; dlouhá hodnota se zkrátí s „…“ na 72 px. Čtyři řádky po 12 px jako SYSTEM s CPU FAN; ověřeno skutečným bitmapovým renderem 128 × 64 (bez přesahu a dotyku názvu s hodnotou).
 - Ověřeno jen v simulátoru a testy na notebooku; hardware displeje ani Raspberry Pi neověřeny.
 
+## Lokální web jen pro čtení (M6-1, implementováno lokálně, jen 127.0.0.1)
+
+První webové rozhraní pro vývojový notebook: `python3 -m nexusstat.run --web [--web-port 8765]`. Web **nic neměří**: smyčka `run_loop` po každém taktu zapíše tytéž vyhodnocené výsledky jako výpis (po `AlarmEvaluator`) do `web.StateBoard` v paměti a stránka se skládá jen z nich. Žádný další kolektor, plánovač, proces ani druhý monitoring.
+
+- **Obsah stránky:** celkový stav; tabulky Systém (CPU, CPU TEMP, RAM, CPU FAN), Síť (rozhraní a linka, RX, TX, IPv4), Úložiště (ROOT, ROOT MODE, ROOT DEV, FS) a Služby (NEXUS, ANIMEDB, NAS, BACKUP), u každé kontroly stav a čas posledního platného měření; seznam aktivních závad a `UNKNOWN`; čas posledního taktu smyčky a posledního platného měření. Hodnoty a texty jsou stejné jako na OLED (`oled_text`: z id, stavu, `measurement` a `details`, nikdy ze `summary`), takže web neukáže cesty ani adresy z konfigurace.
+- **Stavy:** `OK`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, `UNKNOWN` a `N/A` mají vlastní štítek; `UNKNOWN` je šedý, nikdy zelený. Služby se doplní jako na OLED (`complete_service_results`: sledovaná bez dat `UNKNOWN`, vypnutá `N/A`), takže bez kolektoru NEXUS je celkový stav `UNKNOWN`, ne `OK`. ROOT DEV je jen údaj pro zobrazení (zjištěný jednou při spuštění webu), bez vlastního stavu.
+- **Platnost:** posuzuje se v okamžiku požadavku (`effective`), takže když se smyčka zastaví, hodnoty po své platnosti zestárnou na `UNKN`/`UNKNOWN` a stránka to napíše; nikdy nevypadají jako aktuální.
+- **Živá data:** intervaly beze změny (CPU, RAM a teplota po 5 s, RX/TX po 1 s, služby podle SCHED-1). Stránka se obnovuje po 5 s (`<meta refresh>`); každý požadavek jen přečte paměť, takže víc záložek měření nenásobí.
+- **Bezpečnost M6-1:** server ze standardní knihovny (`http.server.ThreadingHTTPServer`, jedno vlákno na pozadí a krátké vlákno na požadavek) naslouchá **napevno jen na `127.0.0.1`** (adresa se nedá nastavit, žádné `0.0.0.0`, žádná změna firewallu). Jen `GET` a `HEAD` na `/`; ostatní metody `405`, jiné cesty `404`, jiný klient než loopback a cizí hlavička `Host` (ochrana proti DNS rebinding) `403`. Žádný zapisovací endpoint, příkaz ani ovládání hardwaru. Všechny texty se escapují; hlavičky `Content-Security-Policy` (`default-src 'none'`, styl jen podle otisku), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`; hlavička `Server` bez verze Pythonu; požadavky se nelogují. Port `--web-port` jen 1024–65535 (výchozí 8765); obsazený port = chyba před měřením.
+- **Souběh a životní cyklus (review 2026-10-31):** smyčka předává webu vždy celý neměnný snímek taktu (krátký zámek jen na výměnu odkazu), takže stránka nikdy nesmíchá dva takty; stránka se skládá mimo zámek. Při zahlcení 8 klienty (asi 435 stránek/s) se takt smyčky zpozdil nejvýš asi o 12 ms. Ukončení přes Ctrl+C i SIGTERM do 0,5 s (i s otevřeným nedokončeným požadavkem), port je hned volný, obsazený port = kód 2 bez spuštěného vlákna. Spojení má timeout 5 s na operaci (nedokončený požadavek se zavře po 5 s, ostatní požadavky běží dál) a odpojení klienta během odpovědi se nevypisuje jako chyba.
+- **Vzhled** ověřen ve vestavěném prohlížeči (široký i úzký displej 375 px, tmavý i světlý režim): na úzkém displeji jeden sloupec bez vodorovného posuvu, časy u řádků skryté (poslední platné měření zůstává v záhlaví).
+- **Před otevřením v LAN (není součástí M6-1):** povinná autentizace (nejlépe HTTPS nebo reverzní proxy s TLS), samostatné schválení adresy a pravidla firewallu jen pro LAN, rozhodnutí o zobrazení IPv4 a dalších údajů, omezení počtu souběžných spojení a celkové doby jednoho požadavku (klient posílající data po bajtech drží vlákno déle než 5 s, protože timeout platí na každou operaci) a test na Raspberry Pi. Veřejný status zůstává samostatná projekce (Web / přístup).
+- Neimplementováno: administrace, potvrzování alarmů, RGB, zápis konfigurace, grafy historie, NAS, hardware, nasazení.
+- Ověřeno syntetickými daty, testovacími HTTP požadavky na loopbacku a krátkým read-only během na notebooku; Raspberry Pi ani Nexus neověřeny.
+
 ## Živý simulátor OLED (potvrzeno pro v0.5)
 
 - Okno tkinter na notebooku; obraz výhradně z existujícího `render_screen()`, skutečná bitmapa 128 × 64 zvětšená celočíselně bez vyhlazení, obnova přes `after()` bez aktivního čekání, ve SLEEP černý displej, bezpečné zavření bez procesů na pozadí.
@@ -423,7 +438,7 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 
 ## Web / přístup
 
-- Lokální webový dashboard dostupný z LAN na konfigurovatelném portu (navržen `8765`), po schválení firewallu a autentizace.
+- Lokální webový dashboard dostupný z LAN na konfigurovatelném portu (navržen `8765`), po schválení firewallu a autentizace. **Od M6-1 existuje lokálně jen první verze jen pro čtení a jen na `127.0.0.1`** (sekce Lokální web jen pro čtení); LAN zůstává podmíněná autentizací.
 - Funkce LAN: přehledné stavové karty, filtrování událostí, potvrzení závad a jas LED (viz RGB LED a potvrzování závad; `CRITICAL` nelze umlčet), konfigurace (včetně délky kolotoče 300 s, intervalu 10 s, nečinnosti STATUS 30 s).
 - Na veřejném webu `mh42.cz` pouze sanitizovaný read-only celkový stav a případně stručný výpis závad. **Nikdy** celé logy, interní IP, administraci ani API pro zápis.
 - Oddělit veřejnou projekci dat od administračního procesu už v návrhu; žádný automatický port forwarding nebo cloud.

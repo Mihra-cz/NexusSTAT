@@ -21,6 +21,8 @@ poslední výsledek se svou původní platností. Historie se zapisuje a její
 kontroly běží jen jednou za [collector] interval_seconds (výchozí 10 s) a řádek
 výpisu vzniká jen při změně stavu, jinak nejvýš jednou za 30 min.
 Ukončení: Ctrl+C nebo SIGTERM.
+S přepínačem --web (M6-1) ukazuje poslední výsledky i lokální web jen pro čtení
+na http://127.0.0.1:8765/ (web.py): jen z tohoto počítače, nic neměří.
 Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nepřistupuje
 k displeji, mountům NAS ani jinému hardwaru a do sítě posílá jen zapnuté kontroly AnimeDB a NAS. Se zapnutou historií
 ([history] enabled = true s výslovnou cestou) předává vyhodnocené výsledky
@@ -51,6 +53,7 @@ from .mounts import RootMountMonitor
 from .nas_monitor import NasMonitor
 from .network_monitor import NetworkMonitor
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
+from .web import DEFAULT_PORT, LOOPBACK, check_port, start_web, stop_web
 
 
 # Klíč v details, kterým se selhání sběru odlišuje od platného měření bez hodnoty
@@ -365,7 +368,7 @@ def history_results(monitor, results, now, observed_utc, validity_seconds):
 
 
 def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now, sleep=time.sleep,
-             output=print_now, history_link=None, stopper=None, tick_seconds=None):
+             output=print_now, history_link=None, stopper=None, tick_seconds=None, board=None):
     """Hlavní smyčka měření. Běží do Ctrl+C nebo SIGTERM a vrací poslední výsledky.
 
     `config` je CollectorConfig, `evaluator` AlarmEvaluator s pravidly [alarms].
@@ -381,6 +384,8 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
     Výpis: řádek při prvním měření, při každé provozně významné změně (stav
     nebo `details` některé kontroly, `significant`) a jinak nejvýš jednou za
     SUMMARY_SECONDS, nikdy při každém taktu.
+    `board` (web.StateBoard, M6-1) dostane po každém taktu tytéž vyhodnocené
+    výsledky jako výpis; web je jen čte, sám nic neměří.
     """
     interval = config.interval_seconds
     tick = interval if tick_seconds is None else tick_seconds
@@ -444,6 +449,8 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
                 # 10 s padne do taktu s měřením CPU po 5 s. Zmeškané se nedohánějí.
                 next_record = grid_after(record_origin, interval, now)
             results = [*results, *history_checks]
+            if board is not None:
+                board.publish(results, now, observed_utc)
             measurements += 1
             current = significant(results, now)
             if text is not None or current != printed or now >= next_summary:
@@ -507,20 +514,35 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Pravidelné read-only měření systému a sítě NexusSTAT")
     parser.add_argument("--config", type=Path,
                         help="TOML se sekcemi [collector], [network], [alarms], [oled], [history] a [services]")
+    parser.add_argument("--web", action="store_true",
+                        help=f"lokální web jen pro čtení na http://{LOOPBACK}:PORT/ (jen z tohoto počítače)")
+    parser.add_argument("--web-port", type=int, default=DEFAULT_PORT, metavar="PORT",
+                        help=f"port lokálního webu (výchozí {DEFAULT_PORT})")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config) if args.config else Config()
-    except (ConfigError, OSError) as error:
+        check_port(args.web_port)
+    except (ConfigError, OSError, ValueError) as error:
         # Neplatná konfigurace = žádné měření, ne tiché použití výchozích hodnot.
         parser.error(str(error))
+    monitor = live_monitor(config)  # jen vytvoření kolektorů, nic se neměří
+    board = server = None
+    if args.web:
+        # Web jen čte výsledky této smyčky; obsazený port = chyba před měřením.
+        try:
+            board, server = start_web(monitor.labels, config.collector.validity_seconds, args.web_port)
+        except OSError as error:
+            parser.error(f"web nelze spustit na {LOOPBACK}:{args.web_port}: {error}")
+        print_now(f"Web: http://{LOOPBACK}:{server.server_address[1]}/ jen pro čtení a jen z tohoto počítače; "
+                  "ukazuje výsledky této smyčky, sám nic neměří.")
     stopper = Stopper()
     link = None
     try:
         stopper.install()
         link = start_history(config)
         print_now(live_note())
-        run_loop(live_monitor(config), config.collector, AlarmEvaluator(config.alarms),
-                 history_link=link, stopper=stopper, tick_seconds=LIVE_TICK_SECONDS)
+        run_loop(monitor, config.collector, AlarmEvaluator(config.alarms),
+                 history_link=link, stopper=stopper, tick_seconds=LIVE_TICK_SECONDS, board=board)
     except KeyboardInterrupt:
         # Signál mimo smyčku (např. během spouštění historie): ukončení je
         # řízené i tady, jen bez řádku o počtu měření.
@@ -529,6 +551,8 @@ def main(argv=None):
         # Obsluha signálů se vrátí i tehdy, když historie selže už při spuštění.
         # Další signál už ukončení nepřeruší: historie dopisuje fronty s limitem.
         stopper.stopping = True
+        if server is not None:
+            stop_web(server)
         if link is not None:
             link.stop()
         stopper.restore()

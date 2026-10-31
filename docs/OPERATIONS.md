@@ -179,6 +179,18 @@ PYTHONPATH=src python3 -m nexusstat.preview --scenario rgb_acknowledged
 
 Úspěšné testy dokládají logiku automatu, validaci, výpočty kolektorů nad vzorovými vstupy (síťové stavy výhradně ve fixturách, nezávisle na síti počítače), plánování smyčky a vyhodnocení prahů se simulovaným časem a hodnotami a vykreslení do obrázku. Nedokládají vhodnost konkrétních prahů pro Nexus. Nedokládají funkci displeje, tlačítka ani správnou volbu teplotního senzoru na Raspberry Pi 5; to vyžaduje samostatné schválené read-only ověření na cílovém stroji. Ruční běh `nexusstat.run` dokládá jen funkci na notebooku.
 
+### Lokální web jen pro čtení (M6-1, volitelný, jen 127.0.0.1)
+
+```bash
+PYTHONPATH=src python3 -m nexusstat.run --web
+```
+
+- Stránka je na `http://127.0.0.1:8765/` (jiný port `--web-port 8780`, jen 1024–65535). Úvodní řádek „Web: …“ adresu vypíše; obsazený port = chyba před měřením (kód 2).
+- Web ukazuje výsledky téže smyčky, sám nic neměří a nic nezapisuje: obnova stránky ani víc záložek nespustí žádnou kontrolu. Zařízení ROOT se zjistí jednou při spuštění.
+- Naslouchá jen na loopbacku, nejde ho otevřít z jiného počítače a firewall se nemění. Jen `GET`/`HEAD` na `/`; požadavky se nelogují.
+- Ukončení stejně jako smyčka (Ctrl+C nebo SIGTERM); server se zastaví s ní nejvýš do 0,5 s a port je hned volný. Nedokončený požadavek server zavře po 5 s; odpojení prohlížeče během obnovy se nevypisuje.
+- **Neotevírat v LAN** (ani přes SSH tunel nebo reverzní proxy pro jiné uživatele), dokud nebude schválená autentizace a pravidla firewallu (REQUIREMENTS.md, Lokální web jen pro čtení).
+
 ### Návratový postup lokálního vývoje
 
 Projekt má lokální Git repozitář (větev `main`, `origin` = veřejný GitHub). Návratovým bodem lokálních změn je poslední commit (`git status`, `git diff`, `git restore <soubor>`); před prvním commitem žádný návratový bod neexistuje. Commit i push jen po schválení. GitHub není ověřenou zálohou: necommitované soubory a vše vyloučené v `.gitignore` (lokální konfigurace, DB, logy) na něm nejsou. Na Nexusu není co vracet, protože nic nebylo nasazeno.
