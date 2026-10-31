@@ -20,6 +20,7 @@ from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol
 from nexusstat.oled_text import page_rows
 from nexusstat.config import Config, HistoryConfig, NetworkConfig, SnapshotConfig
 from nexusstat.fan_monitor import LABELS as FAN_LABELS, FanMonitor
+from nexusstat.mounts import ROOT_MODE_ID, RootMountMonitor
 from nexusstat.network_monitor import LABELS as NETWORK_LABELS, LINK_ID, NetworkMonitor
 from nexusstat.run import (COLLECTOR_FAILURE, Collectors, Stopper, failed_results, failure_name,
                           format_line, live_monitor, main, run_loop, start_history)
@@ -404,23 +405,25 @@ class CollectorsTest(unittest.TestCase):
             Collectors(FakeNetwork(), other)
 
     def test_live_monitor_measures_each_collector_on_its_own_interval(self):
-        # SCHED-2: schválené intervaly; platnost výsledku 3 × interval kolektoru.
+        # SCHED-2: schválené intervaly; platnost výsledku 3 × interval kolektoru. Režim / (M5-S2)
+        # po 60 s jen z tabulky připojení, obsazenost / dál jediným statvfs("/") po 1800 s.
         monitor = live_monitor(Config(collector=CollectorConfig(interval_seconds=5), network=NetworkConfig("end0")))
         wiring = [(type(scheduled.monitor), tuple(scheduled.monitor.labels), scheduled.interval_seconds,
                    scheduled.monitor.validity_seconds) for scheduled in monitor.monitors]
         self.assertEqual(wiring, [
             (SystemMonitor, (CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID), 5, 15),
             (SystemMonitor, (DISK_ROOT_ID,), 1800, 5400),
+            (RootMountMonitor, (ROOT_MODE_ID,), 60, 180),
             (FanMonitor, tuple(FAN_LABELS), 10, 30),
             (NetworkMonitor, tuple(NETWORK_LABELS), 1, 3),
         ])
-        network = monitor.monitors[3].monitor
+        network = monitor.monitors[4].monitor
         self.assertEqual((network.interface, network.details_interval, network.details_validity), ("end0", 60, 180))
         self.assertEqual(network.gap_seconds, 15)  # rychlost i po zdržení smyčky do obvyklé platnosti
         self.assertEqual({scheduled.validity_seconds for scheduled in monitor.monitors}, {15})
         self.assertEqual(monitor.validity_seconds, 15)
         self.assertFalse(monitor.simulated)  # skutečné zdroje, nic se při vytvoření nečte
-        self.assertIsNone(live_monitor(Config()).monitors[3].monitor.interface)  # výchozí: automatický výběr
+        self.assertIsNone(live_monitor(Config()).monitors[4].monitor.interface)  # výchozí: automatický výběr
 
 
 class TerminationTest(unittest.TestCase):
@@ -944,15 +947,16 @@ class MainTest(unittest.TestCase):
         self.assertEqual(config, CollectorConfig())
         self.assertEqual(monitor.validity_seconds, 30)
         self.assertFalse(any(rule.enabled for rule, _ in evaluator.rules.values()))
-        # Smyčka měří systém i síť, rozhraní se vybírá automaticky.
-        self.assertEqual(list(monitor.labels), list(LABELS) + list(FAN_LABELS) + list(NETWORK_LABELS))
-        self.assertIsNone(monitor.monitors[3].monitor.interface)
+        # Smyčka měří systém, režim / i síť, rozhraní se vybírá automaticky.
+        self.assertEqual(list(monitor.labels),
+                         list(LABELS) + [ROOT_MODE_ID] + list(FAN_LABELS) + list(NETWORK_LABELS))
+        self.assertIsNone(monitor.monitors[4].monitor.interface)
         self.assertEqual(run_loop_mock.call_args.kwargs["tick_seconds"], 1)  # živé měření po 1 s
 
     def test_network_interface_from_config(self):
         run_loop_mock, _ = self.run_main(["--config", self.write_config('[network]\ninterface = "eth0"\n')])
         monitor, _, _ = run_loop_mock.call_args.args
-        self.assertEqual(monitor.monitors[3].monitor.interface, "eth0")
+        self.assertEqual(monitor.monitors[4].monitor.interface, "eth0")
 
     def test_alarm_rules_from_config(self):
         text = "[alarms.disk_root]\nenabled = true\nwarning = 85\nerror = 95\nhysteresis = 3\n"

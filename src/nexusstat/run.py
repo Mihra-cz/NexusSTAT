@@ -3,7 +3,8 @@
 Použití:
   PYTHONPATH=src python3 -m nexusstat.run [--config SOUBOR]
 
-Měří vytížení CPU, teplotu CPU, RAM, obsazenost / a síťové rozhraní
+Měří vytížení CPU, teplotu CPU, RAM, obsazenost /, režim a typ souborového
+systému / (jen z /proc/self/mountinfo; ro je závada ERROR) a síťové rozhraní
 ([network]: linka, RX/TX, IPv4) a vyhodnotí zapnuté prahy ([alarms], výchozí
 vypnuto).
 Se zapnutým [services.animedb] (výchozí vypnuto) navíc jedním požadavkem GET
@@ -14,7 +15,7 @@ dostupnost NAS (bez přihlášení, bez sdílených složek a mountů), se zapnu
 výsledek existující zálohovací úlohy (bez spouštění zálohy a bez Resticu).
 Od SCHED-2 tiká smyčka po 1 s, ale každý kolektor skutečně měří jen ve svém
 termínu (Scheduled): síť RX/TX po 1 s, CPU, teplota a RAM po 5 s, ventilátor
-po 10 s, rozhraní a IPv4 po 60 s, disk / po 1800 s; služby AnimeDB po 15 min,
+po 10 s, rozhraní a IPv4 a režim / po 60 s, obsazenost / po 1800 s; služby AnimeDB po 15 min,
 NAS po 30 min, zálohy podle plánu timeru (SCHED-1). Mezi termíny se ukazuje
 poslední výsledek se svou původní platností. Historie se zapisuje a její
 kontroly běží jen jednou za [collector] interval_seconds (výchozí 10 s) a řádek
@@ -42,10 +43,11 @@ from .animedb_monitor import AnimeDbMonitor
 from .backup_monitor import BackupMonitor
 from .config import (CPU_INTERVAL_SECONDS, DISK_INTERVAL_SECONDS, FAN_INTERVAL_SECONDS, HISTORY_ROLE,
                      LIVE_TICK_SECONDS, NETWORK_DETAILS_INTERVAL_SECONDS, NETWORK_RATE_INTERVAL_SECONDS,
-                     VALIDITY_INTERVALS, Config, ConfigError, load_config)
+                     ROOT_MODE_INTERVAL_SECONDS, VALIDITY_INTERVALS, Config, ConfigError, load_config)
 from .core import ALERT_STATES, CheckResult, State, effective, overall_state
 from .fan_monitor import FanMonitor
 from .history_link import open_history
+from .mounts import RootMountMonitor
 from .nas_monitor import NasMonitor
 from .network_monitor import NetworkMonitor
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
@@ -221,12 +223,12 @@ def grid_after(origin, interval, now):
 
 
 def live_monitor(config):
-    """Skutečné read-only kolektory: systém, ventilátor CPU, síť a volitelně AnimeDB, NAS a zálohy podle konfigurace.
+    """Skutečné read-only kolektory: systém, režim /, ventilátor CPU, síť a volitelně AnimeDB, NAS a zálohy.
 
     Všechny kolektory běží přes Scheduled a skutečně měří jen ve svém termínu:
-    systém, ventilátor a síť v pevných intervalech (SCHED-2, takt smyčky
-    LIVE_TICK_SECONDS), služby podle svého plánu (SCHED-1). Platnost výsledku
-    systému, ventilátoru a sítě je 3 × jejich interval.
+    systém, režim /, ventilátor a síť v pevných intervalech (SCHED-2, M5-S2,
+    takt smyčky LIVE_TICK_SECONDS), služby podle svého plánu (SCHED-1).
+    Platnost výsledku systému, režimu /, ventilátoru a sítě je 3 × jejich interval.
     """
     validity = config.collector.validity_seconds
 
@@ -238,6 +240,9 @@ def live_monitor(config):
         every(SystemMonitor(VALIDITY_INTERVALS * CPU_INTERVAL_SECONDS, checks=fast), CPU_INTERVAL_SECONDS),
         every(SystemMonitor(VALIDITY_INTERVALS * DISK_INTERVAL_SECONDS, checks=(DISK_ROOT_ID,)),
               DISK_INTERVAL_SECONDS),
+        # Režim a typ souborového systému / jen z tabulky připojení (M5-S2), aby
+        # přepnutí na ro bylo vidět do minuty; statvfs("/") dělá jen kontrola výše.
+        every(RootMountMonitor(VALIDITY_INTERVALS * ROOT_MODE_INTERVAL_SECONDS), ROOT_MODE_INTERVAL_SECONDS),
         # Ventilátor CPU se jen čte; chlazení dál řídí Linux (M4-1).
         every(FanMonitor(VALIDITY_INTERVALS * FAN_INTERVAL_SECONDS), FAN_INTERVAL_SECONDS),
         # Čítače po 1 s, výběr rozhraní, linka a IPv4 po 60 s. Rychlost se počítá
@@ -461,8 +466,8 @@ def live_note():
     """Jedna věta o intervalech živého měření pro výpis při startu (SCHED-2)."""
     return (f"Živé měření: takt {LIVE_TICK_SECONDS} s; CPU, teplota a RAM po {CPU_INTERVAL_SECONDS} s, "
             f"ventilátor po {FAN_INTERVAL_SECONDS} s, síť RX/TX po {NETWORK_RATE_INTERVAL_SECONDS} s, "
-            f"rozhraní a IPv4 po {NETWORK_DETAILS_INTERVAL_SECONDS} s, disk / po {DISK_INTERVAL_SECONDS} s; "
-            "služby podle vlastního plánu.")
+            f"rozhraní a IPv4 po {NETWORK_DETAILS_INTERVAL_SECONDS} s, režim / po {ROOT_MODE_INTERVAL_SECONDS} s, "
+            f"obsazenost / po {DISK_INTERVAL_SECONDS} s; služby podle vlastního plánu.")
 
 
 def snapshot_note(config, link):

@@ -29,6 +29,7 @@ from nexusstat.core import CheckResult, Measurement, State, effective
 from nexusstat.fan_monitor import CPU_FAN_ID, RPM
 from nexusstat.network_monitor import (BYTES_PER_SECOND, INTERFACE, IPV4_ID, LINK_ID, RX_RATE_ID, TX_RATE_ID,
                                        NetworkMonitor)
+from nexusstat.mounts import ROOT_MODE_ID
 from nexusstat.nas_monitor import NasMonitor
 from nexusstat.run import COLLECTOR_FAILURE, Collectors, Scheduled, live_monitor, result_text, run_loop
 from nexusstat.services import ANIMEDB_ID, BACKUP_ID, CONFIRM_RETRY_SECONDS, NAS_ID, OutageConfirmation
@@ -721,6 +722,7 @@ class LiveMeasurementTest(unittest.TestCase):
         self.assertEqual({labels: counter.calls for labels, counter in counters.items()}, {
             (CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID): 17_280,  # po 5 s
             (DISK_ROOT_ID,): 48,  # po 1800 s
+            (ROOT_MODE_ID,): 1_440,  # režim / po 60 s, jen z tabulky připojení (M5-S2)
             (CPU_FAN_ID,): 8_640,  # po 10 s
             (LINK_ID, RX_RATE_ID, TX_RATE_ID, IPV4_ID): 86_400,  # čítače po 1 s (rozhraní a IPv4 uvnitř po 60 s)
         })
@@ -1101,7 +1103,7 @@ class ConfigurationTest(unittest.TestCase):
     def test_live_monitor_validity_follows_interval(self):
         config = services_config(collector=CollectorConfig(interval_seconds=5), animedb_interval=600, nas_interval=1200)
         monitor = live_monitor(config)  # jen vytvoření
-        animedb, nas, backup = monitor.monitors[4:]
+        animedb, nas, backup = monitor.monitors[5:]
         self.assertEqual((animedb.monitor.validity_seconds, nas.monitor.validity_seconds,
                           backup.monitor.validity_seconds), (615, 1215, 15))
         self.assertEqual({scheduled.validity_seconds for scheduled in (animedb, nas, backup)}, {15})

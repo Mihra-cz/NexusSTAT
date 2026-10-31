@@ -1,8 +1,8 @@
-"""Testy read-only inventury úložišť z /proc/self/mountinfo (M5-S1).
+"""Testy read-only inventury úložišť z /proc/self/mountinfo (M5-S1) a režimu / (M5-S2).
 
 Tabulky jsou syntetické ve formátu proc(5); cesty jsou obecné a adresy NAS jen
 z dokumentačního rozsahu RFC 5737. Žádný test nečte skutečné body připojení,
-nevolá stat ani statvfs a nepoužívá síť.
+nevolá stat ani statvfs a nepoužívá síť. Čas je simulovaný.
 """
 
 import ast
@@ -12,12 +12,17 @@ import os
 import socket
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from nexusstat import mounts
-from nexusstat.mounts import (AUTOFS, LOCAL, NETWORK, UNKNOWN, VIRTUAL, Mount, MountInfoError, MountTable, kind_of,
-                              parse_mountinfo, read_mountinfo)
+from nexusstat import mounts, rgb
+from nexusstat.core import State, active_problems, effective
+from nexusstat.mounts import (AUTOFS, LOCAL, NETWORK, ROOT_MODE_ID, UNKNOWN, VIRTUAL, Mount, MountInfoError,
+                              MountTable, RootMountMonitor, kind_of, parse_mountinfo, read_mountinfo, root_mode)
+from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, home_symbol
+from nexusstat.oled_text import check_name, status_texts
+from nexusstat.run import Scheduled
 from nexusstat.storage import NETWORK_FILESYSTEMS
 
 SRC = Path(mounts.__file__).resolve().parent
@@ -155,6 +160,16 @@ class ParseTest(unittest.TestCase):
                 self.assertFalse(parsed.complete)
                 self.assertEqual([m.mount_point for m in parsed.mounts], ["/mnt/x", "/mnt/y"])
 
+    def test_read_only_from_mount_options_and_superblock(self):
+        # M5-S2: ro ze superbloku (ext4 po chybě s errors=remount-ro) se čte zvlášť od voleb připojení.
+        flags = [(m.mount_point, m.read_only, m.super_read_only) for m in table().mounts
+                 if m.read_only or m.super_read_only]
+        self.assertEqual(flags, [("/mnt/remote", True, False), ("/snap/core22/1", True, True)])
+        # Bez ro/rw na začátku voleb by se režim tiše bral jako rw: řádek je neplatný.
+        for broken in (line(options=b"defaults"), line(super_options=b"errors=remount-ro"), line(options=b"rwx")):
+            with self.subTest(line=broken):
+                self.assertEqual(table(line(mount_id=b"21", point=b"/") + b"\n" + broken).invalid_lines, (2,))
+
     def test_unrecognized_optional_fields_are_ignored(self):
         # proc_pid_mountinfo(5): „Parsers should ignore all unrecognized optional fields.“
         parsed = table(line(optional=b"future-tag:a/b shared:1 x"))
@@ -252,6 +267,149 @@ class LookupTest(unittest.TestCase):
                     table().covering(path)
 
 
+OBSERVED = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+
+
+def root_line(options=b"rw,noatime", super_options=b"rw,errors=remount-ro", fstype=b"ext4", mount_id=b"21",
+              parent=b"1", device=b"259:2", source=b"/dev/nvme0n1p2"):
+    return line(point=b"/", fstype=fstype, source=source, mount_id=mount_id, parent=parent, device=device,
+                options=options, super_options=super_options)
+
+
+class RootModeTest(unittest.TestCase):
+    """M5-S2: režim a typ kořenového souborového systému jen z tabulky připojení."""
+
+    def collect(self, data, now=1000.0):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mountinfo"
+            path.write_bytes(data)
+            [result] = RootMountMonitor(5400, path).collect(now, OBSERVED)
+        return result
+
+    def test_local_read_write_root(self):
+        result = self.collect(TABLE)
+        self.assertEqual((result.id, result.state, result.summary),
+                         (ROOT_MODE_ID, State.INFO, "Režim / rw (ext4, lokální)"))
+        self.assertEqual(dict(result.details), {"mode": "rw", "fstype": "ext4", "kind": LOCAL})
+        self.assertEqual((result.observed_utc, result.expires_monotonic, result.measurement), (OBSERVED, 6400.0, None))
+        self.assertTrue(result.simulated)  # podstrčená tabulka, ne tento počítač
+        self.assertEqual(check_name(ROOT_MODE_ID), "ROOT MODE")  # id, které displej už zná
+        # errors=remount-ro je jen reakce na budoucí chybu, ne důkaz přepnutí: rozhoduje první volba rw.
+        self.assertEqual(root_mode(table(root_line(super_options=b"rw,errors=remount-ro")))[:2],
+                         (State.INFO, "rw (ext4, lokální)"))
+
+    def test_read_only_root_from_mount_options_or_superblock(self):
+        cases = {(b"ro,noatime", b"rw"): "mount", (b"rw,noatime", b"ro,errors=remount-ro"): "superblock",
+                 (b"ro", b"ro"): "both"}
+        for (options, super_options), ro_by in cases.items():
+            with self.subTest(ro_by=ro_by):
+                state, text, details = root_mode(table(root_line(options=options, super_options=super_options)))
+                # Doložené ro je závada ERROR (ROOT READ-ONLY); nedůvěryhodná data jsou UNKNOWN.
+                self.assertIs(state, State.ERROR)
+                self.assertEqual(details, {"mode": "ro", "ro_by": ro_by, "fstype": "ext4", "kind": LOCAL})
+        self.assertEqual(root_mode(table(root_line(super_options=b"ro")))[1],
+                         "jen pro čtení (ext4, lokální; ro v superbloku)")
+
+    def test_overmounted_root_uses_the_visible_mount(self):
+        hidden = root_line()
+        over = root_line(mount_id=b"31", parent=b"21", device=b"8:1", fstype=b"xfs", options=b"ro",
+                         source=b"/dev/sda1")
+        for order in ((hidden, over), (over, hidden)):
+            with self.subTest(first=order[0].split()[0]):
+                self.assertEqual(root_mode(table(b"\n".join(order)))[2],
+                                 {"mode": "ro", "ro_by": "mount", "fstype": "xfs", "kind": LOCAL})
+
+    def test_network_virtual_and_unknown_root_types(self):
+        cases = {b"nfs4": NETWORK, b"fuse.sshfs": NETWORK, b"overlay": VIRTUAL, b"tmpfs": VIRTUAL, b"foo": UNKNOWN}
+        for fstype, kind in cases.items():
+            with self.subTest(fstype=fstype):
+                state, text, details = root_mode(table(root_line(fstype=fstype, source=b"192.0.2.21:/root")))
+                self.assertIs(state, State.INFO)
+                self.assertEqual(details, {"mode": "rw", "fstype": fstype.decode(), "kind": kind})
+                self.assertNotIn("192.0.2.21", text)  # zdroj (může být adresa NAS) se nevypisuje
+        self.assertEqual(root_mode(table(root_line(fstype=b"foo")))[1], "rw (foo, neznámý typ)")
+
+    def test_incomplete_or_untrustworthy_data_is_unknown(self):
+        root = root_line()
+        cases = [
+            # Nečitelný řádek mohl být právě mount nad /.
+            ("incomplete", root + b"\n33 21 0:35 / /mnt/backup rw - cifs //192.0.2.20/backup\n"),
+            ("incomplete", root_line(options=b"defaults")),  # režim kořene nejde přečíst
+            ("ambiguous", root + b"\n" + root_line(mount_id=b"22", device=b"8:1")),  # dva nezávislé kořeny
+            ("ambiguous", line(point=b"/mnt/x")),  # tabulka bez kořene
+            ("invalid_type", root_line(fstype=b"ext\\0114")),  # tabulátor v typu
+        ]
+        for cause, data in cases:
+            with self.subTest(cause=cause, data=data[-40:]):
+                result = self.collect(data)
+                self.assertIs(result.state, State.UNKNOWN)
+                self.assertEqual(dict(result.details), {"cause": cause})  # žádný odhad režimu
+        self.assertEqual(self.collect(b"x" * (mounts.MAX_MOUNTINFO_BYTES + 1)).details["cause"], "invalid")
+        [missing] = RootMountMonitor(5400, "/nonexistent/mountinfo").collect(1000.0, OBSERVED)
+        self.assertEqual((missing.state, missing.summary, dict(missing.details)),
+                         (State.UNKNOWN, "Režim /: tabulka připojení nedostupná", {"cause": "unreadable"}))
+
+    def test_transitions_reach_status_nexus_and_rgb(self):
+        # rw → ro → rw → nečitelná tabulka po 60 s přes Scheduled; ro je závada jako každá jiná.
+        reads, results, seen = [], [], []
+        real_read = mounts.read_mountinfo
+
+        def counting_read(path):
+            reads.append(path)
+            return real_read(path)
+
+        tables = ((1000.0, root_line()), (1060.0, root_line(super_options=b"ro,errors=remount-ro")),
+                  (1120.0, root_line()), (1180.0, None))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(mounts, "read_mountinfo", counting_read):
+            path = Path(directory) / "mountinfo"
+            scheduled = Scheduled(RootMountMonitor(180, path), 30, interval_seconds=60)
+            for now, data in tables:
+                if data is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(data)
+                [result] = scheduled.collect(now, OBSERVED)
+                self.assertIs(scheduled.collect(now + 59, OBSERVED)[0], result)  # mezi termíny se nic nečte
+                results.append(result)
+                signal = rgb.rgb_signal([result], rgb.Acknowledgements(), True, False, now)
+                seen.append((result.state, [status_texts(p, now)[0] for p in active_problems([result], now)],
+                             home_symbol([result], now), signal.kind, signal.steps))
+        self.assertEqual(len(reads), 4)
+        self.assertEqual(seen, [
+            (State.INFO, [], None, rgb.LIGHT, ()),
+            (State.ERROR, ["ROOT READ-ONLY"], ALERT_SYMBOL, rgb.CODES, ((State.ERROR, 1),)),  # kategorie systém
+            (State.INFO, [], None, rgb.LIGHT, ()),
+            (State.UNKNOWN, ["ROOT MODE NO DATA"], UNKNOWN_SYMBOL, rgb.OFF, ()),  # ne předchozí rw
+        ])
+        self.assertEqual(dict(result.details), {"cause": "unreadable"})
+        # Když měření nepřijde, i ERROR po platnosti 3 × 60 s zestárne na UNKNOWN bez údajů.
+        error = results[1]
+        self.assertIs(effective(error, 1060.0 + 179), error)
+        stale = effective(error, 1060.0 + 180)
+        self.assertEqual((stale.state, dict(stale.details)), (State.UNKNOWN, {}))
+
+    def test_monitor_opens_only_the_mountinfo_file(self):
+        # V tabulce jsou CIFS, NFS, sshfs i autofs: na žádný bod připojení se nesmí sáhnout.
+        opened = []
+
+        def recording_open(path, mode="r", *args, **kwargs):
+            opened.append((str(path), mode))
+            if str(path) != mounts.MOUNTINFO_PATH:
+                raise AssertionError(f"zakázané otevření: {path}")
+            return io.BytesIO(TABLE)
+
+        with contextlib.ExitStack() as stack:
+            for name in SafetyTest.FORBIDDEN:
+                if name != "builtins.open":
+                    stack.enter_context(mock.patch(name, side_effect=AssertionError(f"zakázaný přístup: {name}")))
+            stack.enter_context(mock.patch("builtins.open", recording_open))
+            [result] = RootMountMonitor(5400).collect(1000.0, OBSERVED)
+        self.assertEqual(opened, [("/proc/self/mountinfo", "rb")])
+        self.assertEqual((result.state, result.details["kind"], result.simulated), (State.INFO, LOCAL, False))
+        with self.assertRaises(ValueError):
+            RootMountMonitor(0)
+
+
 class SafetyTest(unittest.TestCase):
     """Parser ani vyhledání nesmí sáhnout na body připojení, síť ani jiné soubory."""
 
@@ -303,12 +461,12 @@ class SafetyTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 read_mountinfo(Path(directory) / "chybi")
 
-    def test_not_connected_to_measurement_loop_or_display(self):
-        # Jediný uživatel je kontrola cest historie a snímků (storage.py); smyčka ani displej ne.
+    def test_used_only_by_storage_checks_and_the_loop(self):
+        # Kontrola cest historie a snímků (storage.py) a od M5-S2 režim / ve smyčce (run.py); displej ne.
         users = [path.name for path in SRC.glob("*.py") if path.name != "mounts.py"
                  and "mounts" in {getattr(node, "module", None) for node in ast.walk(ast.parse(path.read_text(
                      encoding="utf-8"))) if isinstance(node, ast.ImportFrom)}]
-        self.assertEqual(users, ["storage.py"])
+        self.assertEqual(sorted(users), ["run.py", "storage.py"])
 
     def test_manual_listing_never_prints_the_source(self):
         output = io.StringIO()

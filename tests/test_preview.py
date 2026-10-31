@@ -19,6 +19,7 @@ from unittest import mock
 from nexusstat.config import AlarmRule, AlarmsConfig, Config, NetworkConfig
 from nexusstat.core import CheckResult, Measurement, State, active_problems
 from nexusstat.fan_monitor import LABELS as FAN_LABELS, FanMonitor
+from nexusstat.mounts import ROOT_MODE_ID, RootMountMonitor
 from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
 from nexusstat.oled import UNKNOWN_SYMBOL, Mode, home_symbol
 from nexusstat.oled_text import network_rows, page_rows, service_rows
@@ -420,12 +421,12 @@ class LiveTest(unittest.TestCase):
         self.assertIs(inspect.signature(PreviewSession).parameters["monitor_factory"].default, live_monitor)
         monitor = live_monitor(config)
         self.assertIsInstance(monitor, Collectors)
-        # Kolektory přes Scheduled (SCHED-2): systém zvlášť rychlý a disk, ventilátor, síť.
+        # Kolektory přes Scheduled (SCHED-2): systém zvlášť rychlý a disk, režim / (M5-S2), ventilátor, síť.
         self.assertEqual([type(m.monitor) for m in monitor.monitors],
-                         [SystemMonitor, SystemMonitor, FanMonitor, NetworkMonitor])
-        self.assertEqual(monitor.monitors[3].monitor.interface, "end0")
+                         [SystemMonitor, SystemMonitor, RootMountMonitor, FanMonitor, NetworkMonitor])
+        self.assertEqual(monitor.monitors[4].monitor.interface, "end0")
         self.assertEqual(list(monitor.labels),
-                         list(SYSTEM_LABELS) + list(FAN_LABELS) + list(NETWORK_LABELS))
+                         list(SYSTEM_LABELS) + [ROOT_MODE_ID] + list(FAN_LABELS) + list(NETWORK_LABELS))
 
     def test_live_without_network_results_shows_unkn(self):
         # Náhradní kolektor bez sítě: stránka NETWORK nic nedomýšlí.

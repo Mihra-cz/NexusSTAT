@@ -35,6 +35,7 @@ FAN_INTERVAL_SECONDS = 10  # ventilátor CPU
 NETWORK_RATE_INTERVAL_SECONDS = 1  # rychlost RX/TX z čítačů jádra
 NETWORK_DETAILS_INTERVAL_SECONDS = 60  # výběr rozhraní, linka a IPv4
 DISK_INTERVAL_SECONDS = 1800  # obsazenost disku /
+ROOT_MODE_INTERVAL_SECONDS = 60  # režim / jen z /proc/self/mountinfo (M5-S2)
 
 # Jen klíče, které kód skutečně používá. Neznámý klíč je chyba, aby se překlep
 # (např. "page_second") tiše nenahradil výchozí hodnotou a aby nefunkční

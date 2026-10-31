@@ -17,13 +17,17 @@ Každý mount se zařadí podle typu souborového systému:
 * `autofs`: bod automatického připojení; skutečný cíl se připojí až při přístupu,
 * `unknown`: jiný typ; nikdy se nepovažuje za lokální.
 
-Modul zatím není napojený na měřicí smyčku ani OLED.
+Od M5-S2 měřicí smyčka jednou za minutu čte z tabulky režim kořenového
+souborového systému (`RootMountMonitor`, kontrola `disk.root_readonly`).
+Inventura ostatních mountů se pravidelně nespouští, OLED modul zatím nepoužívá.
 """
 
 import os
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+
+from .core import CheckResult, State, is_finite_number
 
 MOUNTINFO_PATH = "/proc/self/mountinfo"
 # Běžná tabulka má jednotky až desítky KiB (i s Dockerem a snapy); větší vstup
@@ -73,6 +77,9 @@ DEVICE = re.compile(rb"[0-9]+:[0-9]+")
 SEPARATOR = b"-"
 FIELDS_BEFORE_OPTIONAL = 6
 FIELDS_AFTER_SEPARATOR = 3
+# Jádro píše na začátek voleb připojení i voleb superbloku vždy ro nebo rw.
+# Jiný začátek je chybný vstup: režim by se jinak tiše bral jako rw.
+MODES = {b"ro": True, b"rw": False}
 
 
 class MountInfoError(ValueError):
@@ -99,7 +106,12 @@ def kind_of(fstype):
 
 @dataclass(frozen=True)
 class Mount:
-    """Jeden řádek mountinfo. `source` může obsahovat adresu NAS: jen pro paměť, nevypisovat."""
+    """Jeden řádek mountinfo. `source` může obsahovat adresu NAS: jen pro paměť, nevypisovat.
+
+    `read_only` je ro ve volbách připojení, `super_read_only` ro v superbloku
+    souborového systému. Jen pro čtení je mount při kterémkoli z nich: ext4 po
+    chybě s errors=remount-ro přepne jen superblok a volby připojení zůstanou rw.
+    """
 
     mount_id: int
     parent_id: int
@@ -109,6 +121,7 @@ class Mount:
     read_only: bool
     fstype: str
     source: str
+    super_read_only: bool = False
 
     @property
     def kind(self):
@@ -140,9 +153,12 @@ def parse_line(line):
     mount_point = unescape(point)
     if not mount_point.startswith("/"):
         raise MountInfoError("bod připojení není absolutní cesta")
-    fstype, source, _super_options = fields[separator + 1:]
+    fstype, source, super_options = fields[separator + 1:]
+    read_only, super_read_only = MODES.get(options.split(b",")[0]), MODES.get(super_options.split(b",")[0])
+    if read_only is None or super_read_only is None:
+        raise MountInfoError("chybí režim ro/rw")
     return Mount(int(mount_id), int(parent_id), device.decode("ascii"), unescape(root), mount_point,
-                 options.split(b",")[0] == b"ro", unescape(fstype), unescape(source))
+                 read_only, unescape(fstype), unescape(source), super_read_only)
 
 
 def lexical_path(path):
@@ -265,6 +281,72 @@ def read_mountinfo(path=MOUNTINFO_PATH):
     if len(data) > MAX_MOUNTINFO_BYTES:
         raise MountInfoError("neočekávaně dlouhá tabulka připojení")
     return parse_mountinfo(data)
+
+
+ROOT_MODE_ID = "disk.root_readonly"  # na displeji ROOT MODE, závada ROOT READ-ONLY (oled_text)
+ROOT_LABEL = "Režim /"
+# Strojové údaje výsledku pro budoucí stránku STORAGE. Klíč důvodu je stejný
+# jako u služeb (services.CAUSE).
+MODE, FSTYPE, KIND, RO_BY, CAUSE = "mode", "fstype", "kind", "ro_by", "cause"
+KIND_TEXT = {LOCAL: "lokální", NETWORK: "síťové", VIRTUAL: "virtuální", AUTOFS: "autofs",
+             UNKNOWN: "neznámý typ"}
+RO_TEXT = {"mount": "ve volbách připojení", "superblock": "v superbloku", "both": "ve volbách i v superbloku"}
+
+
+def root_mode(table):
+    """(stav, text, details) kořenového souborového systému z přečtené tabulky (M5-S2).
+
+    Viditelný mount `/` jednoznačný: `rw` je INFO, doložené `ro` ve volbách
+    připojení nebo v superbloku ERROR (schválená závada ROOT READ-ONLY, žádný
+    práh ani automatická oprava). Rozhoduje jen první volba ro/rw: volba
+    errors=remount-ro je reakce na budoucí chybu, ne důkaz přepnutí. `rw` je
+    jen nastavení mountu, ne ověřený zápis; `ro_by` říká, kde je ro. Neúplná
+    tabulka, chybějící nebo nejednoznačný kořen a nečitelný typ dají UNKNOWN
+    s důvodem v `cause`, nikdy odhad režimu.
+    """
+    if not table.complete:
+        return State.UNKNOWN, "tabulka připojení je neúplná", {CAUSE: "incomplete"}
+    mount = table.covering("/")
+    if mount is None:
+        return State.UNKNOWN, "kořenový mount nejde jednoznačně určit", {CAUSE: "ambiguous"}
+    if not (mount.fstype.isascii() and mount.fstype.isprintable()):
+        return State.UNKNOWN, "neplatný typ souborového systému", {CAUSE: "invalid_type"}
+    where = f"{mount.fstype}, {KIND_TEXT[mount.kind]}"
+    details = {FSTYPE: mount.fstype, KIND: mount.kind}
+    if not (mount.read_only or mount.super_read_only):
+        return State.INFO, f"rw ({where})", {MODE: "rw", **details}
+    ro_by = "both" if mount.read_only and mount.super_read_only else "mount" if mount.read_only else "superblock"
+    return State.ERROR, f"jen pro čtení ({where}; ro {RO_TEXT[ro_by]})", {MODE: "ro", RO_BY: ro_by, **details}
+
+
+class RootMountMonitor:
+    """Režim a typ kořenového souborového systému jen z tabulky připojení (M5-S2).
+
+    Čte jedině `/proc/self/mountinfo`: žádné statvfs (obsazenost / měří dál
+    system_monitor), stat ani zkušební zápis, takže se nedotkne žádného jiného
+    mountu. Selhané čtení je UNKNOWN s důvodem, nikdy předchozí stav. Kolik
+    a kdy se čte, určuje Scheduled v run.live_monitor (po 60 s).
+    """
+
+    labels = {ROOT_MODE_ID: ROOT_LABEL}
+
+    def __init__(self, validity_seconds, path=MOUNTINFO_PATH):
+        if not is_finite_number(validity_seconds) or validity_seconds <= 0:
+            raise ValueError(f"validity_seconds musí být kladný počet sekund, ne {validity_seconds!r}")
+        self.validity_seconds = validity_seconds
+        self.path = path
+        self.simulated = os.fspath(path) != MOUNTINFO_PATH  # podstrčená tabulka v testech
+
+    def collect(self, now, observed_utc):
+        try:
+            state, text, details = root_mode(read_mountinfo(self.path))
+        except OSError:
+            state, text, details = State.UNKNOWN, "tabulka připojení nedostupná", {CAUSE: "unreadable"}
+        except MountInfoError:
+            state, text, details = State.UNKNOWN, "neplatná tabulka připojení", {CAUSE: "invalid"}
+        summary = f"{ROOT_LABEL} {text}" if state is State.INFO else f"{ROOT_LABEL}: {text}"
+        return [CheckResult(ROOT_MODE_ID, state, summary, observed_utc, now + self.validity_seconds,
+                            simulated=self.simulated, details=details)]
 
 
 def main():
