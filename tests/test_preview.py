@@ -17,14 +17,16 @@ from datetime import datetime, timezone
 from unittest import mock
 
 from nexusstat.config import AlarmRule, AlarmsConfig, Config, NetworkConfig
-from nexusstat.core import CheckResult, Measurement, State, active_problems
+from nexusstat.core import CheckResult, Measurement, State, active_problems, overall_state
 from nexusstat.fan_monitor import LABELS as FAN_LABELS, FanMonitor
 from nexusstat.mounts import ROOT_MODE_ID, RootMountMonitor
 from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
-from nexusstat.oled import UNKNOWN_SYMBOL, Mode, home_symbol
-from nexusstat.oled_text import network_rows, page_rows, service_rows
+from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, Mode, home_symbol
+from nexusstat.oled_text import network_rows, page_rows, service_rows, status_texts
 from nexusstat import rgb
-from nexusstat.preview import LED_OFF_FILL, LIVE, SCENARIOS, SPEEDS, PreviewSession, SessionClock, led_fill, main
+from nexusstat.preview import (LED_OFF_FILL, LIVE, SCENARIOS, SIM_UNKNOWN_DEVICE, SPEEDS, PreviewSession, SessionClock,
+                               led_fill, main)
+from nexusstat.root_device import identify_root_device
 from nexusstat.run import Collectors, live_monitor
 from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, SERVICE_LABELS
 from nexusstat.system_monitor import CPU_TEMP_ID, LABELS as SYSTEM_LABELS, SystemMonitor
@@ -78,11 +80,28 @@ class FakeMonitor:
         return results
 
 
-def make_session(scenario="ok", config=None):
+class FakeDevice:
+    """Náhrada identify_root_device pro LIVE: počítá volání, sysfs nečte."""
+
+    NVME = (State.INFO, "ROOT na NVMe (oddíl disku)", {"bus": "nvme", "disk": "nvme0n1", "layout": "partition"})
+
+    def __init__(self, result=NVME):
+        self.result = result
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def make_session(scenario="ok", config=None, device=None):
     real = FakeRealClock()
     session = PreviewSession(
         config, scenario=scenario, clock=SessionClock(real_clock=real),
         utc_clock=lambda: START_UTC, wall_clock=lambda: WALL, monitor_factory=FakeMonitor,
+        device_factory=device or FakeDevice(),
     )
     return session, real
 
@@ -158,7 +177,7 @@ class CarouselTest(unittest.TestCase):
         for _ in range(6):
             pages.append(mode_page(session)[1])
             real.advance(10)
-        self.assertEqual(pages, ["NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES", "NEXUS"])
+        self.assertEqual(pages, ["NEXUS", "SYSTEM", "STORAGE", "NETWORK", "SERVICES", "NEXUS"])
 
     def test_pages_at_5x_speed(self):
         session, real = make_session()
@@ -168,7 +187,7 @@ class CarouselTest(unittest.TestCase):
         for _ in range(6):
             pages.append(mode_page(session)[1])
             real.advance(2)  # 2 s skutečného času = 10 s simulovaného
-        self.assertEqual(pages, ["NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES", "NEXUS"])
+        self.assertEqual(pages, ["NEXUS", "SYSTEM", "STORAGE", "NETWORK", "SERVICES", "NEXUS"])
 
     def test_describe_names_network_and_services_pages(self):
         session, real = make_session()
@@ -238,7 +257,8 @@ class ScenarioTest(unittest.TestCase):
         self.assertEqual(list(SCENARIOS), ["ok", "warning", "error", "unknown", "many", "unconnected", "net_down",
                                            "net_no_ipv4", "net_low", "net_high", "net_invalid", "rgb_nas_warning",
                                            "rgb_animedb_error", "rgb_backup_error", "rgb_multi", "rgb_critical",
-                                           "rgb_acknowledged", "nas_outage", "nas_animedb", LIVE])
+                                           "rgb_acknowledged", "nas_outage", "nas_animedb", "root_readonly",
+                                           LIVE])
 
     def test_fictitious_values_are_simulated(self):
         for name in SCENARIOS:
@@ -277,6 +297,7 @@ class ScenarioTest(unittest.TestCase):
             # Průběh výpadku NAS začíná dostupným NAS (OK), výpadek přijde až dalšími pokusy.
             "nas_outage": set(),
             "nas_animedb": {State.ERROR},
+            "root_readonly": {State.ERROR},  # doložené ro jako skutečný kolektor (M5-S2)
         }
         for name, states in expected.items():
             session, _ = make_session(name)
@@ -328,13 +349,13 @@ class ScenarioTest(unittest.TestCase):
     def test_stale_data_expire_in_simulated_time(self):
         session, real = make_session("unknown")
         session.set_speed(10)
-        self.assertEqual(page_rows("DISK", session.results, session.clock.now()), [("ROOT", "42%")])
+        self.assertEqual(page_rows("STORAGE", session.results, session.clock.now())[:1], [("ROOT", "42%")])
         self.assertEqual(page_rows("SYSTEM", session.results, session.clock.now())[2], ("RAM", "UNKN"))  # chybí úplně
         run_for(session, real, 1.9, step=0.1)  # 19 s simulovaného času, obnova po 10 s
-        self.assertEqual(page_rows("DISK", session.results, session.clock.now()), [("ROOT", "42%")])
+        self.assertEqual(page_rows("STORAGE", session.results, session.clock.now())[:1], [("ROOT", "42%")])
         run_for(session, real, 0.1, step=0.1)  # 20 s: disk naposledy změřen při startu scénáře
         now = session.clock.now()
-        self.assertEqual(page_rows("DISK", session.results, now), [("ROOT", "UNKN")])
+        self.assertEqual(page_rows("STORAGE", session.results, now)[:1], [("ROOT", "UNKN")])
         problems = {p.id: p for p in active_problems(session.results, now)}
         self.assertIn("zastaralá data", problems["disk.root"].summary)
         self.assertNotIn(BACKUP_ID, problems)
@@ -415,10 +436,12 @@ class LiveTest(unittest.TestCase):
 
         config = Config(network=NetworkConfig("end0"))
         session = PreviewSession(config, scenario=LIVE, clock=SessionClock(real_clock=FakeRealClock()),
-                                 utc_clock=lambda: START_UTC, wall_clock=lambda: WALL, monitor_factory=factory)
+                                 utc_clock=lambda: START_UTC, wall_clock=lambda: WALL, monitor_factory=factory,
+                                 device_factory=FakeDevice())
         self.assertEqual(created, [config])
         self.assertIs(session.monitor_factory, factory)
         self.assertIs(inspect.signature(PreviewSession).parameters["monitor_factory"].default, live_monitor)
+        self.assertIs(inspect.signature(PreviewSession).parameters["device_factory"].default, identify_root_device)
         monitor = live_monitor(config)
         self.assertIsInstance(monitor, Collectors)
         # Kolektory přes Scheduled (SCHED-2): systém zvlášť rychlý a disk, režim / (M5-S2), ventilátor, síť.
@@ -450,13 +473,15 @@ class FrameTest(unittest.TestCase):
         real.advance(12)
         with mock.patch.object(render, "render_screen", wraps=render.render_screen) as spy:
             frame = session.tick()
-        controller, now, results, wall_time = spy.call_args.args
+        controller, now, results, wall_time, root_device = spy.call_args.args
         self.assertIs(controller, session.controller)
+        self.assertIs(root_device, session.root_device)  # údaj ROOT DEV zvlášť od výsledků kontrol
         self.assertEqual(now, 12)
         self.assertIs(results, session.results)
         self.assertEqual(wall_time, datetime(2026, 10, 19, 14, 0, 12))  # simulované hodiny na displeji
         self.assertEqual((frame.size, frame.mode), ((128, 64), "1"))
-        self.assertEqual(frame.tobytes(), render.render_screen(controller, now, results, wall_time).tobytes())
+        self.assertEqual(frame.tobytes(),
+                         render.render_screen(controller, now, results, wall_time, root_device).tobytes())
 
     def test_sleep_is_black(self):
         session, _ = make_session("error")
@@ -509,6 +534,68 @@ class FrameTest(unittest.TestCase):
         decoded = Image.open(io.BytesIO(base64.b64decode(preview.png_data(scaled))))
         self.assertEqual(decoded.size, (512, 256))
         self.assertLessEqual(set(decoded.getdata()), {0, 255})  # jen černá a bílá, žádné vyhlazení
+
+
+class StoragePageTest(unittest.TestCase):
+    """Stránka STORAGE (M5-S4): ROOT DEV je jen údaj pro displej, zjištěný v LIVE jednou."""
+
+    def rows(self, session):
+        return page_rows("STORAGE", session.results, session.clock.now(), session.root_device)
+
+    def test_scenarios_show_fictitious_storage(self):
+        ok, _ = make_session("ok")
+        self.assertEqual(self.rows(ok), [("ROOT", "42%"), ("ROOT MODE", "RW"), ("ROOT DEV", "NVME"), ("FS", "EXT4")])
+        # Scénář UNKNOWN: režim / chybí a zařízení je nepodporované, nic se nedomýšlí.
+        unknown, _ = make_session("unknown")
+        self.assertEqual(self.rows(unknown)[1:], [("ROOT MODE", "UNKN"), ("ROOT DEV", "UNKN"), ("FS", "UNKN")])
+
+    def test_read_only_root_is_an_error_in_status_nexus_and_rgb(self):
+        session, _ = make_session("root_readonly")
+        now = session.clock.now()
+        self.assertEqual(self.rows(session)[1], ("ROOT MODE", "RO"))  # ERROR, na stránce dál RO
+        self.assertIs(overall_state(session.results, now), State.ERROR)
+        self.assertEqual([status_texts(p, now)[0] for p in active_problems(session.results, now)], ["ROOT READ-ONLY"])
+        self.assertEqual(home_symbol(session.results, now), ALERT_SYMBOL)
+        session.press()
+        self.assertEqual(led_signal(session), rgb.Signal(rgb.CODES, ((State.ERROR, 1),)))  # kategorie systém
+
+    def test_unsupported_device_is_only_information(self):
+        nvme, _ = make_session(LIVE)
+        for name, device in (("vrstvené", FakeDevice(SIM_UNKNOWN_DEVICE)), ("chyba", FakeDevice(OSError("sysfs")))):
+            session, _ = make_session(LIVE, device=device)
+            now = session.clock.now()
+            with self.subTest(name):
+                self.assertEqual(self.rows(session)[2], ("ROOT DEV", "UNKN"))
+                # Žádný nový UNKNOWN, problém ve STATUS, symbol ani jiné LED než se zjištěným NVMe.
+                self.assertEqual(overall_state(session.results, now), overall_state(nvme.results, now))
+                self.assertEqual(active_problems(session.results, now), active_problems(nvme.results, now))
+                self.assertEqual(home_symbol(session.results, now), home_symbol(nvme.results, now))
+                session.press()
+                nvme.press()
+                self.assertEqual(led_signal(session), led_signal(nvme))
+                self.assertEqual(led_signal(session).kind, rgb.LIGHT)
+
+    @unittest.skipIf(Image is None, "Pillow není dostupné")
+    def test_live_identifies_once_and_drawing_measures_nothing(self):
+        device = FakeDevice()
+        session, real = make_session(LIVE, device=device)
+        session.press()
+        real.advance(20)  # stránka STORAGE
+        forbidden = AssertionError("kreslení nesmí nic měřit")
+        with mock.patch("nexusstat.mounts.read_mountinfo", side_effect=forbidden), \
+                mock.patch("nexusstat.root_device.read_mountinfo", side_effect=forbidden), \
+                mock.patch("os.statvfs", side_effect=forbidden), mock.patch("os.readlink", side_effect=forbidden):
+            for _ in range(19):
+                frame = session.tick()  # obnova dat i vykreslení
+                real.advance(0.5)
+        self.assertEqual(session.controller.current_page(session.clock.now() - 0.5), "STORAGE")
+        self.assertIsNotNone(frame.crop((0, 50, 128, 64)).getbbox())  # řádek FS
+        self.assertEqual(device.calls, 1)
+        session.set_scenario("ok")
+        self.assertEqual(device.calls, 1)  # fiktivní scénář sysfs nečte
+        session.set_scenario(LIVE)
+        self.assertEqual(device.calls, 2)  # nová LIVE session zjistí zařízení znovu, jednou
+        self.assertIn("jednou při spuštění LIVE", session.source_text())
 
 
 def led_signal(session):

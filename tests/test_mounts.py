@@ -461,12 +461,20 @@ class SafetyTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 read_mountinfo(Path(directory) / "chybi")
 
-    def test_used_only_by_storage_checks_and_the_loop(self):
-        # Kontrola cest historie a snímků (storage.py), od M5-S2 režim / ve smyčce (run.py) a od M5-S3
-        # identifikace zařízení ROOT na požádání (root_device.py); displej ne.
-        users = [path.name for path in SRC.glob("*.py") if path.name != "mounts.py"
-                 and "mounts" in {getattr(node, "module", None) for node in ast.walk(ast.parse(path.read_text(
-                     encoding="utf-8"))) if isinstance(node, ast.ImportFrom)}]
+    def test_table_is_read_only_by_storage_checks_the_loop_and_root_device(self):
+        # Tabulku čte kontrola cest historie a snímků (storage.py), od M5-S2 režim / ve smyčce (run.py)
+        # a od M5-S3 identifikace zařízení ROOT (root_device.py). Displej a simulátor si berou jen
+        # klíče details a id (M5-S4), tabulku samy nečtou.
+        readers = {"read_mountinfo", "RootMountMonitor", "parse_mountinfo", "MountTable"}
+        users = []
+        for path in SRC.glob("*.py"):
+            if path.name == "mounts.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            names = {alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                     and node.module == "mounts" for alias in node.names}
+            if names & readers:
+                users.append(path.name)
         self.assertEqual(sorted(users), ["root_device.py", "run.py", "storage.py"])
 
     def test_manual_listing_never_prints_the_source(self):

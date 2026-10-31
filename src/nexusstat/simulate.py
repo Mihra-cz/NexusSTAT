@@ -6,7 +6,8 @@ Použití:
 
 Bez --live: skriptovaný scénář stisků s fiktivními daty, simulovaný čas, nic se nečeká.
 S --live: jeden snímek každé obrazovky ze skutečného read-only měření tohoto
-počítače (system_monitor, fan_monitor, network_monitor a se zapnutým
+počítače (system_monitor, režim / z mountinfo, jednou zjištěné zařízení ROOT
+ze sysfs, fan_monitor, network_monitor a se zapnutým
 [services.animedb] i healthcheck AnimeDB, se zapnutým [services.nas] i kontrola
 dostupnosti NAS, se zapnutým [services.backup] i read-only stav zálohovací
 úlohy ze systemd). Ani jeden režim nepřistupuje k hardwaru displeje; do sítě
@@ -22,6 +23,7 @@ from pathlib import Path
 from .config import CPU_INTERVAL_SECONDS, LIVE_TICK_SECONDS, Config, load_config
 from .core import CheckResult, Measurement, State, active_problems
 from .fan_monitor import CPU_FAN_ID, DEVICE, FAN_ON, FAN_STATE, RPM, SOURCE, SOURCE_RPM
+from .mounts import FSTYPE, KIND, LOCAL, MODE, RO_BY, ROOT_MODE_ID
 from .network_monitor import (
     ADDRESS,
     BYTES_PER_SECOND,
@@ -34,12 +36,18 @@ from .network_monitor import (
     TX_RATE_ID,
 )
 from .oled import CAROUSEL_PAGES, Mode, OledController
+from .root_device import BUS, DISK, LAYOUT, NVME, identify_root_device
 from .run import live_monitor
 from .services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
 from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
 
 # Snímky se ukládají zvětšené, aby byly 128 × 64 pixely na monitoru čitelné.
 PNG_SCALE = 4
+
+# Fiktivní zařízení ROOT pro řádek ROOT DEV stránky STORAGE ve tvaru
+# root_device.identify_root_device(). Jen ve scénářích s fiktivními výsledky,
+# takže stránka nese značku SIM; skutečný sysfs se tu nečte.
+SIM_ROOT_DEVICE = (State.INFO, "ROOT na NVMe (oddíl disku)", {BUS: NVME, DISK: "nvme0n1", LAYOUT: "partition"})
 
 
 def sample_results(observed_utc):
@@ -61,7 +69,9 @@ def sample_results(observed_utc):
 
     return [
         sim("system.load", State.OK, "Zátěž v normě"),
-        sim("disk.root_readonly", State.CRITICAL, "Disk / jen pro čtení"),
+        # Jako skutečný kolektor (M5-S2): doložené ro je ERROR (ROOT READ-ONLY), ne CRITICAL.
+        sim(ROOT_MODE_ID, State.ERROR, "Režim / jen pro čtení (ext4, lokální; ro v superbloku)",
+            details={MODE: "ro", RO_BY: "superblock", FSTYPE: "ext4", KIND: LOCAL}),
         sim("system.time_sync", State.ERROR, "Čas nesynchronizován"),
         sim("disk.nvme_temp", State.WARNING, "NVMe 71 °C", value=Measurement(71, CELSIUS)),
         sim("docker.engine", State.UNKNOWN, "Docker: stav neznámý"),
@@ -69,7 +79,7 @@ def sample_results(observed_utc):
         sim("public.status", State.NA, "Veřejný status vypnut", expires=1),
         # Výsledek s prošlou platností: v čase scénáře se z OK stane UNKNOWN.
         sim("disk.smart", State.OK, "SMART bez chyb", expires=5),
-        # Fiktivní hodnoty pro stránky SYSTEM a DISK (stejná id jako kolektor).
+        # Fiktivní hodnoty pro stránky SYSTEM a STORAGE (stejná id jako kolektor).
         sim(CPU_USAGE_ID, State.INFO, "CPU 23 %", value=Measurement(23, PERCENT)),
         sim(CPU_TEMP_ID, State.INFO, "Teplota CPU 48 °C", value=Measurement(48, CELSIUS)),
         sim(MEMORY_ID, State.INFO, "RAM 24 % z 7,9 GiB", value=Measurement(24, PERCENT)),
@@ -95,7 +105,7 @@ SCENARIO = [
     (0, "wait"),
     (1, "press"),  # probuzení na NEXUS
     (11, "wait"),  # SYSTEM
-    (21, "wait"),  # DISK
+    (21, "wait"),  # STORAGE
     (31, "wait"),  # NETWORK
     (41, "wait"),  # SERVICES
     (51, "wait"),  # kolotoč dokola: znovu NEXUS
@@ -146,7 +156,8 @@ def run(output_dir, config):
         state = describe(controller, now)
         print(f"t={now:>4} s  {action:<5}  {state}")
         if render_screen is not None:
-            image = render_screen(controller, now, results, start_wall_time + timedelta(seconds=now))
+            image = render_screen(controller, now, results, start_wall_time + timedelta(seconds=now),
+                                  root_device=SIM_ROOT_DEVICE)
             save_png(image, output_dir / f"{step:02d}_t{now:03d}_{state.replace('/', '_')}.png")
 
 
@@ -174,6 +185,9 @@ def run_live(output_dir, config):
                                        monitored=monitor.labels)
     for result in results:
         print(f"{result.id:<17} {result.state.value:<8} {result.summary}")
+    # Zařízení ROOT jen jednou za běh (M5-S3), ne pro každý snímek; jen pro řádek ROOT DEV.
+    root_device = identify_root_device()
+    print(f"{'root_device':<17} {root_device[0].value:<8} {root_device[1]}")
 
     render_screen = load_renderer(output_dir)
     if render_screen is None:
@@ -184,11 +198,11 @@ def run_live(output_dir, config):
     for page in CAROUSEL_PAGES:
         controller = OledController(config.oled, pages=(page,))
         controller.press(now, 0)
-        save_png(render_screen(controller, now, results, wall_time), output_dir / f"live_{page}.png")
+        save_png(render_screen(controller, now, results, wall_time, root_device), output_dir / f"live_{page}.png")
     controller = OledController(config.oled)
     controller.press(now, 0)
     controller.press(now, len(active_problems(results, now)))  # druhý stisk otevře STATUS
-    save_png(render_screen(controller, now, results, wall_time), output_dir / "live_STATUS.png")
+    save_png(render_screen(controller, now, results, wall_time, root_device), output_dir / "live_STATUS.png")
 
 
 def main(argv=None):

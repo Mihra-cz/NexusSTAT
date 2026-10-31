@@ -412,7 +412,7 @@ class CoreAndOledIntegrationTest(FixtureCase):
         # výsledky nepřijdou od FanMonitor (M4-1).
         self.assertEqual(page_rows("SYSTEM", results, 100),
                          [("CPU", "20%"), ("CPU TEMP", "55°C"), ("RAM", "25%"), ("CPU FAN", "UNKN")])
-        self.assertEqual(page_rows("DISK", results, 100), [("ROOT", "21%")])
+        self.assertEqual(page_rows("STORAGE", results, 100)[:1], [("ROOT", "21%")])
 
     def test_valid_values_give_no_symbol_and_no_problems(self):
         results = self.collect_twice(now=100)
@@ -439,8 +439,8 @@ class CoreAndOledIntegrationTest(FixtureCase):
     def test_expired_results_become_unkn_and_unknown(self):
         results = self.collect_twice(now=100)
         expired_at = 100 + VALIDITY_SECONDS
-        self.assertEqual(page_rows("DISK", results, expired_at - 0.001), [("ROOT", "21%")])
-        self.assertEqual(page_rows("DISK", results, expired_at), [("ROOT", "UNKN")])
+        self.assertEqual(page_rows("STORAGE", results, expired_at - 0.001)[:1], [("ROOT", "21%")])
+        self.assertEqual(page_rows("STORAGE", results, expired_at)[:1], [("ROOT", "UNKN")])
         self.assertEqual(overall_state(results, expired_at), State.UNKNOWN)
         self.assertEqual(len(active_problems(results, expired_at)), 4)
 
@@ -471,7 +471,7 @@ class CoreAndOledIntegrationTest(FixtureCase):
 
     @unittest.skipIf(render_screen is None, "Pillow není dostupné")
     def test_render_unavailable_values(self):
-        controller = OledController(OledConfig(), pages=("DISK",))
+        controller = OledController(OledConfig(), pages=("STORAGE",))
         controller.press(0, 0)
         image = render_screen(controller, 0, [], WALL_TIME)
         self.assertIsNotNone(image.getbbox())

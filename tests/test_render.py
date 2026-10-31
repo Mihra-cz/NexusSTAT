@@ -135,6 +135,31 @@ class PagesRenderTest(RenderCase):
         self.assertTrue(all(any(image) for image in images))
         self.assertEqual(len(set(images)), len(CAROUSEL_PAGES))  # stránky se liší
 
+    def test_storage_page_rows_fit_128x64(self):
+        # M5-S4: čtyři řádky jako SYSTEM s CPU FAN; název vlevo, hodnota tučně vpravo, mezi nimi LABEL_GAP.
+        controller = OledController(OledConfig(), pages=("STORAGE",))
+        controller.press(0, problem_count=0)
+        mode = CheckResult("disk.root_readonly", State.ERROR, "popis", OBSERVED, 1000, simulated=False,
+                           details={"mode": "ro", "fstype": "fuse.sshfs", "kind": "network", "ro_by": "both"})
+        disk = CheckResult("disk.root", State.INFO, "popis", OBSERVED, 1000, simulated=False,
+                           measurement=Measurement(100, "%"))
+        devices = {"NVME": (State.INFO, "", {"bus": "nvme"}), "VIRTIO": (State.INFO, "", {"bus": "virtio"}),
+                   "UNKN": (State.UNKNOWN, "", {"cause": "stacked"}), "ŽÁDNÉ": None}
+        for name, device in devices.items():
+            with self.subTest(device=name):
+                image = render_screen(controller, 0, [disk, mode], WALL_TIME, device)
+                self.assertLessEqual(image.getbbox()[3], 64)
+                for index in range(4):
+                    top = render.SERVICES_ROW_TOP + index * render.SERVICES_ROW_STEP
+                    groups = ink_groups(image, top, top + 12, merge_gap=render.LABEL_GAP - 1)
+                    # Název (i dvě slova ROOT MODE) vlevo, hodnota poslední skupinou vpravo, nedotýkají se.
+                    self.assertGreaterEqual(len(groups), 2, (index, groups))
+                    self.assertEqual(groups[0][0], 0)
+                    self.assertGreaterEqual(groups[-1][0] - groups[-2][1] - 1, render.LABEL_GAP)
+                    self.assertLessEqual(groups[-1][1], render.RIGHT_EDGE)
+        # Bez údaje o zařízení i bez výsledků se stránka vykreslí celá (UNKN), nic se neměří.
+        self.assertIsNotNone(render_screen(controller, 0, [], WALL_TIME).getbbox())
+
     def test_status_pages(self):
         results = [result(f"check{i}", State.WARNING) for i in range(6)]  # 2 stránky
         self.controller.press(0, problem_count=0)
@@ -481,6 +506,9 @@ class PageBoundsTest(unittest.TestCase):
             "NEXUS ! SIM": lambda image: render.draw_nexus_page(image, late, ALERT_SYMBOL, True),
             "NEXUS ? SIM": lambda image: render.draw_nexus_page(image, late, UNKNOWN_SYMBOL, True),
             "SYSTEM": lambda image: render.draw_value_page(image, "SYSTEM", long_rows, True),
+            "STORAGE": lambda image: render.draw_value_page(image, "STORAGE", [("ROOT", "100%"), ("ROOT MODE", "UNKN"),
+                                                                              ("ROOT DEV", "1" * 30), ("FS", "1" * 30)],
+                                                            True),
             "SERVICES": lambda image: render.draw_services_page(image, rows, True),
             "STATUS 10/10": lambda image: render.draw_status_page(image, problems, 0, 10, 10, True, True),
             "NO ACTIVE ISSUES": lambda image: render.draw_status_page(image, [], 0, 1, 1, True, True),
@@ -520,7 +548,7 @@ class PageBoundsTest(unittest.TestCase):
             with self.subTest(counter=counter):
                 self.assertEqual(len(groups), 3, groups)  # STATUS, SIM, čítač
                 self.assertTrue(all(b[0] - a[1] > 6 for a, b in zip(groups, groups[1:])))  # aspoň 6 volných sloupců
-        for title in ("SYSTEM", "DISK", "NETWORK", "SERVICES"):
+        for title in ("SYSTEM", "STORAGE", "NETWORK", "SERVICES"):
             image = Image.new("1", (128, 64))
             render.draw_header(image, title, True)
             with self.subTest(title=title):

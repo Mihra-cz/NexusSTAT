@@ -200,10 +200,18 @@ class RootDeviceTest(unittest.TestCase):
         imported = {alias.name for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
                     for alias in node.names}
         self.assertFalse({"subprocess", "socket", "glob", "shutil"} & imported)
-        # Smyčka, displej ani historie identifikaci nevolají: běží jen na požádání (ruční výpis).
-        users = [path.name for path in source.parent.glob("*.py") if path != source and "root_device" in
-                 path.read_text(encoding="utf-8")]
-        self.assertEqual(users, [])
+        # Smyčka, kreslení, RGB ani historie identifikaci nevolají. Na požádání ji volá jen živý
+        # náhled při vytvoření LIVE a simulate --live jednou za běh (M5-S4); oled_text bere jen klíč.
+        callers = []
+        for path in source.parent.glob("*.py"):
+            if path == source:
+                continue
+            nodes = list(ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
+            names = {alias.name for node in nodes if isinstance(node, ast.ImportFrom) for alias in node.names}
+            names |= {node.id for node in nodes if isinstance(node, ast.Name)}
+            if "identify_root_device" in names:
+                callers.append(path.name)
+        self.assertEqual(sorted(callers), ["preview.py", "simulate.py"])
 
     def test_manual_listing(self):
         output = io.StringIO()

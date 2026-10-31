@@ -402,7 +402,7 @@ class OledCompatibilityTest(unittest.TestCase):
         # Hodnoty na stránkách jsou stejné jako bez prahů: skutečně naměřené číslo.
         self.assertEqual(page_rows("SYSTEM", results, 25),
                          [("CPU", "UNKN"), ("CPU TEMP", "72°C"), ("RAM", "UNKN"), ("CPU FAN", "UNKN")])
-        self.assertEqual(page_rows("DISK", results, 25), [("ROOT", "96%")])
+        self.assertEqual(page_rows("STORAGE", results, 25)[:1], [("ROOT", "96%")])
         self.assertEqual(home_symbol(results, 25), ALERT_SYMBOL)
         problems = active_problems(results, 25)
         self.assertEqual([(problem.id, problem.state) for problem in problems], [(DISK_ROOT_ID, E), (CPU_TEMP_ID, W)])

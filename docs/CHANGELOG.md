@@ -1,5 +1,16 @@
 # Changelog NexusSTAT
 
+## 2026-10-31 – M5-S4: stránka STORAGE v OLED simulátoru (lokálně)
+
+- **Kolotoč NEXUS → SYSTEM → STORAGE → NETWORK → SERVICES** (`oled.CAROUSEL_PAGES`): STORAGE nahradila DISK; 10 s na stránku, okno 300 s, tlačítko a STATUS beze změny.
+- **Stránka STORAGE** (`oled_text.storage_rows`, `page_rows("STORAGE", …, root_device)`): `ROOT` (obsazenost z `disk.root`), `ROOT MODE` (`RW`/`RO` z `details["mode"]` platného `disk.root_readonly`, i u `ERROR`), `ROOT DEV` (`NVME`, `SCSI`, `MMC`… z `details["bus"]` identifikace M5-S3) a `FS` (`EXT4`, `BTRFS`… z `details["fstype"]`). Chybějící, neznámý, prošlý nebo nevhodný údaj je `UNKN`, nikdy text `summary`. Rozložení 4 řádků po 12 px jako SYSTEM s CPU FAN, stávající písma a zkracování.
+- **ROOT DEV jen pro displej:** `render_screen(..., root_device=None)` dostává výsledek `identify_root_device()` zvlášť od výsledků kontrol, takže nepodporované zařízení ukáže `UNKN` bez nového globálního `UNKNOWN`, problému ve STATUS, symbolu `?` nebo blokování bílé RGB. Kreslení nic neměří ani nečte.
+- **Živý náhled (`preview.py`):** `PreviewSession(device_factory=identify_root_device)` zjistí zařízení jednou při vytvoření LIVE; chyba identifikace dá `UNKN`, náhled běží dál. Fiktivní scénáře mají výsledek `disk.root_readonly` (rw) a fiktivní NVMe se značkou `SIM`; scénář UNKNOWN nepodporované zařízení; nový scénář „20 STORAGE: ROOT jen pro čtení (ERROR, 1 bliknutí)“. Ostatní scénáře a jejich stavy beze změny.
+- **Skriptovaný simulátor a PNG (`simulate.py`):** fiktivní `disk.root_readonly` sjednocen s kolektorem (**`ERROR`** s `details` `mode = ro`, ne `CRITICAL`; počet problémů a stránek STATUS stejný), snímek STORAGE místo DISK, `--live` zjistí zařízení ROOT jednou za běh.
+- **Beze změny:** kolektory, intervaly SCHED-1/SCHED-2, `disk.root_readonly`, `root_device.py`, historie SQLite, RGB pravidla, hardware.
+- **Testy:** nové cílené testy stránky STORAGE (`tests/test_oled_text.py`: hodnoty, `RO` u `ERROR`, `UNKN` u chybějících, prošlých a nevhodných údajů; `tests/test_render.py`: skutečná bitmapa 128 × 64 bez přesahu a dotyku; `tests/test_preview.py`: fiktivní scénáře, ROOT jen pro čtení v celkovém stavu, STATUS, NEXUS a RGB, nepodporované zařízení jen jako informace, identifikace v LIVE právě jednou a kreslení bez čtení mountinfo, sysfs a `statvfs`); stávající testy upravené z DISK na STORAGE; testy náhledu podstrkují identifikaci zařízení, sysfs nečtou.
+- **Ověřeno jen na notebooku** (simulátor, PNG do dočasné složky, read-only LIVE: `ROOT 17%`, `RW`, `SCSI`, `EXT4`). Hardware displeje, Raspberry Pi, Nexus, NAS, Pironman ani Restic nedotčeny; projekt zůstává `development` / `not-deployed`.
+
 ## 2026-10-31 – M5-S3: identifikace zařízení ROOT a NVMe (lokálně, na požádání)
 
 - **Nový modul `root_device.py`:** `identify_root_device()` zjistí na požádání blokové zařízení pod viditelným mountem `/` jedním řetězcem údajů jádra: `major:minor` z `/proc/self/mountinfo` (parser M5-S1) → `readlink /sys/dev/block/<major:minor>` (cíl jen lexikálně v `/sys/devices`) → `uevent` oddílu a disku (shoda čísla, název, typ) → `readlink <disk>/device/subsystem`. Výsledek `(stav, text, details)` jako `mounts.root_mode`: `INFO` s `bus`, `disk` a `layout`, např. `ROOT na NVMe (oddíl disku)`; ruční výpis `python3 -m nexusstat.root_device`.

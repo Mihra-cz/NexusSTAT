@@ -11,11 +11,14 @@ KB/s a MB/s (výslovně zadané pro stránku NETWORK).
 """
 
 import hashlib
+import re
 
 from .backup_monitor import BACKUP, FAILED, NO_JOB, NO_TIMER, RUNNING, SKIPPED
 from .core import ALERT_STATES, State, effective
 from .fan_monitor import CPU_FAN_ID, FAN_ON, FAN_STATE, SOURCE, SOURCE_REQUEST
+from .mounts import FSTYPE, MODE, ROOT_MODE_ID
 from .network_monitor import ADDRESS, BYTES_PER_SECOND, INTERFACE, IPV4_ID, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
+from .root_device import BUS
 from .services import BACKUP_ID, DOWN, HEALTH, INVALID, NAS_ID, SERVICE_LABELS, UP
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
 
@@ -39,6 +42,7 @@ CHECK_NAMES = {
     MEMORY_ID: "RAM",
     CPU_FAN_ID: "CPU FAN",
     DISK_ROOT_ID: "ROOT",
+    ROOT_MODE_ID: "ROOT MODE",  # režim souborového systému / (M5-S2); závada = ROOT READ-ONLY
     # Síť: nejvýš 6 znaků, aby se ve STATUS vešlo i "NET RX NO DATA" (15 znaků).
     LINK_ID: "LINK",
     RX_RATE_ID: "NET RX",
@@ -53,7 +57,6 @@ CHECK_NAMES = {
     # Plánované kontroly, zatím jen ve fiktivních datech simulátoru.
     "system.time_sync": "TIME SYNC",
     "system.load": "LOAD",
-    "disk.root_readonly": "ROOT MODE",  # režim souborového systému /; závada = ROOT READ-ONLY
     "disk.nvme_temp": "NVME TEMP",
     "disk.smart": "SMART",
     "docker.engine": "DOCKER",
@@ -70,7 +73,7 @@ FAULT_TEXT = {
     NAS_ID: "NAS OFFLINE",
     BACKUP_ID: "BACKUP OVERDUE",
     "system.time_sync": "TIME UNSYNCED",
-    "disk.root_readonly": "ROOT READ-ONLY",
+    ROOT_MODE_ID: "ROOT READ-ONLY",
 }
 
 # Důvod stavu kontroly dostupnosti (AnimeDB, NAS) pro STATUS podle (stav,
@@ -104,8 +107,16 @@ STALE = "STALE"  # výsledek prošel a nový nepřišel (BACKUP OVERDUE je jiná
 # Které výsledky (podle id) ukazují stránky s hodnotami, řádek po řádku.
 PAGE_CHECKS = {
     "SYSTEM": (CPU_USAGE_ID, CPU_TEMP_ID, MEMORY_ID, CPU_FAN_ID),
-    "DISK": (DISK_ROOT_ID,),
 }
+
+# Stránka STORAGE (M5-S4). Režim RW/RO z details["mode"] platného výsledku
+# disk.root_readonly, nikdy ze summary. Typ souborového systému a sběrnice
+# zařízení ROOT jako slovo velkými písmeny; jiné znaky (nebo nic) jsou UNKN.
+STORAGE_PAGE = "STORAGE"
+MODE_TEXT = {"rw": "RW", "ro": "RO"}
+ROOT_DEVICE_LABEL = "ROOT DEV"
+FS_LABEL = "FS"
+DISPLAY_WORD = re.compile(r"[A-Z0-9][A-Z0-9._-]*")
 
 # Předpona stavu, který je znám jen z požadavku řízení. Displej tím nikdy
 # netvrdí, že se ventilátor otáčí (REQUIREMENTS.md 85).
@@ -164,7 +175,7 @@ def measurement_text(measurement):
 
 
 def value_text(result, now):
-    """Hodnota pro stránky SYSTEM, DISK a RX/TX na NETWORK: číslo s jednotkou, jinak text stavu.
+    """Hodnota pro stránky SYSTEM, STORAGE a RX/TX na NETWORK: číslo s jednotkou, jinak text stavu.
 
     Chybějící, prošlý nebo neměřitelný výsledek je UNKN, nikdy staré číslo.
     Ne N/A: to znamená záměrně vypnutou integraci, ne neznámou hodnotu.
@@ -199,8 +210,42 @@ def fan_value(result, now):
     return state
 
 
-def page_rows(page, results, now):
-    """Řádky stránek SYSTEM a DISK: (název, hodnota) v pevném pořadí podle id."""
+def display_word(value):
+    """Údaj z details jako slovo velkými písmeny (EXT4, NVME); chybějící nebo nevhodný je UNKN."""
+    text = value.upper() if isinstance(value, str) else ""
+    return text if DISPLAY_WORD.fullmatch(text) else STATE_TEXT[State.UNKNOWN]
+
+
+def storage_rows(results, now, root_device=None):
+    """Řádky stránky STORAGE: ROOT, ROOT MODE, ROOT DEV a FS jako (název, hodnota).
+
+    ROOT je obsazenost z disk.root. ROOT MODE a FS se čtou jen z details
+    platného výsledku disk.root_readonly, takže i ERROR s doloženým ro ukáže
+    RO; chybějící, neznámý nebo prošlý výsledek je UNKN. `root_device` je
+    (stav, text, details) z root_device.identify_root_device(), nebo None:
+    jen doplňující údaj pro displej, který volající předává zvlášť od
+    výsledků kontrol, proto jeho UNKNOWN nemění stav, STATUS, NEXUS ani RGB.
+    Sběrnici ukáže jen INFO, jinak UNKN.
+    """
+    by_id = {result.id: result for result in results}
+    mode_result = by_id.get(ROOT_MODE_ID)
+    details = effective(mode_result, now).details if mode_result is not None else {}
+    bus = root_device[2].get(BUS) if root_device is not None and root_device[0] is State.INFO else None
+    return [
+        (check_name(DISK_ROOT_ID), value_text(by_id.get(DISK_ROOT_ID), now)),
+        (check_name(ROOT_MODE_ID), MODE_TEXT.get(details.get(MODE), STATE_TEXT[State.UNKNOWN])),
+        (ROOT_DEVICE_LABEL, display_word(bus)),
+        (FS_LABEL, display_word(details.get(FSTYPE))),
+    ]
+
+
+def page_rows(page, results, now, root_device=None):
+    """Řádky stránek SYSTEM a STORAGE: (název, hodnota) v pevném pořadí.
+
+    `root_device` použije jen STORAGE (storage_rows).
+    """
+    if page == STORAGE_PAGE:
+        return storage_rows(results, now, root_device)
     by_id = {result.id: result for result in results}
     rows = []
     for check_id in PAGE_CHECKS.get(page, ()):

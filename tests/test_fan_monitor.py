@@ -489,9 +489,9 @@ class RenderTest(FanCase):
         self.assertLessEqual(64 + value[2], render.RIGHT_EDGE + 1)
 
     def test_three_row_pages_keep_their_layout(self):
-        # Stránka DISK (jeden řádek) se nesmí posunout: rozteč 15 px platí dál.
+        # Stránka s méně než čtyřmi řádky se nesmí posunout: rozteč 15 px platí dál.
         image = Image.new("1", (128, 64), 0)
-        render.draw_value_page(image, "DISK", [("ROOT", "31%")], False)
+        render.draw_value_page(image, "SYSTEM", [("ROOT", "31%")], False)
         box = image.crop((0, render.VALUE_ROW_TOP, 128, render.VALUE_ROW_TOP + 13)).getbbox()
         self.assertIsNotNone(box)
 
@@ -525,10 +525,10 @@ class OtherPagesTest(FanCase):
         self.device(0, "pwmfan", fan1_input=3200, pwm1=153)
         self.fan_results = list(self.monitor().collect(NOW, OBSERVED))
 
-    def test_disk_page_has_one_row(self):
+    def test_storage_page_root_row_ignores_fan_results(self):
         disk = CheckResult("disk.root", State.INFO, "Disk / 31 %", OBSERVED, NOW + VALIDITY,
                            simulated=False, measurement=Measurement(31, PERCENT))
-        self.assertEqual(page_rows("DISK", [*self.fan_results, disk], NOW), [("ROOT", "31%")])
+        self.assertEqual(page_rows("STORAGE", [*self.fan_results, disk], NOW)[:1], [("ROOT", "31%")])
 
     def test_services_page_ignores_fan_results(self):
         self.assertEqual([name for name, _ in service_rows(self.fan_results, NOW)],

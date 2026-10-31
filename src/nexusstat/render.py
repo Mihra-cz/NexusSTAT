@@ -43,13 +43,13 @@ NEXUS_CLOCK_TOP = 21
 NEXUS_DATE_TOP = 50
 CLOCK_SCALE = 2
 
-# Záhlaví stránek SYSTEM, DISK, NETWORK, SERVICES a STATUS: nadpis nahoře, pod ním čára.
+# Záhlaví stránek SYSTEM, STORAGE, NETWORK, SERVICES a STATUS: nadpis nahoře, pod ním čára.
 HEADER_LINE_Y = 13
 
-# SYSTEM a DISK: do 3 řádků rozteč 15 px (inkoust 17–58 px), název vlevo,
-# hodnota tučně vpravo jako stav na stránce SERVICES. Od čtyř řádků (SYSTEM
-# s CPU FAN) se použije rozteč stránky SERVICES, jinak by poslední řádek
-# nevyšel na 64 px; stránka DISK s jedním řádkem zůstává beze změny.
+# Stránky s hodnotami: do 3 řádků rozteč 15 px (inkoust 17–58 px), název
+# vlevo, hodnota tučně vpravo jako stav na stránce SERVICES. Od čtyř řádků
+# (SYSTEM s CPU FAN, STORAGE) se použije rozteč stránky SERVICES, jinak by
+# poslední řádek nevyšel na 64 px.
 VALUE_ROW_TOP = 16
 VALUE_ROW_STEP = 15
 VALUE_ROWS_COMPACT = 4
@@ -212,7 +212,7 @@ def draw_header(image, title, simulated, right_text=None):
 
 
 def draw_value_page(image, title, rows, simulated):
-    """Stránky SYSTEM a DISK: řádky (název, hodnota), hodnoty pod sebou zarovnané vpravo."""
+    """Stránky SYSTEM a STORAGE: řádky (název, hodnota), hodnoty pod sebou zarovnané vpravo."""
     draw = draw_header(image, title, simulated)
     compact = len(rows) >= VALUE_ROWS_COMPACT
     top = SERVICES_ROW_TOP if compact else VALUE_ROW_TOP
@@ -277,11 +277,14 @@ def draw_status_page(image, problems, now, page_number, page_total, has_data, si
         draw.text((STATUS_TEXT_X, y), text, font=font(TEXT_FONT), fill=1)
 
 
-def render_screen(controller, now, results, wall_time):
+def render_screen(controller, now, results, wall_time, root_device=None):
     """Vykreslí, co má displej ukazovat v čase `now`.
 
     Před voláním má proběhnout controller.update(now). `wall_time` je místní
     čas pro hodiny a datum; `now` je monotónní čas automatu a platnosti kontrol.
+    `root_device` je jen údaj ROOT DEV pro stránku STORAGE (už zjištěný
+    výsledek root_device.identify_root_device(), nebo None). Kreslení nic
+    neměří ani nečte ze systému.
     """
     image = Image.new("1", (DISPLAY_WIDTH, DISPLAY_HEIGHT), 0)
     if controller.mode is Mode.SLEEP:
@@ -303,5 +306,5 @@ def render_screen(controller, now, results, wall_time):
     elif page == "SERVICES":
         draw_services_page(image, service_rows(results, now), simulated)
     else:
-        draw_value_page(image, page, page_rows(page, results, now), simulated)
+        draw_value_page(image, page, page_rows(page, results, now, root_device), simulated)
     return image

@@ -18,8 +18,8 @@ class Mode(Enum):
 
 # Stránky kolotoče. První musí být NEXUS, protože na ni vede každý návrat.
 # Názvy jsou zároveň nadpisy na displeji; texty stránek sestavuje oled_text.
-# DISK se později rozšíří na STORAGE (zatím jen plán).
-CAROUSEL_PAGES = ("NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES")
+# STORAGE nahradila od M5-S4 stránku DISK.
+CAROUSEL_PAGES = ("NEXUS", "SYSTEM", "STORAGE", "NETWORK", "SERVICES")
 
 # Počet řádků s problémy na jedné stránce STATUS (128 × 64 px).
 STATUS_LINES_PER_PAGE = 4

@@ -13,6 +13,7 @@ from unittest import mock
 from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmRule, AlarmsConfig, Config
 from nexusstat.core import CheckResult, Measurement, State, active_problems, effective
+from nexusstat.mounts import ROOT_MODE_ID
 from nexusstat.network_monitor import (
     ADDRESS,
     BYTES_PER_SECOND,
@@ -38,6 +39,7 @@ from nexusstat.oled_text import (
     rate_text,
     service_rows,
     status_texts,
+    storage_rows,
     value_text,
 )
 from nexusstat.preview import LIVE, SCENARIOS, PreviewSession, SessionClock
@@ -131,6 +133,58 @@ class NamesTest(unittest.TestCase):
                 self.assertEqual(STATE_TEXT[problem.state], STATE_TEXT[state])  # závažnost zůstává ve sloupci
 
 
+NVME = (State.INFO, "ROOT na NVMe (oddíl disku)", {"bus": "nvme", "disk": "nvme0n1", "layout": "partition"})
+
+
+def root_mode(state=State.INFO, mode="rw", fstype="ext4", expires=1000):
+    details = {"mode": mode, "fstype": fstype, "kind": "local"} if mode else {"cause": "incomplete"}
+    if mode == "ro":
+        details["ro_by"] = "superblock"
+    return result(ROOT_MODE_ID, state, expires=expires, details=details)
+
+
+class StorageRowsTest(unittest.TestCase):
+    """Stránka STORAGE (M5-S4): jen z dostupných výsledků a předaného údaje o zařízení."""
+
+    def test_values_from_results_details_and_device(self):
+        disk = result(DISK_ROOT_ID, State.INFO, 31, "%")
+        cases = [
+            ("rw", [disk, root_mode()], NVME, [("ROOT", "31%"), ("ROOT MODE", "RW"), ("ROOT DEV", "NVME"),
+                                               ("FS", "EXT4")]),
+            # Doložené ro je ERROR, na stránce dál RO z details, ne text stavu ani summary.
+            ("ro", [disk, root_mode(State.ERROR, "ro")], NVME, [("ROOT", "31%"), ("ROOT MODE", "RO"),
+                                                                 ("ROOT DEV", "NVME"), ("FS", "EXT4")]),
+            ("btrfs na SATA", [disk, root_mode(fstype="btrfs")], (State.INFO, "", {"bus": "scsi"}),
+             [("ROOT", "31%"), ("ROOT MODE", "RW"), ("ROOT DEV", "SCSI"), ("FS", "BTRFS")]),
+            ("SD karta", [disk, root_mode()], (State.INFO, "", {"bus": "mmc"}),
+             [("ROOT", "31%"), ("ROOT MODE", "RW"), ("ROOT DEV", "MMC"), ("FS", "EXT4")]),
+        ]
+        for name, results, device, rows in cases:
+            with self.subTest(name):
+                self.assertEqual(storage_rows(results, 10, device), rows)
+                self.assertEqual(page_rows("STORAGE", results, 10, device), rows)
+
+    def test_missing_unknown_expired_or_unsuitable_data_are_unkn(self):
+        unkn = [("ROOT", "UNKN"), ("ROOT MODE", "UNKN"), ("ROOT DEV", "UNKN"), ("FS", "UNKN")]
+        self.assertEqual(storage_rows([], 10), unkn)  # nic nepřišlo, zařízení nezjištěno
+        stacked = (State.UNKNOWN, "vrstvené zařízení", {"cause": "stacked"})
+        results = [result(DISK_ROOT_ID, State.INFO, 31, "%", expires=20), root_mode(expires=20)]
+        self.assertEqual(storage_rows(results, 19.9, stacked)[:2], [("ROOT", "31%"), ("ROOT MODE", "RW")])
+        self.assertEqual(storage_rows(results, 20, stacked), unkn)  # prošlé: ani režim, ani typ
+        self.assertEqual(storage_rows([root_mode(State.UNKNOWN, mode=None)], 10, None), unkn)
+        # Typ a sběrnice jen jako jedno slovo pro displej; jiné znaky nebo chybějící údaj = UNKN.
+        odd = [root_mode(fstype="ext 4"), result(DISK_ROOT_ID, State.INFO, 31, "%")]
+        self.assertEqual(storage_rows(odd, 10, (State.INFO, "", {"bus": "a/b"}))[2:],
+                         [("ROOT DEV", "UNKN"), ("FS", "UNKN")])
+        self.assertEqual(storage_rows([root_mode(fstype="fuse.sshfs")], 10, (State.INFO, "", {}))[2:],
+                         [("ROOT DEV", "UNKN"), ("FS", "FUSE.SSHFS")])
+
+    def test_read_only_root_is_an_error_everywhere(self):
+        ro = root_mode(State.ERROR, "ro")
+        self.assertEqual(status_texts(ro, 10)[0], "ROOT READ-ONLY")
+        self.assertEqual([(p.id, p.state) for p in active_problems([ro], 10)], [(ROOT_MODE_ID, State.ERROR)])
+
+
 class ValueTextTest(unittest.TestCase):
     def test_measurement_rounding_matches_collector_summary(self):
         # Stejné zaokrouhlení jako summary kolektoru (:.0f, polovina k sudé).
@@ -152,7 +206,7 @@ class ValueTextTest(unittest.TestCase):
         ]
         self.assertEqual(page_rows("SYSTEM", results, 10),
                          [("CPU", "23%"), ("CPU TEMP", "88°C"), ("RAM", "24%"), ("CPU FAN", "UNKN")])
-        self.assertEqual(page_rows("DISK", results, 10), [("ROOT", "91%")])
+        self.assertEqual(page_rows("STORAGE", results, 10)[:1], [("ROOT", "91%")])
         self.assertEqual(page_rows("NEXUS", results, 10), [])
 
     def test_missing_expired_and_unknown_values_are_unkn_never_old_number(self):
@@ -385,7 +439,8 @@ class FakeMonitor:
 def session(scenario):
     real = FakeRealClock()
     preview_session = PreviewSession(Config(), scenario=scenario, clock=SessionClock(real_clock=real),
-                                     utc_clock=lambda: OBSERVED, wall_clock=lambda: WALL, monitor_factory=FakeMonitor)
+                                     utc_clock=lambda: OBSERVED, wall_clock=lambda: WALL, monitor_factory=FakeMonitor,
+                                     device_factory=lambda: None)  # zařízení ROOT (sysfs) se v testu nečte
     return preview_session, real
 
 
@@ -485,12 +540,12 @@ class RenderedTextTest(unittest.TestCase):
         return texts
 
     def all_screens(self, scenario):
-        """Všechny obrazovky scénáře: NEXUS, SYSTEM, DISK, NETWORK, SERVICES a každá stránka STATUS."""
+        """Všechny obrazovky scénáře: NEXUS, SYSTEM, STORAGE, NETWORK, SERVICES a každá stránka STATUS."""
         preview_session, real = session(scenario)
         frames = {}
         preview_session.press()
         start = real.now
-        for offset, page in ((0, "NEXUS"), (10, "SYSTEM"), (20, "DISK"), (30, "NETWORK"), (40, "SERVICES")):
+        for offset, page in ((0, "NEXUS"), (10, "SYSTEM"), (20, "STORAGE"), (30, "NETWORK"), (40, "SERVICES")):
             real.now = start + offset
             frames[page] = preview_session.tick()
         preview_session.press()
@@ -516,7 +571,7 @@ class RenderedTextTest(unittest.TestCase):
 
     def test_page_titles_are_english(self):
         texts = set(self.recorded_texts(lambda: self.all_screens("many")))
-        self.assertLessEqual({"NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES", "STATUS"}, texts)
+        self.assertLessEqual({"NEXUS", "SYSTEM", "STORAGE", "NETWORK", "SERVICES", "STATUS"}, texts)
         self.assertFalse({"SLUŽBY", "SLUZBY"} & texts)
 
     def test_screens_stay_one_bit_128x64(self):

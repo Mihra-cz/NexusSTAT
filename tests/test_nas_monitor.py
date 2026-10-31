@@ -864,7 +864,8 @@ class PreviewTest(unittest.TestCase):
         self.real = FakeRealClock()
         return PreviewSession(config, scenario=scenario, clock=SessionClock(real_clock=self.real),
                               utc_clock=lambda: OBSERVED, wall_clock=lambda: datetime(2026, 10, 28, 13, 0),
-                              monitor_factory=factory)
+                              # Zařízení ROOT (sysfs) se v testu nečte.
+                              monitor_factory=factory, device_factory=lambda: None)
 
     def next_measurement(self, session):
         self.real.advance(INTERVAL)

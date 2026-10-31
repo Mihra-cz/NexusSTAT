@@ -299,7 +299,7 @@ class CollectorFailureTest(unittest.TestCase):
         self.assertEqual(results[0].summary, "CPU: měření selhalo")
         self.assertIs(overall_state(results, now), State.UNKNOWN)
         self.assertEqual(home_symbol(results, now), UNKNOWN_SYMBOL)
-        self.assertEqual(page_rows("DISK", results, now), [("ROOT", "UNKN")])
+        self.assertEqual(page_rows("STORAGE", results, now)[:1], [("ROOT", "UNKN")])
         self.assertEqual(len(active_problems(results, now)), 4)
         for result in results:
             self.assertEqual(result.observed_utc, START_UTC + timedelta(seconds=20))
@@ -609,7 +609,7 @@ class OledCompatibilityTest(unittest.TestCase):
 
         # Další měření nepřišlo: po třech intervalech hodnoty zmizí a STATUS ukáže UNKNOWN.
         expired = START + 50
-        self.assertEqual(page_rows("DISK", results, expired), [("ROOT", "UNKN")])
+        self.assertEqual(page_rows("STORAGE", results, expired)[:1], [("ROOT", "UNKN")])
         self.assertEqual(home_symbol(results, expired), UNKNOWN_SYMBOL)
         problems = active_problems(results, expired)
         self.assertEqual({problem.state for problem in problems}, {State.UNKNOWN})

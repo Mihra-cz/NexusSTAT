@@ -27,6 +27,7 @@ from . import rgb
 from .alarms import AlarmEvaluator
 from .config import HEALTH_TIMEOUT_DEFAULT, LIVE_TICK_SECONDS, NAS_PORT_DEFAULT, Config, ConfigError, load_config
 from .core import CheckResult, Measurement, State, active_problems
+from .mounts import FSTYPE, KIND, LOCAL, MODE, RO_BY, ROOT_MODE_ID
 from .nas_monitor import NasMonitor
 from .network_monitor import (
     ADDRESS,
@@ -42,8 +43,10 @@ from .network_monitor import (
     format_rate,
 )
 from .oled import Mode, OledController, status_page_count
+from .root_device import identify_root_device
 from .run import failed_results, live_monitor
 from .services import ANIMEDB_ID, BACKUP_ID, CAUSE, DOWN, HEALTH, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
+from .simulate import SIM_ROOT_DEVICE
 from .system_monitor import CELSIUS, CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, PERCENT
 
 # Zrychlení simulovaného času. LIVE běží vždy 1×, protože měří skutečný čas.
@@ -75,6 +78,9 @@ LED_COUNT = 4
 SIM_INTERFACE = "eth0"
 SIM_ADDRESS = "192.0.2.10"
 SIM_NAS_ADDRESS = "192.0.2.20"  # fiktivní NAS ze stejného rozsahu; nikdy se na ni nepřipojuje
+# Fiktivní nepodporované (vrstvené) zařízení ROOT: řádek ROOT DEV ukáže UNKN,
+# stav, STATUS ani LED se tím nemění (je to jen údaj pro displej).
+SIM_UNKNOWN_DEVICE = (State.UNKNOWN, "vrstvené nebo virtuální blokové zařízení", {CAUSE: "stacked"})
 
 
 def pct(value):
@@ -102,7 +108,17 @@ def network(sim, rx, tx, link=LINK_UP, address=SIM_ADDRESS, stale_after=None):
     ]
 
 
+def root_mode(sim, read_only=False):
+    """Fiktivní režim / se stejnými details jako kolektor (M5-S2): rw INFO, doložené ro ERROR."""
+    if read_only:
+        return sim(ROOT_MODE_ID, State.ERROR, "Režim / jen pro čtení (ext4, lokální; ro v superbloku)",
+                   details={MODE: "ro", RO_BY: "superblock", FSTYPE: "ext4", KIND: LOCAL})
+    return sim(ROOT_MODE_ID, State.INFO, "Režim / rw (ext4, lokální)",
+               details={MODE: "rw", FSTYPE: "ext4", KIND: LOCAL})
+
+
 def system_and_services(sim):
+    # Režim / na konci, aby indexy systémových položek a služeb zůstaly stejné.
     return [
         sim(CPU_USAGE_ID, State.INFO, "CPU 12 %", pct(12)),
         sim(CPU_TEMP_ID, State.INFO, "Teplota CPU 46 °C", deg(46)),
@@ -112,6 +128,7 @@ def system_and_services(sim):
         sim(NAS_ID, State.OK, "NAS dostupný"),
         sim(BACKUP_ID, State.OK, "Záloha v pořádku"),
         sim(ANIMEDB_ID, State.NA, "AnimeDB není nasazena"),
+        root_mode(sim),
     ]
 
 
@@ -157,6 +174,7 @@ def scenario_many(sim):
         sim(NAS_ID, State.CRITICAL, "NAS nedostupný"),
         sim(BACKUP_ID, State.ERROR, "Záloha starší 3 dny"),
         sim(ANIMEDB_ID, State.NA, "AnimeDB není nasazena"),
+        root_mode(sim),
     ] + network(sim, rx=4_820_000, tx=310_000)
 
 
@@ -164,7 +182,7 @@ def scenario_unconnected(sim):
     # Fiktivní systém a síť, služby bez výsledku: doplnění je ukáže jako dnes
     # ve skutečnosti s výchozí konfigurací (NEXUS UNKNOWN; AnimeDB, NAS a BACKUP
     # se sledováním vypnutým N/A).
-    return system_and_services(sim)[:4] + network(sim, rx=1_234_000, tx=85_300)
+    return system_and_services(sim)[:4] + [root_mode(sim)] + network(sim, rx=1_234_000, tx=85_300)
 
 
 # Síťové scénáře: systém a služby jako ve scénáři 1, mění se jen NETWORK.
@@ -272,6 +290,14 @@ class ScriptedConnection:
         pass
 
 
+def scenario_root_readonly(sim):
+    # Doložené ro (M5-S2): ERROR jako každá jiná závada; STORAGE ukáže ROOT MODE RO,
+    # STATUS ROOT READ-ONLY, NEXUS trojúhelník a LED červeně 1 bliknutí (systém).
+    results = scenario_ok(sim)
+    results[8] = root_mode(sim, read_only=True)
+    return results
+
+
 def scenario_nas_animedb(sim):
     # Potvrzený výpadek NAS i AnimeDB zároveň (stejné popisy a details jako
     # u kolektorů): červeně 2 a 3 bliknutí, ve STATUS ANIMEDB DOWN a NAS OFFLINE.
@@ -303,8 +329,11 @@ SCENARIOS = {
     "rgb_acknowledged": ("17 RGB: potvrzená závada (zálohy ERROR)", scenario_rgb_backup_error),
     "nas_outage": ("18 NAS: průběh výpadku a obnovení (1/3, 2/3, ERROR, odeznění)", scenario_ok),
     "nas_animedb": ("19 NAS a AnimeDB: současný výpadek (2 a 3 bliknutí)", scenario_nas_animedb),
+    "root_readonly": ("20 STORAGE: ROOT jen pro čtení (ERROR, 1 bliknutí)", scenario_root_readonly),
     LIVE: ("LIVE: měření tohoto notebooku", None),
 }
+# Fiktivní zařízení ROOT pro řádek ROOT DEV; scénář UNKNOWN ukazuje nepodporované.
+SCENARIO_DEVICES = {"unknown": SIM_UNKNOWN_DEVICE}
 # Scénáře, ve kterých je závada potvrzená hned od spuštění.
 PREACKNOWLEDGED = {"rgb_acknowledged"}
 # Scénáře, ve kterých výsledek NAS dává NasMonitor podle připraveného průběhu pokusů.
@@ -339,12 +368,13 @@ class PreviewSession:
     """Stav simulátoru bez grafického okna: scénář, data, controller a čas."""
 
     def __init__(self, config=None, scenario="ok", clock=None, utc_clock=None, wall_clock=datetime.now,
-                 monitor_factory=live_monitor):
+                 monitor_factory=live_monitor, device_factory=identify_root_device):
         self.config = config or Config()
         self.clock = clock or SessionClock()
         self.utc_clock = utc_clock or (lambda: datetime.now(timezone.utc))
         self.wall_clock = wall_clock
         self.monitor_factory = monitor_factory
+        self.device_factory = device_factory
         self.validity = self.config.collector.validity_seconds
         self.interval = self.config.collector.interval_seconds
         # Převod simulovaného času na UTC a místní čas pro výsledky a hodiny na displeji.
@@ -378,8 +408,11 @@ class PreviewSession:
             # a jen při zapnutém [services.animedb] i healthcheck AnimeDB.
             self.monitor = self.monitor_factory(self.config)
             self.evaluator = AlarmEvaluator(self.config.alarms)
+            # Zařízení ROOT jen jednou při vytvoření LIVE (M5-S3), ne při obnově ani kreslení.
+            self.root_device = self._identify_root_device()
         else:
             self.monitor = self.evaluator = None
+            self.root_device = SCENARIO_DEVICES.get(name, SIM_ROOT_DEVICE)
         # Průběh výpadku NAS začíná se scénářem znovu, jako potvrzení a alarmy.
         attempts = NAS_ATTEMPTS.get(name)
         self.nas = None if attempts is None else NasMonitor(
@@ -394,6 +427,13 @@ class PreviewSession:
         self._refresh(now)
         if name in PREACKNOWLEDGED:
             self.leds.acks.acknowledge(self.monitored, now)
+
+    def _identify_root_device(self):
+        # Doplňující údaj pro displej: chyba identifikace nesmí zastavit náhled (ROOT DEV UNKN).
+        try:
+            return self.device_factory()
+        except Exception:
+            return None
 
     def set_speed(self, speed):
         if self.is_live:
@@ -490,7 +530,7 @@ class PreviewSession:
         self.controller.update(now)
         # Pillow až tady: stavová logika a její testy bez něj fungují.
         from .render import render_screen
-        return render_screen(self.controller, now, self.results, self.wall_time(now))
+        return render_screen(self.controller, now, self.results, self.wall_time(now), self.root_device)
 
     def describe(self):
         """Režim displeje pro popisek mimo plochu OLED."""
@@ -514,7 +554,8 @@ class PreviewSession:
             backup = ("BACKUP z výsledku úlohy v systemd" if self.config.services.backup.enabled
                       else "BACKUP N/A (sledování vypnuto)")
             return ("LIVE: skutečná read-only měření (systém a síť) tohoto NOTEBOOKU, ne Nexusu. "
-                    f"Služby bez kolektoru UNKNOWN, {source}, {nas}, {backup}. Čas 1×.")
+                    f"Služby bez kolektoru UNKNOWN, {source}, {nas}, {backup}. "
+                    "Zařízení ROOT zjištěno jednou při spuštění LIVE. Čas 1×.")
         text = f"SIMULACE: fiktivní data (značka SIM), čas {self.clock.speed}×."
         if self.nas is not None:
             # OLED ukazuje u 1. i 2. neúspěšného pokusu stejné NAS FAILING;

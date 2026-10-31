@@ -773,7 +773,8 @@ class PreviewTest(unittest.TestCase):
 
         return PreviewSession(config, scenario=LIVE, clock=SessionClock(real_clock=lambda: 5000.0),
                               utc_clock=lambda: OBSERVED, wall_clock=lambda: datetime(2026, 10, 28, 13, 0),
-                              monitor_factory=factory)
+                              # Zařízení ROOT (sysfs) se v testu nečte.
+                              monitor_factory=factory, device_factory=lambda: None)
 
     def test_enabled_and_disabled(self):
         session = self.session(FakeSystemctl(FAILURE), enabled=True)

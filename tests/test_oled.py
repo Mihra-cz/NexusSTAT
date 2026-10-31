@@ -74,15 +74,15 @@ class CarouselTest(unittest.TestCase):
         controller = awake_controller(at=100)
         self.assertEqual(at(controller, 109.9), (Mode.CAROUSEL, "NEXUS"))
         self.assertEqual(at(controller, 110), (Mode.CAROUSEL, "SYSTEM"))
-        self.assertEqual(at(controller, 120), (Mode.CAROUSEL, "DISK"))
+        self.assertEqual(at(controller, 120), (Mode.CAROUSEL, "STORAGE"))
         self.assertEqual(at(controller, 130), (Mode.CAROUSEL, "NETWORK"))
         self.assertEqual(at(controller, 140), (Mode.CAROUSEL, "SERVICES"))
         self.assertEqual(at(controller, 149.9), (Mode.CAROUSEL, "SERVICES"))
         self.assertEqual(at(controller, 150), (Mode.CAROUSEL, "NEXUS"))  # cyklus znovu
 
     def test_five_pages_in_order(self):
-        # STORAGE (místo DISK) a CPU FAN jsou plán další fáze, zatím ne.
-        self.assertEqual(CAROUSEL_PAGES, ("NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES"))
+        # Od M5-S4 STORAGE místo DISK; počet stránek a časování beze změny.
+        self.assertEqual(CAROUSEL_PAGES, ("NEXUS", "SYSTEM", "STORAGE", "NETWORK", "SERVICES"))
         self.assertEqual(OledController(OledConfig()).pages, CAROUSEL_PAGES)
 
     def test_rotation_over_whole_window_returns_to_nexus(self):
@@ -96,7 +96,7 @@ class CarouselTest(unittest.TestCase):
         config = OledConfig(carousel_seconds=60, page_seconds=4, status_idle_seconds=30)
         controller = awake_controller(at=0, config=config)
         self.assertEqual([at(controller, now)[1] for now in (0, 4, 8, 12, 16, 20)],
-                         ["NEXUS", "SYSTEM", "DISK", "NETWORK", "SERVICES", "NEXUS"])
+                         ["NEXUS", "SYSTEM", "STORAGE", "NETWORK", "SERVICES", "NEXUS"])
         self.assertEqual(at(controller, 60), (Mode.SLEEP, None))
 
     def test_sleeps_after_300_seconds(self):
@@ -199,7 +199,7 @@ class CarouselResetTest(unittest.TestCase):
 
     def test_return_by_timeout_starts_new_window_on_nexus(self):
         controller = awake_controller(at=0)
-        controller.press(25, problem_count=1)  # STATUS ze stránky DISK
+        controller.press(25, problem_count=1)  # STATUS ze stránky STORAGE
         self.assertEqual(at(controller, 55), (Mode.CAROUSEL, "NEXUS"))
         self.assertEqual(at(controller, 65), (Mode.CAROUSEL, "SYSTEM"))
         self.assertEqual(at(controller, 354.9)[0], Mode.CAROUSEL)
@@ -222,7 +222,7 @@ class FullScenarioTest(unittest.TestCase):
             (0, None, (Mode.SLEEP, None)),
             (1, "press", (Mode.CAROUSEL, "NEXUS")),
             (11, None, (Mode.CAROUSEL, "SYSTEM")),
-            (21, None, (Mode.CAROUSEL, "DISK")),
+            (21, None, (Mode.CAROUSEL, "STORAGE")),
             (25, "press", (Mode.STATUS, None)),
             (30, "press", (Mode.STATUS, None)),  # stránka 2/2
             (35, "press", (Mode.CAROUSEL, "NEXUS")),  # z poslední stránky zpět, nové okno
@@ -433,15 +433,19 @@ class FakeMonitor:
 class SimulatorScenarioTest(unittest.TestCase):
     def test_live_mode_completes_services(self):
         output = io.StringIO()
+        device = (State.INFO, "ROOT na NVMe (oddíl disku)", {"bus": "nvme", "disk": "nvme0n1", "layout": "partition"})
         with mock.patch.object(simulate, "live_monitor", FakeMonitor), \
                 mock.patch.object(simulate.time, "sleep"), \
                 mock.patch.object(simulate, "load_renderer", return_value=None), \
+                mock.patch.object(simulate, "identify_root_device", return_value=device) as identify, \
                 contextlib.redirect_stdout(output):
             simulate.main(["/neexistujici-vystup", "--live"])
         lines = {line.split()[0]: line.split()[1] for line in output.getvalue().splitlines()}
         self.assertEqual({service_id: lines[service_id] for service_id in SERVICE_LABELS}, {
             NEXUS_SERVICES_ID: "UNKNOWN", ANIMEDB_ID: "N/A", NAS_ID: "N/A", BACKUP_ID: "N/A",
         })
+        identify.assert_called_once_with()  # zařízení ROOT jednou za běh, ne pro každý snímek
+        self.assertEqual(lines["root_device"], "INFO")
 
     def test_scenario_visits_all_pages_and_keeps_timeouts(self):
         output = io.StringIO()
@@ -450,7 +454,7 @@ class SimulatorScenarioTest(unittest.TestCase):
             simulate.run(None, OledConfig())
         states = [line.split()[-1] for line in output.getvalue().splitlines()]
         self.assertEqual(states, [
-            "SLEEP", "CAROUSEL/NEXUS", "CAROUSEL/SYSTEM", "CAROUSEL/DISK", "CAROUSEL/NETWORK", "CAROUSEL/SERVICES",
+            "SLEEP", "CAROUSEL/NEXUS", "CAROUSEL/SYSTEM", "CAROUSEL/STORAGE", "CAROUSEL/NETWORK", "CAROUSEL/SERVICES",
             "CAROUSEL/NEXUS",  # po SERVICES zpět na NEXUS
             "STATUS/1", "STATUS/2", "CAROUSEL/NEXUS", "STATUS/1",
             "CAROUSEL/NEXUS",  # 30 s bez stisku
@@ -463,6 +467,9 @@ class SimulatorScenarioTest(unittest.TestCase):
                          [("NEXUS", "OK"), ("ANIMEDB", "OK"), ("NAS", "OK"), ("BACKUP", "WARN")])
         self.assertTrue(all(result.simulated for result in results))
         self.assertEqual(status_page_count(len(active_problems(results, 10))), 2)
+        # Fiktivní ROOT jen pro čtení jako skutečný kolektor (M5-S2): ERROR s details, ne CRITICAL.
+        [read_only] = [result for result in results if result.id == "disk.root_readonly"]
+        self.assertEqual((read_only.state, read_only.details["mode"]), (State.ERROR, "ro"))
 
 
 class HomeSymbolTest(unittest.TestCase):
