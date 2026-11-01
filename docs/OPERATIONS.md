@@ -304,7 +304,7 @@ Jen tři akce: potvrzení jedné závady `WARNING`/`ERROR`, jas LED 5–100 % a 
    PYTHONPATH=src python3 -m nexusstat.admin ~/.config/nexusstat/admin.scrypt
    ```
 
-   Zadání je skryté a dvakrát; PIN aspoň 8 číslic, jinak heslo aspoň 12 znaků. Uloží se jen solený otisk `scrypt` s oprávněními `0600`. Změna hesla: totéž s `--replace` a restart `nexusstat.run`.
+   Zadání je skryté a dvakrát; jediné pravidlo je aspoň 4 znaky (PIN i heslo z libovolných znaků). Uloží se jen solený otisk `scrypt` s oprávněními `0600`. Změna hesla: totéž s `--replace` a restart `nexusstat.run`. Krátký PIN chrání hlavně blokace chybných pokusů (čtyřmístný lze při trvalém útoku vyzkoušet řádově za tři týdny; útok ukáže audit `admin.login_blocked`).
 2. **HTTPS:** certifikát a klíč (PEM) připraví správce mimo repozitář; NexusSTAT je nevytváří. Klíč bez hesla, obyčejný soubor tohoto uživatele s `chmod 600` (ne symlink). Skutečné certifikáty a důvěra klientských zařízení se řeší samostatně, před otevřením v LAN.
 3. **Spuštění** (na notebooku jen `127.0.0.1`):
 

@@ -3,7 +3,7 @@
 Nic dalšího: intervaly měření, alarmové prahy, časování OLED ani jiná
 konfigurace se webem nemění, zůstávají v config.toml. Administrace existuje
 jen na HTTPS (web.py ji bez TLS a bez souboru hesla nenabídne) a jen po zadání
-jednoho administračního hesla nebo PINu; žádné účty ani role.
+jednoho administračního hesla nebo PINu (aspoň 4 znaky); žádné účty ani role.
 
 - Heslo: v souboru je jen solený otisk scrypt (0600, mimo repozitář).
   Nastavuje ho správce v terminálu: `python3 -m nexusstat.admin SOUBOR`.
@@ -37,19 +37,18 @@ import sys
 import tempfile
 import threading
 import time
-import unicodedata
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlencode
 
 from . import storage
 from .core import State, effective
 from .oled_text import status_texts
 from .rgb import ACK_LEVELS
 from .user_state import CHECK_ID_PATTERN, MAX_CHECK_ID, Acknowledge, RequestInterrupted, SetBrightness
-from .web import CSS, CSS_HASH, badge, esc
+from .web import CSS, CSS_HASH, MAX_FORM_BYTES, badge, esc
 
 COOKIE = "__Host-nexusstat-admin"
 SESSION_SECONDS = 600
@@ -60,7 +59,8 @@ LOCKOUT_SECONDS = (60, 300, 900)
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
 SCRYPT_N_RANGE = (2 ** 14, 2 ** 17)
 SALT_BYTES, KEY_BYTES = 16, 32
-MIN_PIN_DIGITS, MIN_PASSWORD_CHARS, MAX_PASSWORD_CHARS = 8, 12, 128
+# Heslo nebo PIN: jediné pravidlo je nejméně 4 znaky (rozhodnutí správce 2026-11-01).
+MIN_PASSWORD_CHARS = 4
 MAX_HASH_FILE_BYTES = 512
 # Smyčka tiká po 1 s: běžná odpověď přijde hned v dalším taktu.
 REPLY_SECONDS = 3.0
@@ -97,16 +97,15 @@ class AdminError(ValueError):
 
 
 def check_new_password(password):
-    """PIN aspoň 8 číslic nebo heslo aspoň 12 znaků, nejvýš 128, bez řídicích znaků."""
-    if len(password) > MAX_PASSWORD_CHARS:
-        raise AdminError(f"heslo smí mít nejvýš {MAX_PASSWORD_CHARS} znaků")
-    if any(unicodedata.category(char).startswith("C") for char in password):
-        raise AdminError("heslo nesmí obsahovat řídicí znaky")
-    if re.fullmatch(r"[0-9]+", password):
-        if len(password) < MIN_PIN_DIGITS:
-            raise AdminError(f"PIN musí mít aspoň {MIN_PIN_DIGITS} číslic")
-    elif len(password) < MIN_PASSWORD_CHARS:
-        raise AdminError(f"heslo musí mít aspoň {MIN_PASSWORD_CHARS} znaků (nebo PIN aspoň {MIN_PIN_DIGITS} číslic)")
+    """Heslo nebo PIN aspoň 4 znaky, jinak libovolné znaky a délka.
+
+    Jedinou další mezí je technická: heslo se musí vejít do přihlašovacího
+    formuláře (MAX_FORM_BYTES), jinak by ho na webu nešlo zadat.
+    """
+    if len(password) < MIN_PASSWORD_CHARS:
+        raise AdminError(f"heslo nebo PIN musí mít aspoň {MIN_PASSWORD_CHARS} znaky")
+    if len(urlencode({"password": password})) > MAX_FORM_BYTES:
+        raise AdminError(f"heslo je delší, než projde přihlašovacím formulářem ({MAX_FORM_BYTES} B)")
     return password
 
 
@@ -235,7 +234,8 @@ class LoginGuard:
                 self._refused += 1  # bez události: jen se sečte do příští
                 return False, f"příliš mnoho chybných pokusů; zkuste to za {math.ceil(self._blocked_until - now)} s"
             self.verifications += 1
-            if len(password) <= MAX_PASSWORD_CHARS and self._hash.verify(password):
+            # Kratší vstup správný být nemůže: chybný pokus bez výpočtu scrypt (delší omezí tělo formuláře).
+            if len(password) >= MIN_PASSWORD_CHARS and self._hash.verify(password):
                 self._failures = self._level = 0
                 self._blocked_until = None
                 return True, ""
@@ -479,7 +479,7 @@ class Admin:
         message = f"<p>{esc(note)}</p>" if note else ""
         form = (f'<form method="post" action="{LOGIN}"><label>Heslo nebo PIN '
                 f'<input type="password" name="password" autocomplete="current-password" '
-                f'maxlength="{MAX_PASSWORD_CHARS}" required autofocus></label> <button>Přihlásit</button></form>')
+                f'minlength="{MIN_PASSWORD_CHARS}" required autofocus></label> <button>Přihlásit</button></form>')
         return self._respond(status, _page("NexusSTAT – administrace", f"{message}<section>{form}</section>"
                                            "<p class=\"t\">Jen potvrzení závad a jas LED. Relace platí "
                                            f"{SESSION_SECONDS // 60} min.</p>"))
@@ -522,11 +522,12 @@ class Admin:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Nastaví administrační heslo nebo PIN lokálního webu NexusSTAT "
-                                                 "(uloží jen solený otisk scrypt s oprávněními 0600)")
+                                                 f"(aspoň {MIN_PASSWORD_CHARS} znaky; uloží jen solený otisk scrypt "
+                                                 "s oprávněními 0600)")
     parser.add_argument("path", type=Path, help="soubor otisku mimo repozitář; adresář musí existovat")
     parser.add_argument("--replace", action="store_true", help="přepsat existující otisk")
     args = parser.parse_args(argv)
-    first = getpass.getpass("Nové heslo nebo PIN: ")
+    first = getpass.getpass(f"Nové heslo nebo PIN (aspoň {MIN_PASSWORD_CHARS} znaky): ")
     if getpass.getpass("Znovu: ") != first:
         parser.error("zadání se neshodují; nic se nezapsalo")
     try:

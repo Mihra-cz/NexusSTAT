@@ -130,11 +130,17 @@ class PasswordTest(unittest.TestCase):
                 parse_hash(broken)
 
     def test_new_password_rules(self):
-        for good in ("12345678", "dlouhé heslo", "x" * 128):
-            self.assertEqual(check_new_password(good), good)
-        for bad in ("1234567", "krátké heslo"[:11], "x" * 129, "heslo\nheslo123", "heslo\x00heslo123"):
-            with self.subTest(bad=bad), self.assertRaises(AdminError):
+        # Jediné pravidlo: aspoň 4 znaky; čísla i jiné znaky a délka bez dalších podmínek.
+        for good in ("1234", "12345", "123456", "1234567", "abcd", "žluť", " a b", "dlouhé heslo s mezerami",
+                     "x" * 1015):
+            with self.subTest(good=good[:12]):
+                self.assertEqual(check_new_password(good), good)
+        for bad in ("", "1", "123", "abc", "ž  "):
+            with self.subTest(bad=bad), self.assertRaisesRegex(AdminError, "aspoň 4 znaky"):
                 check_new_password(bad)
+        # Jen technická mez: heslo, které se nevejde do přihlašovacího formuláře (1 KiB), by nešlo zadat.
+        with self.assertRaisesRegex(AdminError, "formulářem"):
+            check_new_password("x" * 1016)
 
     def test_private_file_written_atomically_and_loaded_strictly(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -175,14 +181,18 @@ class PasswordTest(unittest.TestCase):
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 admin.main([str(path)])
             self.assertTrue(load_password_file(path).verify(PASSWORD))
-            for bad in ([PASSWORD, PASSWORD + "x"], ["1234", "1234"]):
+            for bad in ([PASSWORD, PASSWORD + "x"], ["abc", "abc"]):
                 with mock.patch("nexusstat.admin.getpass.getpass", side_effect=bad), \
                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
                         self.assertRaises(SystemExit):
                     admin.main([str(path), "--replace"])
             self.assertTrue(load_password_file(path).verify(PASSWORD))  # nic se nezapsalo
             self.assertNotIn(PASSWORD, out.getvalue() + err.getvalue())
-            self.assertNotIn("1234", err.getvalue())
+            self.assertNotIn("abc", err.getvalue())
+            with mock.patch("nexusstat.admin.getpass.getpass", side_effect=["1234", "1234"]), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                admin.main([str(path), "--replace"])  # i čtyřmístný PIN
+            self.assertTrue(load_password_file(path).verify("1234"))
 
 
 class LoginGuardTest(unittest.TestCase):
@@ -212,7 +222,7 @@ class LoginGuardTest(unittest.TestCase):
         self.assertTrue(all("špatně" not in line and PASSWORD not in line for line in lines))
         clock.now += 60
         before = secret.checked
-        self.assertFalse(guard.attempt("x" * 500)[0])  # příliš dlouhé heslo neprojde a scrypt se nepočítá
+        self.assertFalse(guard.attempt("abc")[0])  # kratší než 4 znaky: chybný pokus bez výpočtu scrypt
         self.assertEqual(secret.checked, before)
 
     def test_one_scrypt_at_a_time_for_concurrent_attempts(self):
@@ -230,7 +240,7 @@ class LoginGuardTest(unittest.TestCase):
 
         guard = LoginGuard(SlowHash(), Clock(), lambda line: None)
         barrier = threading.Barrier(8)
-        threads = [threading.Thread(target=lambda: (barrier.wait(5), guard.attempt("x"))) for _ in range(8)]
+        threads = [threading.Thread(target=lambda: (barrier.wait(5), guard.attempt("špatně"))) for _ in range(8)]
         for thread in threads:
             thread.start()
         for thread in threads:

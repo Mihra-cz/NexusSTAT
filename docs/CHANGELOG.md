@@ -1,5 +1,12 @@
 # Changelog NexusSTAT
 
+## 2026-11-01 – M6-4B: jednodušší administrační heslo nebo PIN (lokálně)
+
+- **Jediné pravidlo aspoň 4 znaky** (rozhodnutí správce 2026-11-01; navržený režim administrace bez hesla M6-4C zrušen, administrace zůstává vždy chráněná): číselný PIN i heslo z libovolných znaků bez dalších podmínek. Dřívější požadavek PIN aspoň 8 číslic nebo heslo aspoň 12 znaků (nejvýš 128, bez řídicích znaků) zrušen; zbývá jen technická mez, že se heslo musí vejít do přihlašovacího formuláře (1 KiB).
+- **Beze změny:** solený otisk `scrypt`, HTTPS, globální blokace chybných pokusů a audit, relace, CSRF, `Origin` a ostatní ochrany. Vstup kratší než 4 znaky se při přihlášení započte jako chybný pokus bez výpočtu `scrypt`; přihlašovací pole má `minlength="4"` místo `maxlength`.
+- **Riziko:** krátký PIN chrání hlavně blokace (asi 480 pokusů za den při trvalém útoku, čtyřmístný PIN řádově tři týdny); popsáno v `REQUIREMENTS.md` a `OPERATIONS.md`.
+- **Testy:** `tests/test_admin.py` – pravidla (3 znaky odmítnuty; 4, 5, 6 i 7 číslic, písmena, diakritika a mezery přijaty; mez formuláře), příkaz s čtyřmístným PINem, krátký vstup bez `scrypt`.
+
 ## 2026-11-01 – M6-4B: chráněná administrace přes HTTPS (lokálně, v LAN neotevřeno)
 
 - **Rozsah jen tři akce:** potvrzení jedné aktivní závady `WARNING`/`ERROR` se závažností, kterou správce viděl, jas LED 5–100 % a odhlášení. Web nemění intervaly, prahy, časování OLED ani jinou konfiguraci a nemá pro to žádný, ani skrytý endpoint (rozhodnutí správce 2026-11-01); starší formulace o webové konfiguraci opravené, vlastní stránky a výběr či pořadí údajů jen jako volitelný budoucí backlog.
