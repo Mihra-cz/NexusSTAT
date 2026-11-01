@@ -4,7 +4,7 @@
 
 ## Účel
 
-Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic, Docker, služby, později AnimeDB). **Cílem je nahradit aplikační software Pironman 5 vlastním NexusSTAT**, ne ho trvale provozovat vedle Pironmanu; hardwarové ochranné funkce a chlazení přitom nesmí utrpět (viz Náhrada Pironmanu 5). Žádná povinná cloudová závislost.
+Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic, služby, později AnimeDB; Docker se samostatně nesleduje, rozhodnutí správce 2026-10-31). **Cílem je nahradit aplikační software Pironman 5 vlastním NexusSTAT**, ne ho trvale provozovat vedle Pironmanu; hardwarové ochranné funkce a chlazení přitom nesmí utrpět (viz Náhrada Pironmanu 5). Žádná povinná cloudová závislost.
 
 ## Náhrada Pironmanu 5 (schválený cíl, zatím neimplementováno)
 
@@ -321,9 +321,28 @@ První webové rozhraní pro vývojový notebook: `python3 -m nexusstat.run --we
 - **Bezpečnost M6-1:** server ze standardní knihovny (`http.server.ThreadingHTTPServer`, jedno vlákno na pozadí a krátké vlákno na požadavek) naslouchá **napevno jen na `127.0.0.1`** (adresa se nedá nastavit, žádné `0.0.0.0`, žádná změna firewallu). Jen `GET` a `HEAD` na `/`; ostatní metody `405`, jiné cesty `404`, jiný klient než loopback a cizí hlavička `Host` (ochrana proti DNS rebinding) `403`. Žádný zapisovací endpoint, příkaz ani ovládání hardwaru. Všechny texty se escapují; hlavičky `Content-Security-Policy` (`default-src 'none'`, styl jen podle otisku), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`; hlavička `Server` bez verze Pythonu; požadavky se nelogují. Port `--web-port` jen 1024–65535 (výchozí 8765); obsazený port = chyba před měřením.
 - **Souběh a životní cyklus (review 2026-10-31):** smyčka předává webu vždy celý neměnný snímek taktu (krátký zámek jen na výměnu odkazu), takže stránka nikdy nesmíchá dva takty; stránka se skládá mimo zámek. Při zahlcení 8 klienty (asi 435 stránek/s) se takt smyčky zpozdil nejvýš asi o 12 ms. Ukončení přes Ctrl+C i SIGTERM do 0,5 s (i s otevřeným nedokončeným požadavkem), port je hned volný, obsazený port = kód 2 bez spuštěného vlákna. Spojení má timeout 5 s na operaci (nedokončený požadavek se zavře po 5 s, ostatní požadavky běží dál) a odpojení klienta během odpovědi se nevypisuje jako chyba.
 - **Vzhled** ověřen ve vestavěném prohlížeči (široký i úzký displej 375 px, tmavý i světlý režim): na úzkém displeji jeden sloupec bez vodorovného posuvu, časy u řádků skryté (poslední platné měření zůstává v záhlaví).
-- **Před otevřením v LAN (není součástí M6-1):** povinná autentizace (nejlépe HTTPS nebo reverzní proxy s TLS), samostatné schválení adresy a pravidla firewallu jen pro LAN, rozhodnutí o zobrazení IPv4 a dalších údajů, omezení počtu souběžných spojení a celkové doby jednoho požadavku (klient posílající data po bajtech drží vlákno déle než 5 s, protože timeout platí na každou operaci) a test na Raspberry Pi. Veřejný status zůstává samostatná projekce (Web / přístup).
+- **Před otevřením v LAN (není součástí M6-1 ani M6-2):** samostatné bezpečnostní review a schválení adresy a pravidla firewallu jen pro LAN (dashboard a historie pak bez uživatelského loginu, jen pro čtení; rozhodnutí správce 2026-10-31), rozhodnutí o zobrazení IPv4 a dalších údajů, omezení počtu souběžných spojení a celkové doby jednoho požadavku (klient posílající data po bajtech drží vlákno déle než 5 s, protože timeout platí na každou operaci) a test na Raspberry Pi. Veřejný status zůstává samostatná projekce (Web / přístup).
 - Neimplementováno: administrace, potvrzování alarmů, RGB, zápis konfigurace, grafy historie, NAS, hardware, nasazení.
 - Ověřeno syntetickými daty, testovacími HTTP požadavky na loopbacku a krátkým read-only během na notebooku; Raspberry Pi ani Nexus neověřeny.
+
+## Historické grafy na lokálním webu (M6-2, implementováno lokálně, jen 127.0.0.1)
+
+Stránka `http://127.0.0.1:8765/history` (odkaz „Historie“ z dashboardu) ukazuje grafy ze SQLite historie, jen pro čtení. Žádný nový kolektor, plánovač, databáze ani změna schématu v1.
+
+| Rozsah | Zdroj (HISTORY.md 6) | Bod grafu | Body na řadu | Výsledek se drží v paměti |
+| --- | --- | --- | --- | --- |
+| 1 hodina | `sample` | 10 s | nejvýš 360 | 30 s |
+| 24 hodin | `sample` | 5 min | nejvýš 288 | 2 min |
+| 7 dní | `agg_5m` + nejnovější `sample` za `done_until` | 30 min | nejvýš 336 | 10 min |
+| 30 dní | `agg_5m` + nejnovější `sample` za `done_until` | 2 h | nejvýš 360 | 30 min |
+
+- **Řady:** CPU vytížení, teplota CPU, RAM, NETWORK RX a TX (každé rozhraní zvlášť, průměrná **rychlost** v B/s, KB/s, MB/s, ne objem přenosu) a obsazenost ROOT. Čára = průměr, pás = minimum až maximum, šedě okno jen s `UNKNOWN`, prázdné místo = žádná data; přes `UNKNOWN` ani mezeru se nikdy nevede čára a `UNKNOWN` není nula. Bod se spojí s předchozím jen do odstupu dvou intervalů řady (u ROOT 2 × 1 800 s).
+- **Agregace při čtení:** SQL vrací pro každý bod počet řádků (`n_samples`, včetně `UNKNOWN`), počet platných (`n_valid`), minimum, maximum a součet; průměr je součet platných / počet platných, nikdy průměr průměrů. Delší rozsahy berou hotová 5min okna z `agg_5m` a ještě neagregovaná poslední okna ze `sample`; oba úseky jsou časově disjunktní.
+- **Šetrné čtení SQLite:** jen `history.open_reader()` (`mode=ro`, `query_only`, bez checkpointu i při zavření, nikdy `immutable=1`), ověření role `development` a otisku stroje; neexistující soubor se nevytvoří. Jedna krátká čtecí transakce na stránku (2 dotazy pro 1 a 24 h, 4 pro 7 a 30 dní), limit 2 s na dotazy (přerušení SQLite), omezený počet řádků, spojení se hned zavře. Názvy tabulek a sloupců jsou pevné v kódu, od klienta jen jeden z rozsahů `1h`, `24h`, `7d`, `30d` (jiný parametr = `400`).
+- **Režie** (notebook, syntetická databáze 20 řad, 3 dny surových vzorků po 10 s a 31 dní `agg_5m`): čtení 16 ms (1 h), 99 ms (24 h), 34 ms (7 dní), 91 ms (30 dní), stránka z paměti asi 20 ms a 63–79 kB. Hlavní dashboard SQLite nečte vůbec; obnova stránky historie po 60 s čte disk nejvýš jednou za dobu v tabulce.
+- **Vypnutá nebo nedostupná historie:** dashboard běží beze změny; stránka historie jen vysvětlí, že je historie vypnutá, nespustila se, nebo je teď nedostupná (krátký kód důvodu, bez cest), a další pokus zkusí nejdřív za 30 s. Nevzniká žádná databáze, měření ani diagnostický alarm.
+- Neimplementováno: přístup z LAN, administrace, heartbeat, `agg_1h` pro rozsahy nad 60 dní, události a změny stavu v grafech.
+- Ověřeno syntetickou SQLite mimo repozitář, testovacími HTTP požadavky na loopbacku a vizuálně ve vestavěném prohlížeči; Raspberry Pi ani Nexus neověřeny.
 
 ## Živý simulátor OLED (potvrzeno pro v0.5)
 
@@ -374,7 +393,7 @@ Schválené chování čtyř RGB LED WS2812 ve vazbě na OLED a na budoucí potv
 | 2 | NAS a jeho dostupnost | `service.nas` a budoucí kontroly NAS |
 | 3 | AnimeDB | `service.animedb` a budoucí kontroly AnimeDB |
 | 4 | zálohy, Restic | `service.backup`, `history.snapshot` a budoucí kontroly Resticu |
-| 5 | Docker a ostatní skutečně monitorované služby | budoucí kontroly Dockeru a služeb; sem spadne i **každé nezařazené id** skutečné závady |
+| 5 | Docker a ostatní skutečně monitorované služby | budoucí kontroly služeb (Docker se samostatně nesleduje, rozhodnutí správce 2026-10-31); sem spadne i **každé nezařazené id** skutečné závady |
 
 - Blikají jen `WARNING`, `ERROR` a `CRITICAL`. Pouhé `INFO`, `UNKNOWN`, `N/A` a běžné změny provozních údajů (např. linka `DOWN`, která je `INFO`) neblikají. Prošlý výsledek se stejně jako na OLED vyhodnotí jako `UNKNOWN`, takže dřívější závada bez platných dat nebliká.
 - Simulovaná data (`simulated=True`) skutečné LED nikdy nerozsvítí: LED nemají značku `SIM` a simulace se nesmí prezentovat jako skutečný alarm Nexusu.
@@ -405,7 +424,7 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 - Jediný uživatelský parametr jasu 5–100 %, výchozí 20 %. Platí pro červenou i oranžovou, tedy i pro `CRITICAL`; dolní mez 5 % brání umlčení `CRITICAL` jasem.
 - Bílá při probuzeném OLED svítí tlumeněji, přibližně na polovině nastaveného jasu; druhý posuvník není.
 - Jas i potvrzení přetrvají restart NexusSTAT.
-- Nastavení jasu a potvrzování jsou dostupné jen oprávněnému uživateli v LAN (autentizace, ochrana CSRF, viz Web / přístup); veřejný status je nenabízí ani nezobrazuje.
+- Nastavení jasu a potvrzování budou dostupné v LAN jen po zadání jednoho administračního PINu nebo hesla (bez uživatelských účtů a rolí, ochrana CSRF, rozhodnutí správce 2026-10-31, viz Web / přístup); veřejný web je nenabízí ani nezobrazuje.
 
 ### Ukládání uživatelského stavu (schválený návrh, bez kódu)
 
@@ -438,11 +457,13 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 
 ## Web / přístup
 
-- Lokální webový dashboard dostupný z LAN na konfigurovatelném portu (navržen `8765`), po schválení firewallu a autentizace. **Od M6-1 existuje lokálně jen první verze jen pro čtení a jen na `127.0.0.1`** (sekce Lokální web jen pro čtení); LAN zůstává podmíněná autentizací.
-- Funkce LAN: přehledné stavové karty, filtrování událostí, potvrzení závad a jas LED (viz RGB LED a potvrzování závad; `CRITICAL` nelze umlčet), konfigurace (včetně délky kolotoče 300 s, intervalu 10 s, nečinnosti STATUS 30 s).
-- Na veřejném webu `mh42.cz` pouze sanitizovaný read-only celkový stav a případně stručný výpis závad. **Nikdy** celé logy, interní IP, administraci ani API pro zápis.
-- Oddělit veřejnou projekci dat od administračního procesu už v návrhu; žádný automatický port forwarding nebo cloud.
-- Budoucí lokální web zobrazí historii ze SQLite jen pro čtení; veřejný status z ní dostane jen výslovně povolené souhrnné údaje (allowlist), nikdy IP adresy, rozhraní ani cesty.
+**Rozhodnutí správce 2026-10-31** (mění dřívější návrh s autentizovaným LAN webem, uživateli a veřejným výpisem závad):
+
+- Lokální webový dashboard na konfigurovatelném portu (navržen `8765`). **Dashboard a historie jsou jen pro čtení a v LAN budou bez uživatelského loginu.** Přístup z LAN se povolí až po samostatném bezpečnostním review (adresa, firewall jen pro LAN, limity spojení). **Lokálně implementováno jen na `127.0.0.1`:** dashboard od M6-1, historické grafy od M6-2 (sekce Lokální web jen pro čtení a Historické grafy).
+- Funkce LAN: přehledné stavové karty a historie (jen čtení); filtrování událostí; potvrzení závad a jas LED (viz RGB LED a potvrzování závad; `CRITICAL` nelze umlčet) a konfigurace (včetně délky kolotoče 300 s, intervalu 10 s, nečinnosti STATUS 30 s) **jen po zadání jednoho administračního PINu nebo hesla**. Žádné uživatelské účty ani správa rolí. Zatím neimplementováno.
+- Veřejný web `mh42.cz` dostane **jen celkový stav** odchozím HTTPS heartbeatem z NexusSTATu (zatím neimplementováno). **Nikdy** interní diagnostiku, výpis závad, logy, IP adresy, názvy zařízení a rozhraní, cesty, administraci, API pro zápis ani přístup do LAN; lokální dashboard nebude veřejně přístupný.
+- Oddělit veřejnou projekci dat od administračního procesu už v návrhu; žádný příchozí port z internetu, automatický port forwarding ani nutný cloud (heartbeat je jen odchozí).
+- Docker se samostatně nesleduje a NexusSTAT nemá přístup k Docker socketu (rozhodnutí 2026-10-24 a 2026-10-31); služby v kontejnerech se kontrolují vlastními healthchecky (např. AnimeDB `/health`).
 
 ## Jednoduchost a způsob vývoje
 

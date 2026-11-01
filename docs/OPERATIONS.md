@@ -189,7 +189,8 @@ PYTHONPATH=src python3 -m nexusstat.run --web
 - Web ukazuje výsledky téže smyčky, sám nic neměří a nic nezapisuje: obnova stránky ani víc záložek nespustí žádnou kontrolu. Zařízení ROOT se zjistí jednou při spuštění.
 - Naslouchá jen na loopbacku, nejde ho otevřít z jiného počítače a firewall se nemění. Jen `GET`/`HEAD` na `/`; požadavky se nelogují.
 - Ukončení stejně jako smyčka (Ctrl+C nebo SIGTERM); server se zastaví s ní nejvýš do 0,5 s a port je hned volný. Nedokončený požadavek server zavře po 5 s; odpojení prohlížeče během obnovy se nevypisuje.
-- **Neotevírat v LAN** (ani přes SSH tunel nebo reverzní proxy pro jiné uživatele), dokud nebude schválená autentizace a pravidla firewallu (REQUIREMENTS.md, Lokální web jen pro čtení).
+- **Neotevírat v LAN** (ani přes SSH tunel nebo reverzní proxy pro jiné uživatele), dokud neproběhne samostatné bezpečnostní review a schválení pravidel firewallu (REQUIREMENTS.md, Web / přístup).
+- **Historie (M6-2):** grafy na `http://127.0.0.1:8765/history` se ukážou jen se zapnutou sekcí `[history]` (jinak stránka napíše, že je historie vypnutá). Čtou SQLite jen pro čtení přes `open_reader` v krátké transakci a výsledek drží v paměti 30 s až 30 min podle rozsahu; hlavní stránka databázi nečte. Nedostupná databáze se ukáže jen na stránce historie (kód důvodu), měření ani dashboard nezastaví.
 
 ### Návratový postup lokálního vývoje
 
@@ -234,7 +235,7 @@ Na Nexusu nic z toho neběží: LED ovládá Pironman a NexusSTAT nemá ovladač
 | nepřetržité červené 0,25 s / 0,25 s | `CRITICAL`; nejde umlčet potvrzením ani jasem |
 | jakýkoli svit po pádu NexusSTAT | nic nedokládá: WS2812 drží poslední barvu (provozní omezení M7) |
 
-Kategorie: 1 Nexus a systém, 2 NAS a jeho dostupnost, 3 AnimeDB, 4 zálohy a Restic, 5 Docker a ostatní skutečně monitorované služby, sem i každá nezařazená skutečná závada. Čísla jsou kódy, ne čísla LED; všechny čtyři LED blikají společně.
+Kategorie: 1 Nexus a systém, 2 NAS a jeho dostupnost, 3 AnimeDB, 4 zálohy a Restic, 5 Docker a ostatní skutečně monitorované služby (Docker se samostatně nesleduje, rozhodnutí správce 2026-10-31), sem i každá nezařazená skutečná závada. Čísla jsou kódy, ne čísla LED; všechny čtyři LED blikají společně.
 
 - Potvrzení „Beru na vědomí / pracuji na nápravě“ jen eviduje, že o závadě víš: nic neopravuje, nemění diagnostický stav, OLED ani historii měření a přetrvá restart. Zanikne až po doloženém odeznění (nejméně tři po sobě jdoucí platná měření bez závady, nebo delší řada podle alarmového pravidla; `UNKNOWN` se nepočítá). Nová epizoda nebo zhoršení na `ERROR` chce nové potvrzení; `CRITICAL` bliká dál.
 - Probuzení OLED kódy potvrzených závad jednou přehraje, pokud nebliká `CRITICAL` ani nepotvrzená závada; pak LED zhasnou. Další stisky mají dosavadní význam.

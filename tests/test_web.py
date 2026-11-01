@@ -10,9 +10,11 @@ import contextlib
 import http.client
 import inspect
 import io
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from nexusstat import web
@@ -20,12 +22,14 @@ from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmsConfig, CollectorConfig
 from nexusstat.core import CheckResult, Measurement, State
 from nexusstat.fan_monitor import CPU_FAN_ID, FAN_ON, FAN_STATE, SOURCE, SOURCE_RPM
+from nexusstat.history_charts import RANGES, Bucket, ChartError, Charts, HistoryCharts, Series
 from nexusstat.mounts import ROOT_MODE_ID
 from nexusstat.network_monitor import ADDRESS, INTERFACE, IPV4_ID, LINK, LINK_ID, LINK_UP, RX_RATE_ID, TX_RATE_ID
 from nexusstat.run import main, run_loop
 from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
-from nexusstat.web import DashboardServer, StateBoard, is_loopback, render_page, start_web, stop_web
+from nexusstat.web import (HISTORY_FAILED, HISTORY_OFF, DashboardServer, StateBoard, is_loopback, render_history_page,
+                           render_page, start_web, stop_web)
 
 OBSERVED = datetime(2026, 10, 31, 12, 0, 5, tzinfo=timezone.utc)
 NVME = (State.INFO, "ROOT na NVMe (oddíl disku)", {"bus": "nvme", "disk": "nvme0n1", "layout": "partition"})
@@ -108,6 +112,62 @@ class PageTest(unittest.TestCase):
         page = render_page(board_with(results(interface="<script>alert(1)</script>")), 101.0)
         self.assertNotIn("<script", page.lower())
         self.assertIn("&lt;SCRIPT&gt;ALERT(1)&lt;/SCRIPT&gt;", page)
+
+
+def history_result(subject="eth0"):
+    """Hodina historie: CPU s neznámým bodem a mezerou, RX v B/s; ostatní řady bez dat."""
+    period = RANGES["1h"]
+    end = 1_800_000_000
+    start = end - period.seconds
+
+    def bucket(index, value):
+        return Bucket(start + index * 10, 1, 0 if value is None else 1, value, value, value)
+
+    cpu = [bucket(i, 20.0 + i) for i in range(6)] + [bucket(6, None)] + [bucket(i, 30.0) for i in range(7, 10)]
+    cpu += [bucket(i, 40.0) for i in range(41, 44)]  # 31 bodů nic: mezera, ne čára
+    rx = [bucket(i, 1_234_000.0) for i in range(10)]
+    series = (Series(CPU_USAGE_ID, "", "%", tuple(cpu)), Series(RX_RATE_ID, subject, "B/s", tuple(rx)))
+    return Charts(period, start, end, series, 2, end - 1)
+
+
+class FakeCharts:
+    """Zdroj grafů pro web bez SQLite: počítá, kolikrát se stránka historie ptala."""
+
+    interval_seconds = 10
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def charts(self, name):
+        self.calls.append(name)
+        return self.result
+
+
+class HistoryPageTest(unittest.TestCase):
+    """M6-2: grafy bez JavaScriptu; UNKNOWN a mezery nikdy jako čára, rychlost sítě v B/s."""
+
+    def test_charts_keep_unknown_and_gaps_and_units(self):
+        page = render_history_page(FakeCharts(history_result(subject="eth0<x>")), "1h")
+        cpu, rx = page.split("<svg")[1:3]
+        self.assertEqual(cpu.count("<polyline"), 3)  # úseky 0–5, 7–9, 41–43: přes UNKNOWN ani mezeru nic
+        self.assertEqual(cpu.count('class="unk"'), 1)
+        self.assertIn(">100%</text>", cpu)  # procenta vždy 0–100
+        self.assertIn("NETWORK RX (rychlost) – ETH0&lt;X&gt;", page)  # escapovaný název rozhraní
+        self.assertIn(">2.0 MB/s</text>", rx)  # osa v jednotkách rychlosti, ne objemu
+        self.assertIn("průměr 1.2 MB/s", page)
+        self.assertEqual(page.count("Žádná platná data v tomto rozsahu."), 4)  # teplota, RAM, TX, ROOT
+        self.assertIn('href="/history?range=1h" aria-current="page"', page)
+        self.assertIn('<meta http-equiv="refresh" content="60">', page)
+
+    def test_disabled_or_unavailable_history_only_explains(self):
+        for source, text in ((HISTORY_OFF, "Historie je vypnutá"), (HISTORY_FAILED, "nespustila"),
+                             (FakeCharts(ChartError("timeout")), "nedostupná (důvod: timeout)")):
+            page = render_history_page(source, "24h")
+            with self.subTest(text=text):
+                self.assertIn(text, page)
+                self.assertNotIn("<svg", page)
+                self.assertIn("měření a aktuální stav", page.lower())  # dashboard běží dál
 
 
 class CountingCollector:
@@ -212,6 +272,24 @@ class HttpTest(unittest.TestCase):
                     self.server.handle_error(None, (web.LOOPBACK, 1))
                 self.assertEqual("Traceback" in output.getvalue(), reported)
 
+    def test_history_route_reads_only_on_request(self):
+        source = FakeCharts(history_result())
+        self.server.history = source
+        for _ in range(10):  # obnova hlavního dashboardu historii nečte
+            self.assertEqual(self.request("GET")[0].status, 200)
+        self.assertEqual(source.calls, [])
+        for path, status in (("/history", 200), ("/history?range=7d", 200), ("/history?range=1y", 400),
+                             ("/history?range=1h&x=1", 400), ("/history?range=1h&range=7d", 400),
+                             ("/history/", 404)):
+            with self.subTest(path=path):
+                self.assertEqual(self.request("GET", path)[0].status, status)
+        self.assertEqual(source.calls, ["24h", "7d"])  # výchozí 24 h; neplatný dotaz nic nečte
+        self.assertEqual(self.request("POST", "/history")[0].status, 405)
+        self.server.history = HISTORY_OFF
+        response, body = self.request("GET", "/history")
+        self.assertEqual(response.status, 200)
+        self.assertIn("Historie je vypnutá", body)
+
     def test_listens_only_on_loopback(self):
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
         for function in (DashboardServer, start_web):
@@ -251,6 +329,33 @@ class MainWebTest(unittest.TestCase):
         with mock.patch("nexusstat.run.run_loop") as loop, contextlib.redirect_stdout(io.StringIO()):
             main([])
         self.assertIsNone(loop.call_args.kwargs["board"])  # bez --web žádný server
+
+    def test_history_source_follows_history_state(self):
+        server = SimpleNamespace(server_address=(web.LOOPBACK, 8765), history=HISTORY_OFF)
+
+        def start(link, config_text=None):
+            server.history = HISTORY_OFF
+            arguments = ["--web"]
+            with tempfile.TemporaryDirectory() as directory:
+                if config_text is not None:
+                    path = Path(directory) / "config.toml"
+                    path.write_text(config_text, encoding="utf-8")
+                    arguments += ["--config", str(path)]
+                with mock.patch("nexusstat.run.run_loop"), mock.patch("nexusstat.run.stop_web"), \
+                        mock.patch("nexusstat.run.start_web", return_value=(StateBoard(), server)), \
+                        mock.patch("nexusstat.run.start_history", return_value=link), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(arguments)
+            return server.history
+
+        self.assertEqual(start(None), HISTORY_OFF)  # výchozí: historie vypnutá, nic se neotevírá
+        enabled = '[history]\nenabled = true\npath = "/nonexistent/history.sqlite3"\n'
+        self.assertEqual(start(None, enabled), HISTORY_FAILED)  # zapnutá, ale nespustila se
+        link = SimpleNamespace(path=Path("/nonexistent/history.sqlite3"), stop=lambda: None)
+        charts = start(link, enabled)
+        self.assertIsInstance(charts, HistoryCharts)
+        self.assertEqual((charts.path, charts.role, charts.interval_seconds, charts.reads),
+                         (link.path, "development", 10, 0))  # při startu se nic nečte
 
     def test_invalid_port_stops_before_measuring(self):
         for port in ("80", "70000", "0"):

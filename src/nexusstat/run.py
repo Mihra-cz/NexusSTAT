@@ -48,12 +48,13 @@ from .config import (CPU_INTERVAL_SECONDS, DISK_INTERVAL_SECONDS, FAN_INTERVAL_S
                      ROOT_MODE_INTERVAL_SECONDS, VALIDITY_INTERVALS, Config, ConfigError, load_config)
 from .core import ALERT_STATES, CheckResult, State, effective, overall_state
 from .fan_monitor import FanMonitor
+from .history_charts import HistoryCharts
 from .history_link import open_history
 from .mounts import RootMountMonitor
 from .nas_monitor import NasMonitor
 from .network_monitor import NetworkMonitor
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
-from .web import DEFAULT_PORT, LOOPBACK, check_port, start_web, stop_web
+from .web import DEFAULT_PORT, HISTORY_FAILED, LOOPBACK, check_port, start_web, stop_web
 
 
 # Klíč v details, kterým se selhání sběru odlišuje od platného měření bez hodnoty
@@ -540,6 +541,12 @@ def main(argv=None):
     try:
         stopper.install()
         link = start_history(config)
+        if server is not None:
+            # Grafy (M6-2) čtou historii jen pro čtení a jen na požádání stránky /history.
+            if link is not None:
+                server.history = HistoryCharts(link.path, HISTORY_ROLE, config.collector.interval_seconds)
+            elif config.history.enabled:
+                server.history = HISTORY_FAILED
         print_now(live_note())
         run_loop(monitor, config.collector, AlarmEvaluator(config.alarms),
                  history_link=link, stopper=stopper, tick_seconds=LIVE_TICK_SECONDS, board=board)
