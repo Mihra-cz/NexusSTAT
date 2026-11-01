@@ -189,8 +189,50 @@ PYTHONPATH=src python3 -m nexusstat.run --web
 - Web ukazuje výsledky téže smyčky, sám nic neměří a nic nezapisuje: obnova stránky ani víc záložek nespustí žádnou kontrolu. Zařízení ROOT se zjistí jednou při spuštění.
 - Naslouchá jen na loopbacku, nejde ho otevřít z jiného počítače a firewall se nemění. Jen `GET`/`HEAD` na `/`; požadavky se nelogují.
 - Ukončení stejně jako smyčka (Ctrl+C nebo SIGTERM); server se zastaví s ní nejvýš do 0,5 s a port je hned volný. Nedokončený požadavek server zavře po 5 s; odpojení prohlížeče během obnovy se nevypisuje.
-- **Neotevírat v LAN** (ani přes SSH tunel nebo reverzní proxy pro jiné uživatele), dokud neproběhne samostatné bezpečnostní review a schválení pravidel firewallu (REQUIREMENTS.md, Web / přístup).
+- **Neotevírat v LAN** (ani přes SSH tunel nebo reverzní proxy pro jiné uživatele), dokud neproběhne samostatné bezpečnostní review a schválení pravidel firewallu (REQUIREMENTS.md, Web / přístup). Volby `--web-bind`, `--web-allow` a `--web-host` (M6-3) jsou připravené, ale použijí se až podle postupu níže.
+- **Ochrany serveru (M6-3):** nejvýš 8 souběžných spojení a 20 nových spojení za sekundu, celkový termín spojení 10 s, hlavička nejvýš 8 KiB; nadbytečné a cizí spojení se hned zavře. Pomalý nebo zahlcující klient tak nezastaví měření, alarmy ani zapisovač historie, nejvýš krátce zdrží web.
 - **Historie (M6-2):** grafy na `http://127.0.0.1:8765/history` se ukážou jen se zapnutou sekcí `[history]` (jinak stránka napíše, že je historie vypnutá). Čtou SQLite jen pro čtení přes `open_reader` v krátké transakci a výsledek drží v paměti 30 s až 30 min podle rozsahu; hlavní stránka databázi nečte. Nedostupná databáze se ukáže jen na stránce historie (kód důvodu), měření ani dashboard nezastaví.
+
+### Budoucí otevření webu v LAN (M6-3, připravený postup, neprovedeno)
+
+Nic z toho se teď neprovádí: Nexus, router ani firewall se nemění. Předpoklady jsou schválené bezpečnostní review, skutečná adresa Nexusu v LAN (`<IP_NEXUSU>`) a schválený rozsah klientů (`<LAN_ROZSAH>`, nejlépe jen domácí podsíť). Obě hodnoty zadá správce; neodvozují se z výchozí trasy ani se nevymýšlejí a do veřejného repozitáře nepatří.
+
+1. **Jen čtení stávajícího stavu** (nic nemění), výpis si uložit pro rollback:
+
+   ```bash
+   sudo ufw status verbose
+   ```
+
+   ```bash
+   sudo ufw status numbered
+   ```
+
+   ```bash
+   ss -ltnp
+   ```
+
+   Pravidla pro SSH, InfluxDB, Pironman a další služby zůstávají beze změny. Je-li UFW neaktivní, v tomto kroku se **nezapíná** (hrozí odříznutí SSH); to je samostatné rozhodnutí.
+2. **NexusSTAT s adresou LAN** (stejný rozsah jako v UFW, druhá vrstva ochrany):
+
+   ```bash
+   PYTHONPATH=src python3 -m nexusstat.run --web --web-bind <IP_NEXUSU> --web-allow <LAN_ROZSAH>
+   ```
+
+   Ověřit, že port 8765 poslouchá jen na `<IP_NEXUSU>:8765` (žádné `0.0.0.0:8765`).
+3. **Jediné nové pravidlo UFW** (ne `ufw allow 8765`, ne `from any`, žádné `ufw reset` ani změna výchozích politik):
+
+   ```bash
+   sudo ufw allow proto tcp from <LAN_ROZSAH> to <IP_NEXUSU> port 8765 comment 'NexusSTAT read-only web'
+   ```
+
+4. **Ověření:** `sudo ufw status numbered` ukáže proti uloženému výpisu jen toto pravidlo navíc; z počítače ve schváleném rozsahu se otevře `http://<IP_NEXUSU>:8765/`, odjinud spojení selže; port se nepřesměrovává na routeru a žádný tunel (např. Cloudflare Tunnel) se nepřidává.
+5. **Rollback:**
+
+   ```bash
+   sudo ufw delete allow proto tcp from <LAN_ROZSAH> to <IP_NEXUSU> port 8765
+   ```
+
+   a NexusSTAT spustit znovu bez `--web-bind` (jen `127.0.0.1`). Ostatní pravidla se nedotknou.
 
 ### Návratový postup lokálního vývoje
 

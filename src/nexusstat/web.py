@@ -17,17 +17,24 @@ Stránka /history (M6-2) ukazuje grafy ze SQLite historie jen pro čtení
 (history_charts: open_reader, krátká transakce, výsledek v paměti); hlavní
 stránka databázi nečte. Bez zapnuté historie jen vysvětlí proč.
 
-Bezpečnost M6-1: server naslouchá napevno jen na 127.0.0.1 (adresa se nedá
-nastavit), přijme jen GET a HEAD na "/" a "/history", odmítne jiného klienta než loopback
-i cizí hlavičku Host (ochrana proti DNS rebinding), nemá zapisovací endpoint,
-nic nespouští a neovládá hardware. Všechny texty se escapují. Otevření v LAN
-vyžaduje autentizaci a samostatné schválení.
+Bezpečnost: výchozí je naslouchání jen na 127.0.0.1. Od M6-3 jde výslovně
+zadat jednu soukromou adresu LAN (`WebAccess`, nikdy 0.0.0.0) se schválenými
+rozsahy klientů; jiný klient se zavře hned po přijetí spojení. Přijme jen GET
+a HEAD na "/" a "/history", odmítne cizí hlavičku Host (ochrana proti DNS
+rebinding), nemá zapisovací endpoint, nic nespouští a neovládá hardware. Všechny
+texty se escapují. Server obsluhuje nejvýš MAX_CONNECTIONS spojení naráz
+(další se zavřou bez vlákna), jedno spojení nejvýš REQUEST_DEADLINE_SECONDS
+celkem a hlavičku požadavku nejvýš MAX_REQUEST_BYTES. Dashboard i historie jsou
+bez přihlášení jen pro čtení; otevření v LAN až po bezpečnostním review.
 """
 
 import base64
 import hashlib
 import html
+import http.client
+import ipaddress
 import math
+import re
 import sys
 import threading
 import time
@@ -35,6 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
+from socket import SHUT_RDWR
 from urllib.parse import parse_qs
 
 from .config import DISK_INTERVAL_SECONDS
@@ -48,7 +56,7 @@ from .root_device import identify_root_device
 from .services import SERVICE_LABELS, complete_service_results
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
 
-LOOPBACK = "127.0.0.1"  # M6-1: jen tento počítač; LAN až s autentizací
+LOOPBACK = "127.0.0.1"  # výchozí: jen tento počítač; LAN jen výslovně (WebAccess, M6-3)
 DEFAULT_PORT = 8765  # navržený port lokálního webu (REQUIREMENTS.md, Web / přístup)
 MIN_PORT, MAX_PORT = 1024, 65535  # bez privilegovaných portů
 # Obnova stránky v prohlížeči: jako měření CPU, RAM a teploty (5 s). Jeden
@@ -60,6 +68,19 @@ HISTORY_REFRESH_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 5
 # Jak často nečinný server ověří, zda má skončit (serve_forever); tolik nejvýš trvá stop_web.
 POLL_SECONDS = 0.5
+# Souběžně obsluhovaná spojení: další se hned zavřou, nevznikne pro ně vlákno.
+MAX_CONNECTIONS = 8
+# Celková doba jednoho spojení (hlavičky i odpověď). Timeout operace sám nestačí:
+# klient, který posílá po bajtech, by ho obnovoval donekonečna.
+REQUEST_DEADLINE_SECONDS = 10
+# Řádek požadavku a hlavičky dohromady; tělo se nikdy nečte (jen GET a HEAD).
+MAX_REQUEST_BYTES = 8192
+# Nejvýš tolik přijatých spojení za sekundu. Bez omezení by klient, který stránku
+# obnovuje bez přestávky, zabral celé jádro (změřeno asi 700 stránek/s); takto
+# další pokusy čekají ve frontě jádra a obsluha i měření běží dál.
+MAX_ACCEPTS_PER_SECOND = 20
+# Další povolený název v hlavičce Host (např. jméno počítače v LAN), malými písmeny bez portu.
+HOST_NAME = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*")
 
 # Barva stavu: UNKNOWN je šedý, nikdy zelený jako OK.
 CSS = """\
@@ -219,7 +240,7 @@ def render_page(board, now):
         f"<a href=\"/history\">Historie</a></nav><p class=\"t\">{esc(updated)}</p></header>"
         f"<section><h2>Aktivní závady a UNKNOWN</h2>{problem_html}</section>"
         f"<div class=\"cards\">{''.join(cards)}</div>"
-        f"<p class=\"t\">Jen pro čtení, jen z tohoto počítače ({LOOPBACK}). Obnova po {REFRESH_SECONDS} s; "
+        f"<p class=\"t\">Jen pro čtení, bez přihlášení. Obnova po {REFRESH_SECONDS} s; "
         "měření běží v nexusstat.run nezávisle na stránce.</p></body></html>"
     )
 
@@ -332,10 +353,11 @@ def chart_section(series, charts, interval_seconds):
     return f"<section><h2>{esc(title)}</h2>{body}</section>"
 
 
-def render_history_page(source, name):
+def render_history_page(source, name, charts=None):
     """Stránka historie pro rozsah `name` (klíč RANGES).
 
-    `source` je HistoryCharts, nebo text, proč historie není (vypnutá, nespustila se).
+    `source` je HistoryCharts, nebo text, proč historie není (vypnutá, nespustila se);
+    `charts` je už přečtený výsledek `source.charts(name)` (jinak se přečte tady).
     """
     current = ' aria-current="page"'
     links = "".join(f'<a href="/history?range={key}"{current if key == name else ""}>{esc(chart_range.label)}</a>'
@@ -343,7 +365,7 @@ def render_history_page(source, name):
     if isinstance(source, str):
         note, body = source, ""
     else:
-        charts = source.charts(name)
+        charts = source.charts(name) if charts is None else charts
         if isinstance(charts, ChartError):
             note = (f"Historie je teď nedostupná (důvod: {charts.reason}). Měření a aktuální stav "
                     "běží dál; další pokus nejdřív za 30 s.")
@@ -368,10 +390,108 @@ def render_history_page(source, name):
         f"<style>{CSS}</style></head><body>"
         f"<header><h1>NexusSTAT – historie</h1><nav><a href=\"/\">Aktuální stav</a>{links}</nav>"
         f"<p class=\"t\">{esc(note)}</p></header>{body}"
-        f"<p class=\"t\">Jen pro čtení, jen z tohoto počítače ({LOOPBACK}). Historie se čte z SQLite jen "
+        f"<p class=\"t\">Jen pro čtení, bez přihlášení. Historie se čte z SQLite jen "
         "pro čtení a výsledek se drží v paměti; měření ani aktuální stav tím nejsou dotčené.</p>"
         "</body></html>"
     )
+
+
+@dataclass(frozen=True)
+class WebAccess:
+    """Kde web naslouchá a kdo se smí připojit (M6-3); výchozí jen 127.0.0.1.
+
+    Klient se posuzuje jen podle skutečné adresy spojení, nikdy podle hlaviček
+    (X-Forwarded-For ani jiné se nečtou). Tento počítač (loopback) smí vždy.
+    """
+
+    bind: str = LOOPBACK
+    networks: tuple = ()  # schválené rozsahy klientů v LAN (IPv4Network)
+    host_names: tuple = ()  # další povolené názvy v hlavičce Host
+
+    @property
+    def loopback(self):
+        return ip_address(self.bind).is_loopback
+
+    def client_allowed(self, address):
+        try:
+            client = ip_address(address)
+        except ValueError:
+            return False
+        if client.version == 6 and client.ipv4_mapped is not None:
+            client = client.ipv4_mapped
+        return client.is_loopback or any(client in network for network in self.networks)
+
+    def allowed_hosts(self, port):
+        names = [self.bind, *self.host_names] + (["localhost"] if self.loopback else [])
+        return {f"{name}:{port}" for name in names}
+
+
+def web_access(bind=LOOPBACK, allow=(), host_names=()):
+    """Ověřený WebAccess z voleb --web-bind, --web-allow a --web-host; ValueError u čehokoli nejistého.
+
+    Adresa je 127.0.0.1, nebo jedna konkrétní soukromá adresa LAN (nikdy 0.0.0.0,
+    veřejná ani link-local) a pak musí být aspoň jeden schválený rozsah klientů.
+    Rozsahy jsou soukromé sítě IPv4 zadané přesně (bez bitů hostitele), ne
+    odvozené z výchozí trasy. IPv6 zatím ne.
+    """
+    try:
+        address = ipaddress.IPv4Address(bind)
+    except ValueError:
+        raise ValueError(f"--web-bind musí být jedna adresa IPv4, ne {bind!r}") from None
+    # Python počítá mezi „soukromé“ i rezervované bloky (třída E a všesměrová adresa):
+    # vylučují se zvlášť.
+    unusable = address.is_link_local or address.is_unspecified or address.is_reserved or address.is_multicast
+    if not (address.is_loopback or (address.is_private and not unusable)):
+        raise ValueError(f"--web-bind {bind}: jen 127.0.0.1 nebo konkrétní soukromá adresa LAN, "
+                         "ne 0.0.0.0 ani veřejná")
+    networks = []
+    for text in allow:
+        try:
+            network = ipaddress.IPv4Network(text, strict=True)
+        except ValueError:
+            raise ValueError(f"--web-allow musí být rozsah IPv4 bez bitů hostitele (např. 192.0.2.0/24), "
+                             f"ne {text!r}") from None
+        if (not network.is_private or network.is_loopback or network.is_link_local or network.is_reserved
+                or network.is_multicast or network.prefixlen < 8):
+            raise ValueError(f"--web-allow {text}: jen soukromý rozsah LAN (nejvýš /8)")
+        networks.append(network)
+    if address.is_loopback and networks:
+        raise ValueError("--web-allow má smysl jen s adresou LAN v --web-bind")
+    if not address.is_loopback and not networks:
+        raise ValueError("adresa LAN v --web-bind vyžaduje aspoň jeden schválený rozsah --web-allow")
+    names = []
+    for name in host_names:
+        if not HOST_NAME.fullmatch(name):
+            raise ValueError(f"--web-host musí být název počítače malými písmeny bez portu, ne {name!r}")
+        names.append(name)
+    return WebAccess(str(address), tuple(networks), tuple(names))
+
+
+class RequestTooLarge(http.client.LineTooLong):
+    """Řádek požadavku a hlavičky dohromady jsou delší než MAX_REQUEST_BYTES."""
+
+
+class LimitedReader:
+    """rfile obsluhy, který přečte nejvýš `limit` bajtů hlavičky požadavku; tělo nečte vůbec."""
+
+    def __init__(self, raw, limit):
+        self.raw = raw
+        self.left = limit
+
+    def readline(self, size=-1):
+        if self.left <= 0:
+            raise RequestTooLarge("hlavičky požadavku")
+        line = self.raw.readline(self.left + 1 if size < 0 else min(size, self.left + 1))
+        self.left -= len(line)
+        if self.left < 0:
+            raise RequestTooLarge("hlavičky požadavku")
+        return line
+
+    def read(self, size=-1):
+        raise RequestTooLarge("tělo požadavku")
+
+    def close(self):
+        self.raw.close()
 
 
 def is_loopback(address):
@@ -387,8 +507,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "NexusSTAT"
     timeout = REQUEST_TIMEOUT_SECONDS
 
+    def setup(self):
+        super().setup()
+        self.rfile = LimitedReader(self.rfile, MAX_REQUEST_BYTES)
+
     def version_string(self):
         return self.server_version  # hlavička Server bez verze Pythonu
+
+    def send_error(self, code, message=None, explain=None):
+        # Chyby z parseru (400, 414, 431, 501) bez ozvěny požadavku a se stejnými
+        # bezpečnostními hlavičkami jako ostatní odpovědi.
+        self.close_connection = True
+        self.send_text(code, f"Chyba {code}.\n", {"Connection": "close"}, body=self.command != "HEAD")
 
     def do_GET(self):
         self.respond(body=True)
@@ -404,9 +534,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = refuse_method
 
     def respond(self, body):
-        if not is_loopback(self.client_address[0]):
-            self.send_text(403, "Jen z tohoto počítače.\n", body=body)
-        elif self.headers.get("Host") not in self.server.allowed_hosts:
+        if not self.server.access.client_allowed(self.client_address[0]):
+            self.send_text(403, "Nepovolený klient.\n", body=body)  # pojistka; verify_request ho už zavřel
+        elif self.headers.get("Host", "").lower() not in self.server.allowed_hosts:
             self.send_text(403, "Nepovolená hlavička Host.\n", body=body)
         else:
             path, _, query = self.path.partition("?")  # doslovně "/" nebo "/history", ne "//jiný-host/"
@@ -438,16 +568,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 class DashboardServer(ThreadingHTTPServer):
-    """HTTP server napevno na 127.0.0.1; `port` 0 = volný port (testy)."""
+    """HTTP server na adrese z `access` (výchozí 127.0.0.1); `port` 0 = volný port (testy).
+
+    Spojení se přijme jen od povoleného klienta a jen při volném místě
+    (`max_connections`); jinak se hned zavře, bez vlákna a bez čtení dat.
+    Přijaté spojení má celkový termín `deadline_seconds`: po něm ho
+    `service_actions` ukončí, i když klient posílá po bajtech.
+    """
 
     daemon_threads = True
 
-    def __init__(self, board, port, clock=time.monotonic):
-        super().__init__((LOOPBACK, port), DashboardHandler)
+    def __init__(self, board, port, clock=time.monotonic, access=WebAccess(), max_connections=MAX_CONNECTIONS,
+                 deadline_seconds=REQUEST_DEADLINE_SECONDS, accepts_per_second=MAX_ACCEPTS_PER_SECOND):
+        super().__init__((access.bind, port), DashboardHandler)
         self.board = board
         self.clock = clock
-        bound = self.server_address[1]
-        self.allowed_hosts = {f"{LOOPBACK}:{bound}", f"localhost:{bound}"}
+        self.access = access
+        self.allowed_hosts = access.allowed_hosts(self.server_address[1])
+        self.deadline_seconds = deadline_seconds
+        self.refused = 0  # spojení zavřená hned po přijetí (cizí klient nebo plno)
+        self._slots = threading.BoundedSemaphore(max_connections)
+        self._deadlines = {}  # přijaté spojení -> monotónní termín ukončení
+        self._deadlines_lock = threading.Lock()
+        self._accept_interval = 1 / accepts_per_second
+        self._next_accept = 0.0  # jen vlákno přijímání (serve_forever), bez zámku
+        self._history_pages = {}  # rozsah -> (výsledek grafů, hotová stránka)
+        self._pages_lock = threading.Lock()
         # Zdroj grafů: HistoryCharts, nebo text, proč historie není (výchozí: vypnutá).
         self.history = HISTORY_OFF
 
@@ -455,13 +601,73 @@ class DashboardServer(ThreadingHTTPServer):
         return render_page(self.board, self.clock())
 
     def history_page(self, name):
-        return render_history_page(self.history, name)
+        """Stránka historie; dokud HistoryCharts vrací týž výsledek, posílá se hotové HTML."""
+        source = self.history
+        if isinstance(source, str):
+            return render_history_page(source, name)
+        result = source.charts(name)  # z paměti HistoryCharts, nebo jedno krátké čtení SQLite
+        with self._pages_lock:
+            cached = self._history_pages.get(name)
+            if cached is None or cached[0] is not result:
+                cached = (result, render_history_page(source, name, result))
+                self._history_pages[name] = cached
+        return cached[1]
+
+    @property
+    def active(self):
+        """Počet právě obsluhovaných spojení."""
+        with self._deadlines_lock:
+            return len(self._deadlines)
+
+    def verify_request(self, request, client_address):
+        # Tempo přijímání: mezi dvěma spojeními aspoň _accept_interval (běží ve vlákně serve_forever).
+        now = time.monotonic()
+        if now < self._next_accept:
+            time.sleep(self._next_accept - now)
+        self._next_accept = max(now, self._next_accept) + self._accept_interval
+        if not self.access.client_allowed(client_address[0]) or not self._slots.acquire(blocking=False):
+            self.refused += 1
+            return False
+        with self._deadlines_lock:
+            self._deadlines[request] = time.monotonic() + self.deadline_seconds
+        return True
+
+    def process_request(self, request, client_address):
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release(request)  # vlákno nevzniklo: místo se uvolní hned
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release(request)
+
+    def _release(self, request):
+        with self._deadlines_lock:
+            if self._deadlines.pop(request, None) is None:
+                return
+        self._slots.release()
+
+    def service_actions(self):
+        # serve_forever volá po každém kole (nejvýš po poll_seconds): spojení po
+        # celkovém termínu se ukončí, blokované čtení i zápis obsluhy tím skončí.
+        now = time.monotonic()
+        with self._deadlines_lock:
+            overdue = [request for request, deadline in self._deadlines.items() if now >= deadline]
+        for request in overdue:
+            try:
+                request.shutdown(SHUT_RDWR)
+            except OSError:
+                pass
 
     def handle_error(self, request, client_address):
-        # Klient odešel dřív, než dostal odpověď (zavřená záložka, přerušená obnova):
-        # to není chyba webu a traceback by zaplnil tichý výpis smyčky i journal.
-        # Jiná výjimka (např. chyba stránky) se vypíše jako dřív.
-        if not isinstance(sys.exc_info()[1], ConnectionError):
+        # Klient odešel dřív, než dostal odpověď (zavřená záložka, přerušená obnova),
+        # nebo poslal příliš velký požadavek: to není chyba webu a traceback by
+        # zaplnil tichý výpis smyčky i journal. Jiná výjimka se vypíše jako dřív.
+        if not isinstance(sys.exc_info()[1], (ConnectionError, RequestTooLarge)):
             super().handle_error(request, client_address)
 
 
@@ -481,7 +687,7 @@ def check_port(port):
 
 
 def start_web(monitored, validity_seconds, port=DEFAULT_PORT, device_factory=identify_root_device,
-              poll_seconds=POLL_SECONDS):
+              poll_seconds=POLL_SECONDS, access=WebAccess()):
     """Spustí web ve vlákně na pozadí; vrací (StateBoard, DashboardServer). OSError = port nejde použít.
 
     Zařízení ROOT se zjistí jen tady, jednou; chyba identifikace dá na stránce UNKN.
@@ -491,7 +697,7 @@ def start_web(monitored, validity_seconds, port=DEFAULT_PORT, device_factory=ide
     except Exception:
         root_device = None
     board = StateBoard(monitored, validity_seconds, root_device)
-    server = DashboardServer(board, port)
+    server = DashboardServer(board, port, access=access)
     threading.Thread(target=server.serve_forever, args=(poll_seconds,), name="nexusstat-web", daemon=True).start()
     return board, server
 

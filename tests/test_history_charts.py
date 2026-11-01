@@ -144,6 +144,30 @@ class ReadTest(unittest.TestCase):
             missing.charts("1h")
             self.assertEqual(missing.reads, 1)  # nedostupnou databázi nezkouší při každé obnově
 
+    def test_concurrent_requests_share_one_read(self):
+        # M6-3: víc současných požadavků na tentýž graf po vypršení paměti = jedno čtení SQLite.
+        release, entered, opened = threading.Event(), threading.Event(), []
+
+        def slow_opener(path, role, host_id):
+            opened.append(path)
+            entered.set()
+            release.wait(5)  # čtení „trvá“, než se ostatní požadavky stihnou přidat
+            return history.open_reader(path, role=role, host_id=host_id)
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = HistoryCharts(build(directory, [(CPU, END - 100, 1.0)]), "test", 10, utc_clock=lambda: END - 1,
+                                   host_id_factory=lambda: HOST, opener=slow_opener)
+            results = []
+            threads = [threading.Thread(target=lambda: results.append(source.charts("1h"))) for _ in range(6)]
+            for thread in threads:
+                thread.start()
+            entered.wait(5)
+            release.set()
+            for thread in threads:
+                thread.join(5)
+        self.assertEqual((len(opened), source.reads, len(results)), (1, 1, 6))
+        self.assertEqual(len({id(result) for result in results}), 1)  # všichni dostali týž výsledek
+
     def test_reading_while_the_writer_writes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = build(directory)

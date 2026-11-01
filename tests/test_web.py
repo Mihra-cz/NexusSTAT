@@ -10,7 +10,11 @@ import contextlib
 import http.client
 import inspect
 import io
+import ipaddress
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,8 +32,8 @@ from nexusstat.network_monitor import ADDRESS, INTERFACE, IPV4_ID, LINK, LINK_ID
 from nexusstat.run import main, run_loop
 from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
-from nexusstat.web import (HISTORY_FAILED, HISTORY_OFF, DashboardServer, StateBoard, is_loopback, render_history_page,
-                           render_page, start_web, stop_web)
+from nexusstat.web import (HISTORY_FAILED, HISTORY_OFF, DashboardServer, StateBoard, WebAccess, is_loopback,
+                           render_history_page, render_page, start_web, stop_web, web_access)
 
 OBSERVED = datetime(2026, 10, 31, 12, 0, 5, tzinfo=timezone.utc)
 NVME = (State.INFO, "ROOT na NVMe (oddíl disku)", {"bus": "nvme", "disk": "nvme0n1", "layout": "partition"})
@@ -307,13 +311,201 @@ class HttpTest(unittest.TestCase):
             web.check_port(80)
 
 
+def wait_until(condition, seconds=3.0):
+    """Čeká na stav serveru (přijetí, uvolnění spojení) po krocích 5 ms; žádné pevné čekání."""
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("stav serveru nenastal včas")
+        time.sleep(0.005)
+
+
+def partial_request(port, header=b""):
+    """Spojení s nedokončenou hlavičkou (bez prázdného řádku): drží místo na serveru."""
+    connection = socket.create_connection((web.LOOPBACK, port), timeout=3)
+    connection.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n" % port + header)
+    return connection
+
+
+def closed_by_server(connection):
+    """True, když server spojení zavřel (prázdné čtení nebo reset)."""
+    try:
+        return connection.recv(1024) == b""
+    except ConnectionError:
+        return True
+
+
+# Skutečné adresy mimo dokumentační rozsahy se do repozitáře nepíšou (PublicDataTest),
+# proto se veřejná a link-local adresa pro testy odmítnutí dopočítají.
+PUBLIC_ADDRESS = str(ipaddress.IPv4Address(int(ipaddress.IPv4Address("192.0.2.1")) - 2 ** 24))
+LINK_LOCAL_ADDRESS = str(ipaddress.IPv4Address((169 << 24) | (254 << 16) | 257))
+
+
+class AccessTest(unittest.TestCase):
+    """M6-3: výchozí jen 127.0.0.1; LAN jen výslovně, se schválenými rozsahy klientů."""
+
+    def test_only_explicit_private_lan_access(self):
+        default = web_access()
+        self.assertEqual((default.bind, default.networks, default.loopback), ("127.0.0.1", (), True))
+        self.assertEqual(default.allowed_hosts(8765), {"127.0.0.1:8765", "localhost:8765"})
+        lan = web_access("192.0.2.10", ["192.0.2.0/24"], ["nexus.lan"])
+        self.assertEqual(lan.allowed_hosts(8765), {"192.0.2.10:8765", "nexus.lan:8765"})  # bez localhost
+        refused = [
+            ("0.0.0.0", ["192.0.2.0/24"], []), ("::", ["192.0.2.0/24"], []), ("::1", [], []),
+            (PUBLIC_ADDRESS, ["192.0.2.0/24"], []), (LINK_LOCAL_ADDRESS, ["192.0.2.0/24"], []),
+            ("255.255.255.255", ["192.0.2.0/24"], []),  # Python ji má za „soukromou“, je ale rezervovaná
+            ("192.0.2.10", [], []),  # LAN bez schváleného rozsahu
+            ("192.0.2.10", ["0.0.0.0/0"], []), ("192.0.2.10", [f"{PUBLIC_ADDRESS}/32"], []),
+            ("192.0.2.10", ["255.255.255.255/32"], []),  # rezervovaný blok
+            ("192.0.2.10", ["192.0.2.5/24"], []),  # bity hostitele: rozsah musí být přesný
+            ("127.0.0.1", ["192.0.2.0/24"], []),  # rozsah bez adresy LAN nemá smysl
+            ("192.0.2.10", ["192.0.2.0/24"], ["Nexus.lan"]), ("192.0.2.10", ["192.0.2.0/24"], ["nexus:8765"]),
+        ]
+        for bind, allow, hosts in refused:
+            with self.subTest(bind=bind, allow=allow, hosts=hosts), self.assertRaises(ValueError):
+                web_access(bind, allow, hosts)
+        for address, allowed in (("192.0.2.77", True), ("203.0.113.1", False), ("198.51.100.7", False),
+                                 ("127.0.0.1", True), ("::1", True), ("::ffff:192.0.2.5", True), ("x", False)):
+            self.assertIs(lan.client_allowed(address), allowed, address)
+
+    def test_foreign_clients_are_closed_before_any_thread(self):
+        access = WebAccess(networks=(ipaddress.IPv4Network("192.0.2.0/24"),))
+        server = DashboardServer(StateBoard(), 0, access=access)
+        self.addCleanup(server.server_close)
+        request = object()
+        self.assertTrue(server.verify_request(request, ("192.0.2.5", 1)))
+        self.assertEqual(server.active, 1)
+        server._release(request)
+        self.assertFalse(server.verify_request(object(), ("198.51.100.7", 1)))  # mimo schválený rozsah
+        self.assertEqual((server.active, server.refused), (0, 1))
+        # Skutečná adresa klienta je jen adresa spojení: z hlaviček web čte jedině Host (ne X-Forwarded-For).
+        tree = ast.parse(Path(web.__file__).read_text(encoding="utf-8"))
+        read = {node.args[0].value for node in ast.walk(tree) if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                and isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "headers"}
+        self.assertEqual(read, {"Host"})
+        self.assertFalse(any(isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
+                             and node.value.attr == "headers" for node in ast.walk(tree)))
+
+
+class ServerLimitTest(unittest.TestCase):
+    """M6-3: omezený počet spojení, celkový termín spojení a velikost hlavičky; vše na loopbacku."""
+
+    def serve(self, **options):
+        server = DashboardServer(StateBoard(), 0, **options)
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(stop_web, server)
+        return server, server.server_address[1]
+
+    def get(self, port, data):
+        connection = socket.create_connection((web.LOOPBACK, port), timeout=3)
+        try:
+            connection.sendall(data)
+            chunks = []
+            while chunk := connection.recv(65536):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        except ConnectionError:
+            return b""
+        finally:
+            connection.close()
+
+    def test_extra_connections_are_closed_without_new_threads(self):
+        server, port = self.serve(max_connections=2)
+        before = threading.active_count()
+        held = [partial_request(port), partial_request(port)]
+        wait_until(lambda: server.active == 2)
+        extra = partial_request(port)
+        self.assertTrue(closed_by_server(extra))  # plno: zavřeno hned, bez vlákna
+        self.assertEqual(server.refused, 1)
+        self.assertLessEqual(threading.active_count(), before + 2)
+        for connection in held + [extra]:
+            connection.close()
+        wait_until(lambda: server.active == 0)  # místa se uvolní
+        self.assertTrue(self.get(port, b"GET / HTTP/1.0\r\nHost: 127.0.0.1:%d\r\n\r\n" % port)
+                        .startswith(b"HTTP/1.0 200"))
+
+    def test_total_deadline_ends_slow_clients(self):
+        # Klient posílá hlavičku po kouscích, takže timeout jedné operace (5 s) nikdy nevyprší.
+        server, port = self.serve(deadline_seconds=0.2)
+        slow = partial_request(port)
+        started = time.monotonic()
+        with self.assertRaises(OSError):
+            while time.monotonic() - started < 3:
+                slow.sendall(b"X-Slow: 1\r\n")
+                time.sleep(0.02)
+                if closed_by_server_nowait(slow):
+                    raise BrokenPipeError
+        self.assertLess(time.monotonic() - started, 1.5)
+        wait_until(lambda: server.active == 0)
+        slow.close()
+
+    def test_oversized_and_malformed_requests(self):
+        server, port = self.serve()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            header = b"GET / HTTP/1.0\r\nHost: 127.0.0.1:%d\r\nX-Big: %s\r\n\r\n" % (port, b"a" * 9000)
+            response = self.get(port, header)
+            self.assertTrue(response.startswith(b"HTTP/1.0 431"), response[:40])
+            self.assertIn(b"Content-Security-Policy", response)
+            self.assertEqual(self.get(port, b"GET /" + b"a" * 9000 + b" HTTP/1.0\r\n\r\n"), b"")  # zavřeno
+            bad = self.get(port, b"GARBAGE<script>\r\n\r\n")  # jednoslovný řádek = HTTP/0.9: jen tělo
+            self.assertEqual(bad, b"Chyba 400.\n")  # chyba neopakuje požadavek
+            wait_until(lambda: server.active == 0)
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_accept_pace_and_cached_history_page_bound_the_cost_of_a_flood(self):
+        server, port = self.serve(accepts_per_second=50)
+        server.history = FakeCharts(history_result())
+        request = b"GET /history?range=1h HTTP/1.0\r\nHost: 127.0.0.1:%d\r\n\r\n" % port
+        with mock.patch.object(web, "render_history_page", wraps=web.render_history_page) as render:
+            started = time.monotonic()
+            pages = {self.get(port, request).split(b"\r\n\r\n", 1)[1] for _ in range(10)}  # tělo bez hlavičky Date
+            elapsed = time.monotonic() - started
+            self.assertEqual(render.call_count, 1)  # SVG se složí jednou, dokud se data grafů nezmění
+            server.history.result = history_result()  # nové čtení = nový výsledek
+            self.get(port, request)
+            self.assertEqual(render.call_count, 2)
+        self.assertGreaterEqual(elapsed, 9 / 50 - 0.01)  # nejvýš 50 spojení za sekundu
+        self.assertEqual(len(pages), 1)  # stále tatáž stránka
+
+    def test_shutdown_with_busy_slots_and_restart_on_the_same_port(self):
+        board, server = start_web(set(), 30, port=0, device_factory=lambda: None, poll_seconds=0.01)
+        port = server.server_address[1]
+        held = [partial_request(port) for _ in range(web.MAX_CONNECTIONS)]
+        wait_until(lambda: server.active == web.MAX_CONNECTIONS)
+        board.publish([], 100.0, OBSERVED)  # měřicí smyčka zapisuje i při plném serveru
+        started = time.monotonic()
+        stop_web(server)
+        self.assertLess(time.monotonic() - started, 1.0)
+        board2, server2 = start_web(set(), 30, port=port, device_factory=lambda: None, poll_seconds=0.01)
+        self.addCleanup(stop_web, server2)
+        self.assertTrue(self.get(port, b"GET / HTTP/1.0\r\nHost: 127.0.0.1:%d\r\n\r\n" % port)
+                        .startswith(b"HTTP/1.0 200"))
+        for connection in held:
+            connection.close()
+
+
+def closed_by_server_nowait(connection):
+    """Neblokující kontrola, zda server spojení už zavřel."""
+    connection.setblocking(False)
+    try:
+        return connection.recv(1024) == b""
+    except BlockingIOError:
+        return False
+    except ConnectionError:
+        return True
+    finally:
+        connection.setblocking(True)
+
+
 class MainWebTest(unittest.TestCase):
     def test_web_flag_shares_the_loop_board_and_stops(self):
         started = []
 
-        def fake_start(monitored, validity, port):
+        def fake_start(monitored, validity, port, access):
             board = StateBoard(monitored, validity)
-            server = mock.Mock(server_address=(web.LOOPBACK, port))
+            server = mock.Mock(server_address=(access.bind, port))
             started.append((board, server, port))
             return board, server
 
@@ -356,6 +548,29 @@ class MainWebTest(unittest.TestCase):
         self.assertIsInstance(charts, HistoryCharts)
         self.assertEqual((charts.path, charts.role, charts.interval_seconds, charts.reads),
                          (link.path, "development", 10, 0))  # při startu se nic nečte
+
+    def test_lan_flags_are_explicit_and_need_web(self):
+        captured = []
+
+        def fake_start(monitored, validity, port, access):
+            captured.append(access)
+            return StateBoard(), mock.Mock(server_address=(access.bind, port))
+
+        output = io.StringIO()
+        with mock.patch("nexusstat.run.run_loop"), mock.patch("nexusstat.run.start_web", fake_start), \
+                mock.patch("nexusstat.run.stop_web"), contextlib.redirect_stdout(output):
+            main(["--web", "--web-bind", "192.0.2.10", "--web-allow", "192.0.2.0/24", "--web-host", "nexus.lan"])
+        [access] = captured
+        self.assertEqual((access.bind, [str(n) for n in access.networks], access.host_names),
+                         ("192.0.2.10", ["192.0.2.0/24"], ("nexus.lan",)))
+        self.assertIn("bez přihlášení z 192.0.2.0/24", output.getvalue())
+        for arguments in (["--web-bind", "192.0.2.10", "--web-allow", "192.0.2.0/24"],  # bez --web
+                          ["--web", "--web-bind", "0.0.0.0", "--web-allow", "192.0.2.0/24"],
+                          ["--web", "--web-bind", "192.0.2.10"]):
+            with self.subTest(arguments=arguments), mock.patch("nexusstat.run.run_loop") as loop, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main(arguments)
+            loop.assert_not_called()
 
     def test_invalid_port_stops_before_measuring(self):
         for port in ("80", "70000", "0"):

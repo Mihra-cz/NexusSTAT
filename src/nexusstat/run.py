@@ -54,7 +54,7 @@ from .mounts import RootMountMonitor
 from .nas_monitor import NasMonitor
 from .network_monitor import NetworkMonitor
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
-from .web import DEFAULT_PORT, HISTORY_FAILED, LOOPBACK, check_port, start_web, stop_web
+from .web import DEFAULT_PORT, HISTORY_FAILED, LOOPBACK, check_port, start_web, stop_web, web_access
 
 
 # Klíč v details, kterým se selhání sběru odlišuje od platného měření bez hodnoty
@@ -516,13 +516,22 @@ def main(argv=None):
     parser.add_argument("--config", type=Path,
                         help="TOML se sekcemi [collector], [network], [alarms], [oled], [history] a [services]")
     parser.add_argument("--web", action="store_true",
-                        help=f"lokální web jen pro čtení na http://{LOOPBACK}:PORT/ (jen z tohoto počítače)")
+                        help=f"lokální web jen pro čtení (výchozí jen http://{LOOPBACK}:PORT/ z tohoto počítače)")
     parser.add_argument("--web-port", type=int, default=DEFAULT_PORT, metavar="PORT",
                         help=f"port lokálního webu (výchozí {DEFAULT_PORT})")
+    parser.add_argument("--web-bind", default=LOOPBACK, metavar="IPv4",
+                        help=f"adresa webu: {LOOPBACK} (výchozí) nebo konkrétní soukromá adresa LAN; s --web-allow")
+    parser.add_argument("--web-allow", action="append", default=[], metavar="ROZSAH",
+                        help="schválený rozsah klientů v LAN, např. 192.0.2.0/24 (lze opakovat)")
+    parser.add_argument("--web-host", action="append", default=[], metavar="NÁZEV",
+                        help="další povolený název počítače v hlavičce Host (lze opakovat)")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config) if args.config else Config()
         check_port(args.web_port)
+        access = web_access(args.web_bind, args.web_allow, args.web_host)
+        if not args.web and (not access.loopback or access.host_names):
+            raise ValueError("--web-bind, --web-allow a --web-host platí jen s --web")
     except (ConfigError, OSError, ValueError) as error:
         # Neplatná konfigurace = žádné měření, ne tiché použití výchozích hodnot.
         parser.error(str(error))
@@ -531,10 +540,13 @@ def main(argv=None):
     if args.web:
         # Web jen čte výsledky této smyčky; obsazený port = chyba před měřením.
         try:
-            board, server = start_web(monitor.labels, config.collector.validity_seconds, args.web_port)
+            board, server = start_web(monitor.labels, config.collector.validity_seconds, args.web_port,
+                                      access=access)
         except OSError as error:
-            parser.error(f"web nelze spustit na {LOOPBACK}:{args.web_port}: {error}")
-        print_now(f"Web: http://{LOOPBACK}:{server.server_address[1]}/ jen pro čtení a jen z tohoto počítače; "
+            parser.error(f"web nelze spustit na {access.bind}:{args.web_port}: {error}")
+        clients = ("jen z tohoto počítače" if access.loopback else
+                   f"bez přihlášení z {', '.join(map(str, access.networks))} a z tohoto počítače")
+        print_now(f"Web: http://{access.bind}:{server.server_address[1]}/ jen pro čtení, {clients}; "
                   "ukazuje výsledky této smyčky, sám nic neměří.")
     stopper = Stopper()
     link = None
