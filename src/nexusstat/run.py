@@ -22,7 +22,9 @@ kontroly běží jen jednou za [collector] interval_seconds (výchozí 10 s) a �
 výpisu vzniká jen při změně stavu, jinak nejvýš jednou za 30 min.
 Ukončení: Ctrl+C nebo SIGTERM.
 S přepínačem --web (M6-1) ukazuje poslední výsledky i lokální web jen pro čtení
-na http://127.0.0.1:8765/ (web.py): jen z tohoto počítače, nic neměří.
+na http://127.0.0.1:8765/ (web.py): jen z tohoto počítače, nic neměří. S --web-tls-cert
+a --web-tls-key běží web přes HTTPS a s --web-admin-password nabídne na /admin
+chráněné potvrzení závad a jas LED (M6-4B, admin.py); bez HTTPS administrace není.
 Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nepřistupuje
 k displeji, mountům NAS ani jinému hardwaru a do sítě posílá jen zapnuté kontroly AnimeDB a NAS. Se zapnutou historií
 ([history] enabled = true s výslovnou cestou) předává vyhodnocené výsledky
@@ -40,6 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__, history
+from .admin import Admin, AdminError, load_password_file
 from .alarms import AlarmEvaluator
 from .animedb_monitor import AnimeDbMonitor
 from .backup_monitor import BackupMonitor
@@ -56,6 +59,7 @@ from .network_monitor import NetworkMonitor
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
 from .user_state import UserState
 from .web import DEFAULT_PORT, HISTORY_FAILED, LOOPBACK, check_port, start_web, stop_web, web_access
+from .web_tls import tls_context
 
 
 # Klíč v details, kterým se selhání sběru odlišuje od platného měření bez hodnoty
@@ -532,14 +536,32 @@ def main(argv=None):
                         help="schválený rozsah klientů v LAN, např. 192.0.2.0/24 (lze opakovat)")
     parser.add_argument("--web-host", action="append", default=[], metavar="NÁZEV",
                         help="další povolený název počítače v hlavičce Host (lze opakovat)")
+    parser.add_argument("--web-tls-cert", type=Path, metavar="SOUBOR",
+                        help="certifikát HTTPS (PEM, existující soubor správce); s --web-tls-key")
+    parser.add_argument("--web-tls-key", type=Path, metavar="SOUBOR",
+                        help="soukromý klíč HTTPS (PEM bez hesla, jen pro vlastníka 0600)")
+    parser.add_argument("--web-admin-password", type=Path, metavar="SOUBOR",
+                        help="otisk administračního hesla (python3 -m nexusstat.admin SOUBOR); jen s HTTPS")
     args = parser.parse_args(argv)
+    tls = password_hash = None
     try:
         config = load_config(args.config) if args.config else Config()
         check_port(args.web_port)
         access = web_access(args.web_bind, args.web_allow, args.web_host)
-        if not args.web and (not access.loopback or access.host_names):
-            raise ValueError("--web-bind, --web-allow a --web-host platí jen s --web")
-    except (ConfigError, OSError, ValueError) as error:
+        if not args.web and (not access.loopback or access.host_names or args.web_tls_cert or args.web_tls_key
+                             or args.web_admin_password):
+            raise ValueError("--web-bind, --web-allow, --web-host, --web-tls-* a --web-admin-password platí "
+                             "jen s --web")
+        if (args.web_tls_cert is None) != (args.web_tls_key is None):
+            raise ValueError("--web-tls-cert a --web-tls-key se zadávají spolu")
+        if args.web_admin_password is not None and args.web_tls_cert is None:
+            # Administrace nikdy přes nešifrované HTTP, ani na tomto počítači.
+            raise ValueError("--web-admin-password vyžaduje HTTPS: --web-tls-cert a --web-tls-key")
+        if args.web_tls_cert is not None:
+            tls = tls_context(args.web_tls_cert, args.web_tls_key)
+        if args.web_admin_password is not None:
+            password_hash = load_password_file(args.web_admin_password)
+    except (AdminError, ConfigError, OSError, ValueError) as error:
         # Neplatná konfigurace = žádné měření, ne tiché použití výchozích hodnot.
         parser.error(str(error))
     monitor = live_monitor(config)  # jen vytvoření kolektorů, nic se neměří
@@ -548,13 +570,16 @@ def main(argv=None):
         # Web jen čte výsledky této smyčky; obsazený port = chyba před měřením.
         try:
             board, server = start_web(monitor.labels, config.collector.validity_seconds, args.web_port,
-                                      access=access)
+                                      access=access, tls=tls)
         except OSError as error:
             parser.error(f"web nelze spustit na {access.bind}:{args.web_port}: {error}")
         clients = ("jen z tohoto počítače" if access.loopback else
                    f"bez přihlášení z {', '.join(map(str, access.networks))} a z tohoto počítače")
-        print_now(f"Web: http://{access.bind}:{server.server_address[1]}/ jen pro čtení, {clients}; "
-                  "ukazuje výsledky této smyčky, sám nic neměří.")
+        scheme = "https" if tls is not None else "http"
+        admin_note = ("; administrace na /admin jen s heslem (potvrzení závad a jas LED)" if password_hash
+                      else "; administrace vypnutá")
+        print_now(f"Web: {scheme}://{access.bind}:{server.server_address[1]}/ jen pro čtení, {clients}; "
+                  f"ukazuje výsledky této smyčky, sám nic neměří{admin_note}.")
     stopper = Stopper()
     link = user_state = None
     try:
@@ -564,6 +589,11 @@ def main(argv=None):
         user_state = UserState(config.alarms, config.user_state.path, output=print_now,
                                on_event=None if link is None else link.record_event)
         print_now(f"Uživatelský stav: {user_state.load()}")
+        if server is not None and password_hash is not None:
+            # Administrace jen předává požadavky vlastníkovi stavu (request()); sama nic nemění.
+            # Chybné přihlášení a blokace jdou jako auditní událost frontou zapisovače historie.
+            server.admin = Admin(password_hash, user_state, board, output=print_now,
+                                 on_event=None if link is None else link.record_event)
         if server is not None:
             # Grafy (M6-2) čtou historii jen pro čtení a jen na požádání stránky /history.
             if link is not None:

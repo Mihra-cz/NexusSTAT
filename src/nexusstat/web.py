@@ -19,13 +19,18 @@ stránka databázi nečte. Bez zapnuté historie jen vysvětlí proč.
 
 Bezpečnost: výchozí je naslouchání jen na 127.0.0.1. Od M6-3 jde výslovně
 zadat jednu soukromou adresu LAN (`WebAccess`, nikdy 0.0.0.0) se schválenými
-rozsahy klientů; jiný klient se zavře hned po přijetí spojení. Přijme jen GET
+rozsahy klientů; jiný klient se zavře hned po přijetí spojení. Přijme GET
 a HEAD na "/" a "/history", odmítne cizí hlavičku Host (ochrana proti DNS
-rebinding), nemá zapisovací endpoint, nic nespouští a neovládá hardware. Všechny
-texty se escapují. Server obsluhuje nejvýš MAX_CONNECTIONS spojení naráz
-(další se zavřou bez vlákna), jedno spojení nejvýš REQUEST_DEADLINE_SECONDS
-celkem a hlavičku požadavku nejvýš MAX_REQUEST_BYTES. Dashboard i historie jsou
-bez přihlášení jen pro čtení; otevření v LAN až po bezpečnostním review.
+rebinding), nic nespouští a neovládá hardware. Všechny texty se escapují.
+Server obsluhuje nejvýš MAX_CONNECTIONS spojení naráz (další se zavřou bez
+vlákna), jedno spojení nejvýš REQUEST_DEADLINE_SECONDS celkem a hlavičku
+požadavku nejvýš MAX_REQUEST_BYTES. Dashboard i historie jsou bez přihlášení
+jen pro čtení; otevření v LAN až po bezpečnostním review.
+
+Od M6-4B může server běžet přes HTTPS (`web_tls.tls_context` z existujících
+souborů certifikátu a klíče; nic se negeneruje). Jen na HTTPS a jen s nastavenou
+administrací (`server.admin`, admin.py) přijme i POST na tři akce pod /admin/
+s malým formulářem; bez TLS je administrace vypnutá a POST se dál odmítá.
 """
 
 import base64
@@ -35,6 +40,7 @@ import http.client
 import ipaddress
 import math
 import re
+import ssl
 import sys
 import threading
 import time
@@ -73,8 +79,14 @@ MAX_CONNECTIONS = 8
 # Celková doba jednoho spojení (hlavičky i odpověď). Timeout operace sám nestačí:
 # klient, který posílá po bajtech, by ho obnovoval donekonečna.
 REQUEST_DEADLINE_SECONDS = 10
-# Řádek požadavku a hlavičky dohromady; tělo se nikdy nečte (jen GET a HEAD).
+# Řádek požadavku a hlavičky dohromady; tělo čte jen administrace (MAX_FORM_BYTES).
 MAX_REQUEST_BYTES = 8192
+# Administrace (M6-4B): jen malé formuláře urlencoded s přesnou délkou.
+ADMIN_PREFIX = "/admin"
+MAX_FORM_BYTES = 1024
+FORM_TYPE = "application/x-www-form-urlencoded"
+ADMIN_OFF = ("Administrace je vypnutá: vyžaduje HTTPS (--web-tls-cert a --web-tls-key) a soubor otisku hesla "
+             "(--web-admin-password).\n")
 # Nejvýš tolik přijatých spojení za sekundu. Bez omezení by klient, který stránku
 # obnovuje bez přestávky, zabral celé jádro (změřeno asi 700 stránek/s); takto
 # další pokusy čekají ve frontě jádra a obsluha i měření běží dál.
@@ -102,9 +114,10 @@ svg.chart{display:block;width:100%;height:auto}.chart text{font-size:11px;fill:#
 .chart .axis{stroke:#8888;stroke-width:1}.chart .grid{stroke:#8884;stroke-width:1}
 .chart .line{fill:none;stroke:#3b82f6;stroke-width:2}.chart .band{fill:#3b82f633}.chart .dot{fill:#3b82f6}
 .chart .unk{fill:#6b728066}
+form{margin:.25rem 0}input,button{font:inherit}input[type=number]{width:5rem}
 @media (max-width:32rem){td.t{display:none}}
 """
-# CSP povolí jen tento jeden blok stylu (podle otisku): žádný skript, obrázek ani formulář.
+# CSP povolí jen tento jeden blok stylu (podle otisku): žádný skript ani obrázek; formulář jen administrace.
 CSS_HASH = base64.b64encode(hashlib.sha256(CSS.encode("utf-8")).digest()).decode("ascii")
 SECURITY_HEADERS = {
     "Content-Security-Policy": (f"default-src 'none'; style-src 'sha256-{CSS_HASH}'; base-uri 'none'; "
@@ -195,8 +208,11 @@ def sections(results, now, root_device):
             for title, rows, ids in tables]
 
 
-def render_page(board, now):
-    """Celá stránka HTML z posledního taktu v monotónním čase `now`; nic neměří ani nečte ze systému."""
+def render_page(board, now, admin=False):
+    """Celá stránka HTML z posledního taktu v monotónním čase `now`; nic neměří ani nečte ze systému.
+
+    `admin` = přidat odkaz na administraci (jen když ji server na HTTPS nabízí).
+    """
     snapshot = board.snapshot()
     if snapshot is None:
         results = []
@@ -237,7 +253,8 @@ def render_page(board, now):
         f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}"><title>NexusSTAT</title>'
         f"<style>{CSS}</style></head><body>"
         f"<header><h1>NexusSTAT {badge(overall)}</h1><nav><a href=\"/\" aria-current=\"page\">Aktuální stav</a>"
-        f"<a href=\"/history\">Historie</a></nav><p class=\"t\">{esc(updated)}</p></header>"
+        f"<a href=\"/history\">Historie</a>{'<a href=\"/admin\">Administrace</a>' if admin else ''}</nav>"
+        f"<p class=\"t\">{esc(updated)}</p></header>"
         f"<section><h2>Aktivní závady a UNKNOWN</h2>{problem_html}</section>"
         f"<div class=\"cards\">{''.join(cards)}</div>"
         f"<p class=\"t\">Jen pro čtení, bez přihlášení. Obnova po {REFRESH_SECONDS} s; "
@@ -490,6 +507,10 @@ class LimitedReader:
     def read(self, size=-1):
         raise RequestTooLarge("tělo požadavku")
 
+    def read_body(self, length):
+        """Tělo formuláře administrace: nejvýš `length` bajtů (volající ověří MAX_FORM_BYTES)."""
+        return self.raw.read(length)
+
     def close(self):
         self.raw.close()
 
@@ -509,6 +530,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
+        if isinstance(self.connection, ssl.SSLSocket):
+            # Handshake TLS až tady, ve vlákně obsluhy s jejím timeoutem a celkovým
+            # termínem spojení: pomalý klient nezablokuje vlákno přijímání.
+            self.connection.do_handshake()
         self.rfile = LimitedReader(self.rfile, MAX_REQUEST_BYTES)
 
     def version_string(self):
@@ -531,14 +556,61 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         self.send_text(405, "Web je jen pro čtení.\n", {"Allow": "GET, HEAD", "Connection": "close"})
 
-    do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = refuse_method
+    do_PUT = do_PATCH = do_DELETE = do_OPTIONS = refuse_method
 
-    def respond(self, body):
+    def do_POST(self):
+        # POST jen na akce administrace a jen na HTTPS s nastavenou administrací; jinak jako dřív 405.
+        admin = self.server.admin_handler()
+        path, _, query = self.path.partition("?")
+        if admin is None or not path.startswith(ADMIN_PREFIX + "/"):
+            self.refuse_method()
+            return
+        self.close_connection = True
+        if self.refused_origin(body=True):
+            return
+        form, error = self.read_form()  # malé tělo se přečte i před odmítnutím, aby spojení neskončilo RST
+        if error is not None:
+            self.send_text(*error)
+        elif query:
+            self.send_text(400, "Parametry v adrese nejsou povolené.\n")  # tajemství nikdy v URL
+        else:
+            self.send_admin(admin.post(path, self.headers.get("Host", "").lower(), self.headers, form))
+
+    def read_form(self):
+        """(tělo, None), nebo (None, (status, text)): jen urlencoded s jednou přesnou délkou do MAX_FORM_BYTES."""
+        if self.headers.get_all("Transfer-Encoding"):
+            return None, (411, "Tělo jen s přesnou délkou (Content-Length), bez Transfer-Encoding.\n")
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,5}", lengths[0].strip()):
+            return None, (411, "Chybí jedna přesná délka těla (Content-Length).\n")
+        length = int(lengths[0])
+        if length > MAX_FORM_BYTES:
+            return None, (413, "Formulář je příliš velký.\n")
+        data = self.rfile.read_body(length)
+        if len(data) != length:
+            return None, (400, "Neúplné tělo formuláře.\n")
+        types = self.headers.get_all("Content-Type") or []
+        media, _, parameters = (types[0] if len(types) == 1 else "").partition(";")
+        if media.strip().lower() != FORM_TYPE or parameters.strip().lower() not in ("", "charset=utf-8"):
+            return None, (415, f"Jen formulář {FORM_TYPE}.\n")
+        return data, None
+
+    def send_admin(self, response, body=True):
+        self.send_text(response.status, response.html, response.headers, content_type="text/html; charset=utf-8",
+                       body=body)
+
+    def refused_origin(self, body):
+        """Kontrola klienta a hlavičky Host (stejná pro všechny cesty); True = už odmítnuto."""
         if not self.server.access.client_allowed(self.client_address[0]):
             self.send_text(403, "Nepovolený klient.\n", body=body)  # pojistka; verify_request ho už zavřel
         elif self.headers.get("Host", "").lower() not in self.server.allowed_hosts:
             self.send_text(403, "Nepovolená hlavička Host.\n", body=body)
         else:
+            return False
+        return True
+
+    def respond(self, body):
+        if not self.refused_origin(body):
             path, _, query = self.path.partition("?")  # doslovně "/" nebo "/history", ne "//jiný-host/"
             if path == "/":
                 self.send_text(200, self.server.page(), content_type="text/html; charset=utf-8", body=body)
@@ -549,6 +621,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else:
                     self.send_text(200, self.server.history_page(name), content_type="text/html; charset=utf-8",
                                    body=body)
+            elif path == ADMIN_PREFIX or path.startswith(ADMIN_PREFIX + "/"):
+                admin = self.server.admin_handler()
+                if admin is None:
+                    self.send_text(403, ADMIN_OFF, body=body)
+                elif path != ADMIN_PREFIX:
+                    self.send_text(404, "Nenalezeno.\n", body=body)  # akce jen metodou POST
+                elif query:
+                    self.send_text(400, "Parametry v adrese nejsou povolené.\n", body=body)
+                else:
+                    self.send_admin(admin.get(self.headers), body=body)
             else:
                 self.send_text(404, "Nenalezeno.\n", body=body)
 
@@ -579,8 +661,15 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, board, port, clock=time.monotonic, access=WebAccess(), max_connections=MAX_CONNECTIONS,
-                 deadline_seconds=REQUEST_DEADLINE_SECONDS, accepts_per_second=MAX_ACCEPTS_PER_SECOND):
+                 deadline_seconds=REQUEST_DEADLINE_SECONDS, accepts_per_second=MAX_ACCEPTS_PER_SECOND, tls=None):
         super().__init__((access.bind, port), DashboardHandler)
+        if tls is not None:
+            # Spojení se přijme bez handshaku; ten proběhne ve vlákně obsluhy (DashboardHandler.setup),
+            # takže kontrola klienta a limit spojení platí ještě před TLS.
+            self.socket = tls.wrap_socket(self.socket, server_side=True, do_handshake_on_connect=False)
+        self.https = tls is not None
+        # Administrace (admin.Admin) se nastaví až po spuštění uživatelského stavu; bez HTTPS se nikdy nepoužije.
+        self.admin = None
         self.board = board
         self.clock = clock
         self.access = access
@@ -598,7 +687,11 @@ class DashboardServer(ThreadingHTTPServer):
         self.history = HISTORY_OFF
 
     def page(self):
-        return render_page(self.board, self.clock())
+        return render_page(self.board, self.clock(), admin=self.admin_handler() is not None)
+
+    def admin_handler(self):
+        """Administrace, jen když běží HTTPS a je nastavená; jinak None (vypnuto)."""
+        return self.admin if self.https else None
 
     def history_page(self, name):
         """Stránka historie; dokud HistoryCharts vrací týž výsledek, posílá se hotové HTML."""
@@ -659,7 +752,8 @@ class DashboardServer(ThreadingHTTPServer):
             overdue = [request for request, deadline in self._deadlines.items() if now >= deadline]
         for request in overdue:
             try:
-                request.shutdown(SHUT_RDWR)
+                # U TLS jen soket jádra: SSLSocket.shutdown by z cizího vlákna rušil stav TLS obsluhy.
+                (super(ssl.SSLSocket, request) if isinstance(request, ssl.SSLSocket) else request).shutdown(SHUT_RDWR)
             except OSError:
                 pass
 
@@ -667,7 +761,8 @@ class DashboardServer(ThreadingHTTPServer):
         # Klient odešel dřív, než dostal odpověď (zavřená záložka, přerušená obnova),
         # nebo poslal příliš velký požadavek: to není chyba webu a traceback by
         # zaplnil tichý výpis smyčky i journal. Jiná výjimka se vypíše jako dřív.
-        if not isinstance(sys.exc_info()[1], (ConnectionError, RequestTooLarge)):
+        # Nezdařený handshake TLS (např. prosté HTTP na port HTTPS) nebo timeout klienta také ne.
+        if not isinstance(sys.exc_info()[1], (ConnectionError, RequestTooLarge, ssl.SSLError, TimeoutError)):
             super().handle_error(request, client_address)
 
 
@@ -687,7 +782,7 @@ def check_port(port):
 
 
 def start_web(monitored, validity_seconds, port=DEFAULT_PORT, device_factory=identify_root_device,
-              poll_seconds=POLL_SECONDS, access=WebAccess()):
+              poll_seconds=POLL_SECONDS, access=WebAccess(), tls=None):
     """Spustí web ve vlákně na pozadí; vrací (StateBoard, DashboardServer). OSError = port nejde použít.
 
     Zařízení ROOT se zjistí jen tady, jednou; chyba identifikace dá na stránce UNKN.
@@ -697,7 +792,7 @@ def start_web(monitored, validity_seconds, port=DEFAULT_PORT, device_factory=ide
     except Exception:
         root_device = None
     board = StateBoard(monitored, validity_seconds, root_device)
-    server = DashboardServer(board, port, access=access)
+    server = DashboardServer(board, port, access=access, tls=tls)
     threading.Thread(target=server.serve_forever, args=(poll_seconds,), name="nexusstat-web", daemon=True).start()
     return board, server
 

@@ -21,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from nexusstat import web
+from nexusstat import admin, web
 from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmsConfig, CollectorConfig
 from nexusstat.core import CheckResult, Measurement, State
@@ -378,14 +378,18 @@ class AccessTest(unittest.TestCase):
         server._release(request)
         self.assertFalse(server.verify_request(object(), ("198.51.100.7", 1)))  # mimo schválený rozsah
         self.assertEqual((server.active, server.refused), (0, 1))
-        # Skutečná adresa klienta je jen adresa spojení: z hlaviček web čte jedině Host (ne X-Forwarded-For).
-        tree = ast.parse(Path(web.__file__).read_text(encoding="utf-8"))
-        read = {node.args[0].value for node in ast.walk(tree) if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
-                and isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "headers"}
-        self.assertEqual(read, {"Host"})
-        self.assertFalse(any(isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
-                             and node.value.attr == "headers" for node in ast.walk(tree)))
+        # Skutečná adresa klienta je jen adresa spojení: web čte z hlaviček jedině Host a od M6-4B
+        # rámování těla formuláře, administrace jen Origin a Cookie (nikdy X-Forwarded-For).
+        for module, expected in ((web, {"Host", "Transfer-Encoding", "Content-Length", "Content-Type"}),
+                                 (admin, {"Origin", "Cookie"})):
+            tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+            read = {node.args[0].value for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute) and node.func.attr in ("get", "get_all")
+                    and isinstance(node.func.value, (ast.Attribute, ast.Name))
+                    and getattr(node.func.value, "attr", getattr(node.func.value, "id", "")) == "headers"}
+            self.assertEqual(read, expected, module.__name__)
+            self.assertFalse(any(isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
+                                 and node.value.attr == "headers" for node in ast.walk(tree)))
 
 
 class ServerLimitTest(unittest.TestCase):
@@ -503,7 +507,7 @@ class MainWebTest(unittest.TestCase):
     def test_web_flag_shares_the_loop_board_and_stops(self):
         started = []
 
-        def fake_start(monitored, validity, port, access):
+        def fake_start(monitored, validity, port, access, tls=None):
             board = StateBoard(monitored, validity)
             server = mock.Mock(server_address=(access.bind, port))
             started.append((board, server, port))
@@ -553,7 +557,7 @@ class MainWebTest(unittest.TestCase):
     def test_lan_flags_are_explicit_and_need_web(self):
         captured = []
 
-        def fake_start(monitored, validity, port, access):
+        def fake_start(monitored, validity, port, access, tls=None):
             captured.append(access)
             return StateBoard(), mock.Mock(server_address=(access.bind, port))
 

@@ -1,7 +1,7 @@
 """Trvalý uživatelský stav: potvrzení závad a jas RGB (M6-4A).
 
 Jediným vlastníkem je hlavní smyčka měření (run.run_loop): jen ona mění
-potvrzení a jas a jen ona zapisuje soubor. Budoucí administrační web (M6-4B)
+potvrzení a jas a jen ona zapisuje soubor. Administrace webu (M6-4B, admin.py)
 z vláken HTTP jen podá požadavek (`request`) a počká na odpověď; RgbLeds,
 alarmovou paměť ani soubor nikdy nemění. Fronta požadavků je jediné místo
 sdílené mezi vlákny, takže víc synchronizace není potřeba.
@@ -73,7 +73,7 @@ class Reply:
 
 @dataclass(frozen=True)
 class View:
-    """Neměnný přehled pro čtení z jiných vláken (budoucí web)."""
+    """Neměnný přehled pro čtení z jiných vláken (administrace webu)."""
 
     brightness: int
     acknowledged: tuple = ()  # ((check_id, State), …) seřazené podle id

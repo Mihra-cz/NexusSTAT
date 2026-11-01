@@ -173,10 +173,10 @@ timeout_seconds = 2
 # [alarms]  # trojúhelník na stránce NEXUS zatím nejde vypnout
 # show_warning_triangle = true
 #
-# [web]  # v první fázi není žádný web
-# admin_listen = "127.0.0.1"
-# admin_port = 8765  # plán, před nasazením ověřit dostupnost
-# public_status_enabled = false
+# Web se nenastavuje v tomto souboru, ale volbami nexusstat.run --web* (adresa,
+# klienti, HTTPS, soubor otisku administračního hesla). Webem nelze měnit
+# intervaly, prahy, časování OLED ani jinou konfiguraci. Veřejný heartbeat
+# zatím neexistuje.
 #
 # [storage]  # žádná runtime DB zatím není; cesta bude schválena při nasazení
 # history_mode = "events-only"

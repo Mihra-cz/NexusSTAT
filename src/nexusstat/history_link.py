@@ -393,9 +393,11 @@ class HistoryLink:
     def record_event(self, kind, severity, message, observed_utc, check_id=None, data=None):
         """Předá událost (např. potvrzení závady, M6-4A) frontě zapisovače; vrací True při přijetí.
 
-        Čas je čas měření taktu; `synced` jen s doloženou synchronizací hodin
-        z posledního dotazu, jinak `unsynced` (vymyšlená značka nevznikne).
-        Výjimku do smyčky měření nepustí, selhání se započítá jako u `record()`.
+        Čas je čas měření taktu nebo požadavku; `synced` jen s doloženou
+        synchronizací hodin z posledního dotazu, jinak `unsynced` (vymyšlená
+        značka nevznikne). Smí se volat i z vláken webu (audit administrace,
+        M6-4B): `submit_event` jen krátce zamkne omezenou frontu zapisovače a na
+        I/O nečeká. Výjimku nepustí, selhání se započítá jako u `record()`.
         """
         try:
             moment = max(1, math.floor(observed_utc.timestamp()))

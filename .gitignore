@@ -51,6 +51,12 @@ NEXUS-RECOVERY.md
 user_state*.json
 .user_state*.json.*.tmp
 
+# Otisk administračního hesla a certifikáty webu (M6-4B) patří mimo repozitář
+*.scrypt
+.*.scrypt.*.tmp
+*.crt
+*.p12
+
 # Editor a záložní soubory
 *~
 *.swp

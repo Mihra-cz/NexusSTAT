@@ -281,18 +281,41 @@ Kategorie: 1 Nexus a systém, 2 NAS a jeho dostupnost, 3 AnimeDB, 4 zálohy a Re
 
 - Potvrzení „Beru na vědomí / pracuji na nápravě“ jen eviduje, že o závadě víš: nic neopravuje, nemění diagnostický stav, OLED ani historii měření a přetrvá restart. Zanikne až po doloženém odeznění (nejméně tři po sobě jdoucí platná měření bez závady, nebo delší řada podle alarmového pravidla; `UNKNOWN` se nepočítá). Nová epizoda nebo zhoršení na `ERROR` chce nové potvrzení; `CRITICAL` bliká dál.
 - Probuzení OLED kódy potvrzených závad jednou přehraje, pokud nebliká `CRITICAL` ani nepotvrzená závada; pak LED zhasnou. Další stisky mají dosavadní význam.
-- Jediný jas 5–100 % (výchozí 20 %), bílá asi na polovině. Jas a potvrzení jsou od M6-4A v samostatném malém souboru (`[user_state] path`, viz Uživatelský stav); měnit je bude jen správce po zadání administračního PINu v LAN (M6-4B, neimplementováno).
+- Jediný jas 5–100 % (výchozí 20 %), bílá asi na polovině. Jas a potvrzení jsou od M6-4A v samostatném malém souboru (`[user_state] path`, viz Uživatelský stav); měnit je smí jen správce v administraci přes HTTPS po zadání hesla nebo PINu (M6-4B, viz Administrace).
 
 ## Uživatelský stav: potvrzení a jas (M6-4A, lokálně, na Nexusu nenasazeno)
 
 - **Výchozí stav:** bez sekce `[user_state]` žijí potvrzení a jas jen v paměti procesu `nexusstat.run`; restart je zapomene a nic se nezapisuje. Při startu to řekne řádek `Uživatelský stav: …`.
 - **Zapnutí na notebooku:** adresář vytvoří správce (aplikace ho nevytváří), např. `mkdir -p -m 700 ~/.local/state/nexusstat`, a do lokálního `config/config.toml` přidá `[user_state]` s `path = "/home/<uživatel>/.local/state/nexusstat/user_state.json"`. Na Nexusu navržená cesta `/srv/nexus/appdata/nexusstat/user_state.json` (až po schválení nasazení, M7).
-- **Dnes stav nic nemění:** administrační web (M6-4B) neexistuje, takže nevznikne žádné potvrzení ani změna jasu. Smyčka jen načte soubor, hlídá zánik načtených potvrzení a soubor zapíše jen tehdy, když nějaké potvrzení doloženě zanikne.
+- **Kdo stav mění:** jen administrace (M6-4B) přes HTTPS a heslo; bez ní nevznikne žádné potvrzení ani změna jasu a smyčka jen načte soubor, hlídá zánik načtených potvrzení a zapíše ho, když nějaké doloženě zanikne.
 - **Četnost zápisu:** jen při skutečné změně (nové nebo zvýšené potvrzení, zánik potvrzení, změna jasu), nikdy v taktu smyčky; po selhání zápisu nejvýš jeden pokus za 60 s, stav mezitím platí v paměti.
 - **Soubor:** JSON s oprávněními `0600` (`format`, `brightness`, `acknowledgements`). Prohlížet jen pro čtení, např. `python3 -m json.tool <soubor>`. Ručně neupravovat za běhu NexusSTAT: smyčka by ho při další změně přepsala svým stavem.
 - **Poškozený nebo podezřelý soubor** (neplatný obsah, symlink, cizí vlastník, zápis pro skupinu či ostatní) se nepoužije: start vypíše důvod, platí výchozí stav bez potvrzení a jas 20 % a soubor zůstane beze změny do první skutečné změny. Závady tak znovu blikají, nikdy nemlčí falešně.
 - **Zálohy:** soubor patří do záloh `appdata`. Obnova ze zálohy jen se zastaveným NexusSTAT (zkopírovat soubor a nastavit `0600`). **Riziko:** starší soubor může vrátit potvrzení epizody, která mezitím skončila; trvá-li v tu chvíli u téže kontroly nová závada stejné nebo nižší závažnosti, bere se jako potvrzená. Po obnově proto obsah souboru zkontrolovat a nepotřebná potvrzení odstranit smazáním souboru.
 - **Rollback:** odebrat sekci `[user_state]` (stav jen v paměti) a případně smazat soubor; tím zmizí všechna potvrzení (bezpečný směr: závady znovu blikají) a jas se vrátí na 20 %. Historie SQLite ani jiné soubory se nemění.
+
+## Administrace: potvrzení závad a jas (M6-4B, lokálně, v LAN neotevřeno)
+
+Jen tři akce: potvrzení jedné závady `WARNING`/`ERROR`, jas LED 5–100 % a odhlášení. Intervaly, prahy, časování OLED ani jinou konfiguraci web nemění; ty zůstávají v `config/config.toml`.
+
+1. **Heslo nebo PIN** nastaví správce v terminálu (adresář vytvoří sám, mimo repozitář):
+
+   ```bash
+   PYTHONPATH=src python3 -m nexusstat.admin ~/.config/nexusstat/admin.scrypt
+   ```
+
+   Zadání je skryté a dvakrát; PIN aspoň 8 číslic, jinak heslo aspoň 12 znaků. Uloží se jen solený otisk `scrypt` s oprávněními `0600`. Změna hesla: totéž s `--replace` a restart `nexusstat.run`.
+2. **HTTPS:** certifikát a klíč (PEM) připraví správce mimo repozitář; NexusSTAT je nevytváří. Klíč bez hesla, obyčejný soubor tohoto uživatele s `chmod 600` (ne symlink). Skutečné certifikáty a důvěra klientských zařízení se řeší samostatně, před otevřením v LAN.
+3. **Spuštění** (na notebooku jen `127.0.0.1`):
+
+   ```bash
+   PYTHONPATH=src python3 -m nexusstat.run --web --web-tls-cert CERT.pem --web-tls-key KEY.pem --web-admin-password ~/.config/nexusstat/admin.scrypt
+   ```
+
+   Řádek `Web: https://…; administrace na /admin jen s heslem` potvrdí zapnutí. Bez `--web-tls-*` web běží jako dřív přes HTTP jen pro čtení a `/admin` jen vysvětlí, že administrace je vypnutá; `--web-admin-password` bez HTTPS start odmítne.
+- **Přihlášení:** relace na 10 min (bez prodlužování), po restartu znovu. Po 5 chybných pokusech se přihlašování zablokuje pro všechny na 60 s, další blokace 300 s a pak 900 s; výpis ukáže jeden řádek za blokaci (bez zadaného textu). Se zapnutou historií je každý chybný pokus událost `admin.login_failed` a každá blokace `admin.login_blocked` (jen počty, nejvýš 6 událostí na okno blokace); pokusy během blokace se jen sečtou. Heslo, token relace ani token CSRF se nikam nevypisují ani nezapisují.
+- **Výsledek akce:** `Provedeno` (s informací, zda je uložené v souboru stavu), `Odmítnuto` (s důvodem, nic se nezměnilo) nebo `Nejisté` (smyčka požadavek převzala, ale odpověď nepřišla včas; stav ověř na stránce administrace). Potvrzení nemění stav závady ani OLED; zhoršená závada a `CRITICAL` potvrdit nejdou.
+- **Rollback:** spustit bez `--web-admin-password` (HTTPS jen pro čtení) nebo bez `--web-tls-*` (HTTP jako dřív) a případně smazat soubor otisku. Potvrzení a jas zůstávají v souboru uživatelského stavu (viz výše); jejich zrušení = smazat ten soubor.
 
 ## SQLite: provoz a zálohování (implementováno lokálně, na Nexusu nenasazeno)
 
