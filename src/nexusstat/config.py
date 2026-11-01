@@ -59,6 +59,7 @@ KNOWN_SERVICES_KEYS = {"animedb", "nas", "backup"}
 KNOWN_ANIMEDB_KEYS = {"enabled", "url", "timeout_seconds", "interval_seconds"}
 KNOWN_NAS_KEYS = {"enabled", "host", "port", "timeout_seconds", "interval_seconds"}
 KNOWN_BACKUP_KEYS = {"enabled", "unit", "timer", "timeout_seconds"}
+KNOWN_USER_STATE_KEYS = {"path"}
 
 # Healthcheck AnimeDB (SERVICES-1): limit celé kontroly v sekundách (spojení,
 # odeslání i příjem dohromady). Měřicí smyčka je jednovláknová, takže se
@@ -124,7 +125,7 @@ DEFAULT_CLEAR_COUNT = 2
 
 # Načítané sekce. Ostatní ([web], [storage], ...) jsou chyba,
 # dokud je kód skutečně nepoužívá, jinak by se tiše ignorovaly.
-KNOWN_SECTIONS = {"oled", "collector", "network", "alarms", "history", "services"}
+KNOWN_SECTIONS = {"oled", "collector", "network", "alarms", "history", "services", "user_state"}
 
 # Role databáze historie v tomto kroku: jen vývojová databáze na notebooku.
 # Konfigurace roli nenastavuje, takže produkční databázi nelze zapnout omylem
@@ -139,6 +140,7 @@ DAILY_TIME = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
 # Přípona souboru databáze historie. Stejné pravidlo má .gitignore (*.sqlite3),
 # takže ani omylem zadaná cesta v repozitáři nepůjde zaverzovat.
 HISTORY_SUFFIX = ".sqlite3"
+USER_STATE_SUFFIX = ".json"
 
 
 class ConfigError(ValueError):
@@ -431,6 +433,29 @@ class HistoryConfig:
             raise ConfigError(f"path musí mít příponu {HISTORY_SUFFIX}, ne {name!r}")
 
 
+@dataclass(frozen=True)
+class UserStateConfig:
+    """Soubor uživatelského stavu: jas RGB a potvrzení závad (M6-4A, user_state.py).
+
+    Bez `path` (výchozí) žije stav jen v paměti procesu a po restartu začne
+    znovu. Cesta je absolutní soubor `.json` v existujícím adresáři, který
+    vytvoří správce (na Nexusu `appdata/nexusstat/`); aplikace adresář nevytváří.
+    """
+
+    path: str | None = None
+
+    def __post_init__(self):
+        if self.path is None:
+            return
+        if not isinstance(self.path, str) or not self.path or "\x00" in self.path:
+            raise ConfigError(f"path musí být neprázdná cesta k souboru, ne {self.path!r}")
+        if not self.path.startswith("/"):
+            raise ConfigError(f"path musí být absolutní cesta, ne {self.path!r}")
+        name = PurePosixPath(self.path).name
+        if not name or self.path.endswith("/") or PurePosixPath(name).suffix != USER_STATE_SUFFIX:
+            raise ConfigError(f"path musí být soubor s příponou {USER_STATE_SUFFIX}, ne {self.path!r}")
+
+
 def check_health_url(url):
     """Ověří adresu healthchecku a vrátí ji rozloženou (urlsplit).
 
@@ -611,6 +636,7 @@ class Config:
     network: NetworkConfig = field(default_factory=NetworkConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
     services: ServicesConfig = field(default_factory=ServicesConfig)
+    user_state: UserStateConfig = field(default_factory=UserStateConfig)
 
     def __post_init__(self):
         # Vytížení CPU jde do historie jako měření za celé okno zápisu (SCHED-2).
@@ -658,6 +684,15 @@ def history_config_from_dict(section):
         raise ConfigError(f"[history.snapshot] {error}") from error
     keys = {name: value for name, value in section.items() if name != "snapshot"}
     return HistoryConfig(**keys, snapshot=snapshot)
+
+
+def user_state_config_from_dict(section):
+    """Vytvoří UserStateConfig ze slovníku sekce [user_state]."""
+    _check_section("user_state", section, KNOWN_USER_STATE_KEYS)
+    try:
+        return UserStateConfig(**section)
+    except ConfigError as error:
+        raise ConfigError(f"[user_state] {error}") from error
 
 
 def services_config_from_dict(section):
@@ -714,4 +749,5 @@ def load_config(path):
         network=network_config_from_dict(data.get("network", {})),
         history=history_config_from_dict(data.get("history", {})),
         services=services_config_from_dict(data.get("services", {})),
+        user_state=user_state_config_from_dict(data.get("user_state", {})),
     )

@@ -7,7 +7,8 @@ o závažnosti dál rozhodují kolektory, AlarmEvaluator a effective(). Pravidla
 jsou v docs/REQUIREMENTS.md (RGB LED a potvrzování závad).
 
 Čas je monotónní `now` jako v oled.py, takže testy na bliknutí nečekají.
-Hardwarový ovladač ani trvalé ukládání potvrzení zatím neexistují.
+Hardwarový ovladač zatím neexistuje; potvrzení a jas trvale ukládá
+user_state.py (M6-4A).
 """
 
 from dataclasses import dataclass
@@ -93,6 +94,7 @@ class Acknowledgement:
     state: State  # nejvyšší potvrzená závažnost (WARNING nebo ERROR)
     clean_samples: int = 0  # po sobě jdoucí platná měření bez závady (jen v paměti)
     last_sample: float | None = None  # expires_monotonic posledního započteného měření
+    acknowledged_utc: int | None = None  # kdy správce potvrdil (jen pro přehled, ne pro logiku)
 
 
 class Acknowledgements:
@@ -103,7 +105,7 @@ class Acknowledgements:
     Zanikne až po doloženém odeznění: `required()` po sobě jdoucích platných
     měření OK nebo INFO. UNKNOWN, N/A, prošlá data ani chybějící výsledek se
     jako odstranění problému nepočítají a řadu přeruší.
-    V simulátoru žije jen v paměti; trvalé uložení je samostatný budoucí krok.
+    V simulátoru žije jen v paměti; trvale ho ukládá jen user_state.UserState.
     """
 
     def __init__(self, alarms_config=None):
@@ -131,6 +133,33 @@ class Acknowledgements:
             self.records[result.id] = Acknowledgement(current.state)
             done.append(result.id)
         return done
+
+    def acknowledge_seen(self, results, check_id, seen_state, now, acknowledged_utc=None):
+        """Potvrdí jednu závadu na závažnosti, kterou správce viděl; vrací (přijato, důvod).
+
+        Přijme se jen skutečná aktivní WARNING nebo ERROR, která se mezitím
+        nezhoršila nad `seen_state`. CRITICAL, UNKNOWN, prošlá data ani
+        simulovaný výsledek potvrdit nejde; tak nevznikne falešné potvrzení.
+        Uloží se závažnost platná teď (nejvýš viděná): po mezitímním zmírnění
+        tak návrat k horší závažnosti znovu bliká.
+        """
+        if seen_state not in ACK_LEVELS:
+            return False, "potvrdit lze jen WARNING nebo ERROR; CRITICAL nelze umlčet"
+        found = [effective(result, now) for result in results if result.id == check_id and not result.simulated]
+        if not found:
+            return False, "kontrola nemá skutečný aktuální výsledek"
+        current = found[0]
+        if current.state is State.CRITICAL:
+            return False, "závada je CRITICAL; CRITICAL nelze umlčet"
+        if current.state not in ACK_LEVELS:
+            return False, f"závada teď není aktivní (stav {current.state.value})"
+        if ACK_LEVELS[current.state] > ACK_LEVELS[seen_state]:
+            return False, "závada se mezitím zhoršila, potvrďte ji znovu"
+        record = self.records.get(check_id)
+        if record is not None and ACK_LEVELS[record.state] >= ACK_LEVELS[current.state]:
+            return True, "už potvrzeno"
+        self.records[check_id] = Acknowledgement(current.state, acknowledged_utc=acknowledged_utc)
+        return True, "potvrzeno"
 
     def clear(self):
         """Zruší všechna potvrzení (jen pro zkoušení v simulátoru)."""
@@ -299,8 +328,10 @@ class RgbLeds:
     přerušená skupina neukázala špatný počet; CRITICAL přebíjí okamžitě.
     """
 
-    def __init__(self, alarms_config=None, brightness=BRIGHTNESS_DEFAULT):
-        self.acks = Acknowledgements(alarms_config)
+    def __init__(self, alarms_config=None, brightness=BRIGHTNESS_DEFAULT, acks=None):
+        # Budoucí ovladač dostane potvrzení vlastníka (user_state.UserState.acks),
+        # simulátor si drží vlastní jen v paměti.
+        self.acks = Acknowledgements(alarms_config) if acks is None else acks
         self.brightness = check_brightness(brightness)
         self.replay = False
         self.signal = None  # právě přehrávaný signál

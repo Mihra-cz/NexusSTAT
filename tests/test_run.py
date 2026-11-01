@@ -622,6 +622,7 @@ class FakeLink:
 
     def __init__(self, state=State.INFO, record_error=None, snapshot_state=State.NA):
         self.recorded = []
+        self.events = []
         self.checks = []
         self.snapshot_checks = []
         self.plans = []
@@ -641,6 +642,10 @@ class FakeLink:
         if self.record_error is not None:
             raise self.record_error
         self.recorded.append((list(results), measured_monotonic))
+        return True
+
+    def record_event(self, kind, severity, message, observed_utc, check_id=None, data=None):
+        self.events.append((kind, severity, message, check_id, data))
         return True
 
     def check(self, now, observed_utc):

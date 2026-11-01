@@ -47,6 +47,10 @@ NEXUS-RECOVERY.md
 *.sqlite-*
 *.log
 
+# Uživatelský stav NexusSTAT (potvrzení a jas, M6-4A) i jeho dočasné soubory
+user_state*.json
+.user_state*.json.*.tmp
+
 # Editor a záložní soubory
 *~
 *.swp

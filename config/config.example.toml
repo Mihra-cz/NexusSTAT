@@ -150,6 +150,17 @@ enabled = false
 # timer = "example-backup.timer"
 timeout_seconds = 2
 
+# Uživatelský stav (M6-4A): jas RGB LED (5–100 %, výchozí 20 %) a potvrzení
+# závad WARNING/ERROR. Bez `path` (výchozí) žije jen v paměti procesu a restart
+# ho zapomene. S `path` je to absolutní cesta k souboru s příponou .json
+# v adresáři, který už vytvořil správce (na Nexusu appdata/nexusstat/, patří do
+# záloh); aplikace adresář nevytváří. Soubor se zapisuje atomicky s oprávněními
+# 0600 a jen při skutečné změně. Poškozený, cizí nebo cizím zapisovatelný soubor
+# znamená žádná potvrzení a výchozí jas. Měnit stav bude jen budoucí
+# administrační web (M6-4B); dnes žádný zápisový endpoint neexistuje.
+[user_state]
+# path = "/home/uzivatel/.local/state/nexusstat/user_state.json"
+
 # --- Budoucí možnosti: zatím NEIMPLEMENTOVÁNO a nenačítá se ---
 # Nápis na první stránce je pevně NEXUS, hodiny jsou vždy 24h.
 # Symboly na stránce NEXUS (trojúhelník / "?") nelze vypnout.

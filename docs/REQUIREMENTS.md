@@ -378,9 +378,9 @@ Dashboard a historie zůstávají **bez přihlášení a jen pro čtení**. Výc
 - Návrh krátkého/dlouhého stisku pro řízené vypnutí je **neuzavřený do HW testů**. Dlouhé 10s gesto reboot se **neimplementuje**, může kolidovat s hardwarovým vypnutím.
 - Ovládání tlačítka při přechodu ověřit proti `systemd-logind` a přítomnosti exkluzivního `evdev` grabu.
 
-## RGB LED a potvrzování závad (schválený návrh 2026-10-23; lokálně jen rozhodovací logika a simulace v náhledu)
+## RGB LED a potvrzování závad (schválený návrh 2026-10-23; lokálně rozhodovací logika, simulace v náhledu a od M6-4A trvalý stav)
 
-Schválené chování čtyř RGB LED WS2812 ve vazbě na OLED a na budoucí potvrzování závad v lokálním webu. **Implementováno je jen lokálně na notebooku (RGB-1):** rozhodovací logika `rgb.py` a čtyři simulované LED v živém náhledu s potvrzením v paměti okna. Neexistuje ovladač RGB, web ani trvale uložená potvrzení a na Nexusu LED dál ovládá Pironman. NexusSTAT je jednoduchá náhrada softwaru Pironman 5 a stavový panel domácího serveru, ne další alarmový systém: signalizace vychází jen z existujících výsledků `CheckResult` po `AlarmEvaluator`u a kvůli RGB nevznikají žádné nové alarmy. Oddělení rozhodovací logiky od ovladače popisuje `ARCHITECTURE.md` (RGB signalizace a potvrzení závad); rozhodnutí správce jsou shrnutá na konci sekce.
+Schválené chování čtyř RGB LED WS2812 ve vazbě na OLED a na budoucí potvrzování závad v lokálním webu. **Implementováno je jen lokálně na notebooku:** rozhodovací logika `rgb.py` a čtyři simulované LED v živém náhledu s potvrzením v paměti okna (RGB-1) a od M6-4A trvalý uživatelský stav `user_state.py` (potvrzení a jas s jediným vlastníkem v měřicí smyčce, viz Ukládání uživatelského stavu). Neexistuje ovladač RGB ani administrační web, který by potvrzení nebo jas měnil, a na Nexusu LED dál ovládá Pironman. NexusSTAT je jednoduchá náhrada softwaru Pironman 5 a stavový panel domácího serveru, ne další alarmový systém: signalizace vychází jen z existujících výsledků `CheckResult` po `AlarmEvaluator`u a kvůli RGB nevznikají žádné nové alarmy. Oddělení rozhodovací logiky od ovladače popisuje `ARCHITECTURE.md` (RGB signalizace a potvrzení závad); rozhodnutí správce jsou shrnutá na konci sekce.
 
 ### Normální stav
 
@@ -425,6 +425,7 @@ Schválené chování čtyř RGB LED WS2812 ve vazbě na OLED a na budoucí potv
 - `CRITICAL` lze evidovat jako přečtený, ale je signalizovaný i po potvrzení. Přečtení neumlčí ani `ERROR` či `WARNING`, na které se `CRITICAL` později zmírní; ty vyžadují běžné potvrzení.
 - Volitelné „potvrdit všechny `WARNING`/`ERROR`“ potvrdí jen závady aktivní v tu chvíli, ne budoucí; `CRITICAL` se tím neumlčí.
 - Potvrzení a jeho zánik jsou událost historie alarmů (viz Historie a databáze SQLite); web je předá procesu NexusSTAT, který je zapíše frontou zapisovače (`HISTORY.md` 5.8, bod 5). Signalizace ani potvrzení na zapnuté historii nezávisí.
+- **Stav implementace (M6-4A, lokálně):** pravidla výše platí v `rgb.Acknowledgements` a ve vlastníkovi `user_state.UserState` v měřicí smyčce. Potvrzení se přijme jen pro skutečný platný výsledek `WARNING`/`ERROR`, který není horší než viděná závažnost; uloží se závažnost platná v okamžiku potvrzení, takže po mezitímním zmírnění návrat k horší závažnosti znovu bliká. Odmítne se `CRITICAL`, `UNKNOWN`, prošlý, chybějící i simulovaný výsledek. Evidence „přečteno“ u `CRITICAL` a „potvrdit všechny“ zatím nejsou implementované: požadavek na potvrzení `CRITICAL` se odmítne a nic se neuloží. Zatím ho nemůže podat nikdo, administrační web je M6-4B.
 
 ### Tlačítko, OLED a přehrání kódů
 
@@ -442,10 +443,13 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 - Jas i potvrzení přetrvají restart NexusSTAT.
 - Nastavení jasu a potvrzování budou dostupné v LAN jen po zadání jednoho administračního PINu nebo hesla (bez uživatelských účtů a rolí, ochrana CSRF, rozhodnutí správce 2026-10-31, viz Web / přístup); veřejný web je nenabízí ani nezobrazuje.
 
-### Ukládání uživatelského stavu (schválený návrh, bez kódu)
+### Ukládání uživatelského stavu (M6-4A, implementováno lokálně)
 
-- Jas, potvrzení aktivních závad a údaje potřebné k rozpoznání nové epizody nebo zhoršení budou v samostatném malém souboru v `appdata` NexusSTAT, ne v SQLite historii. Schéma SQLite v1 se nerozšiřuje a nový databázový subsystém nevzniká.
-- Při budoucí implementaci: atomický zápis, soukromá oprávnění, zachování po restartu a zahrnutí do záloh.
+- Jas, potvrzení aktivních závad a údaje potřebné k rozpoznání nové epizody nebo zhoršení jsou v samostatném malém souboru JSON, ne v SQLite historii. Schéma SQLite v1 se nerozšiřuje a nový databázový subsystém nevzniká. Cestu určuje sekce `[user_state]` (jediný klíč `path`: absolutní cesta k souboru s příponou `.json`); bez ní žije stav jen v paměti procesu a restart ho zapomene. Na Nexusu navržená cesta `appdata/nexusstat/user_state.json`; adresář vytváří správce, aplikace nikdy.
+- **Obsah jen:** verze formátu (`format = 1`), jas a pro každou potvrzenou kontrolu potvrzená závažnost (`WARNING`/`ERROR`) a čas potvrzení UTC (jen pro přehled, o ničem nerozhoduje). Existence záznamu znamená, že epizoda doloženě neskončila; zhoršení se pozná porovnáním s potvrzenou závažností. Počítadla odeznění se neukládají: po restartu začínají od nuly, takže restart zánik potvrzení jen oddálí, nikdy neurychlí. Žádný uživatel ani tajemství.
+- **Zápis** atomicky (dočasný soubor ve stejném adresáři s oprávněními `0600`, `fsync`, přejmenování, `fsync` adresáře) a **jen při skutečné změně** uloženého obsahu: nové nebo zvýšené potvrzení, jeho zánik, změna jasu. Takt smyčky, opakované měření ani trvající závada nezapisují. Selhání zápisu nezastaví měření: stav platí v paměti, další pokus nejdřív za 60 s, hláška jednou za řadu selhání.
+- **Načtení při startu je konzervativní:** chybějící soubor = výchozí stav (bez potvrzení, jas 20 %) a nic se nezapíše. Poškozený nebo neúplný soubor, nepodporovaná verze, neznámý klíč, neplatná hodnota (např. `CRITICAL`, jas mimo 5–100 %), víc než 256 potvrzení, soubor nad 64 KiB, symlink, jiný než obyčejný soubor, soubor jiného uživatele nebo soubor zapisovatelný pro skupinu či ostatní = **celý** soubor se nepoužije: žádná potvrzení a výchozí jas (raději znovu blikat než falešně mlčet; cizí zápis nesmí podstrčit potvrzení). Soubor se přitom nemaže ani nepřepisuje, přepíše ho až první skutečná změna.
+- Soubor patří do záloh (cesta v `appdata`); úprava seznamu cest Resticu jen po schválení (M7). Postup a rollback: `OPERATIONS.md` (Uživatelský stav).
 
 ### Bezpečnost hardwaru a převzetí od Pironmanu
 
@@ -480,6 +484,18 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 - Veřejný web `mh42.cz` dostane **jen celkový stav** odchozím HTTPS heartbeatem z NexusSTATu (zatím neimplementováno). **Nikdy** interní diagnostiku, výpis závad, logy, IP adresy, názvy zařízení a rozhraní, cesty, administraci, API pro zápis ani přístup do LAN; lokální dashboard nebude veřejně přístupný.
 - Oddělit veřejnou projekci dat od administračního procesu už v návrhu; žádný příchozí port z internetu, automatický port forwarding ani nutný cloud (heartbeat je jen odchozí).
 - Docker se samostatně nesleduje a NexusSTAT nemá přístup k Docker socketu (rozhodnutí 2026-10-24 a 2026-10-31); služby v kontejnerech se kontrolují vlastními healthchecky (např. AnimeDB `/health`).
+
+### Administrace v LAN (M6-4B, návrh k posouzení, neimplementováno)
+
+Navazuje na M6-4A: web smí potvrzení a jas jen **vyžádat** (`UserState.request()`), ověří a provede je hlavní smyčka. Do schválení a implementace M6-4B neexistuje žádný zápisový endpoint, `POST`, přihlášení, cookie ani relace.
+
+- **Jeden administrační PIN nebo heslo**, žádné účty ani role. Uložený jen jako pomalý solený otisk (`hashlib.scrypt` ze standardní knihovny) v samostatném souboru mimo repozitář s oprávněními `0600` (ne v `config.toml`, ne v Gitu, ne v souboru uživatelského stavu); nastavuje ho správce příkazem v terminálu. Nejméně 8 číslic PINu nebo 12 znaků hesla; porovnání v konstantním čase (`hmac.compare_digest`).
+- **HTTPS povinné**, než se administrace povolí v LAN: bez TLS se administrační formulář nenabídne a `POST` se odmítne (bez TLS jen na `127.0.0.1` pro vývoj). Certifikát (vlastní CA nebo self-signed s otiskem ověřeným správcem) a umístění klíče se schválí zvlášť.
+- **Omezení neúspěšných pokusů:** po 5 chybách rostoucí prodleva (např. 1, 5, 15 min) pro celou administraci, ne jen pro jednu adresu (v LAN lze adresu měnit); stav jen v paměti; neúspěch i zablokování jako událost historie bez zadaného textu.
+- **Krátkodobé oprávnění:** po úspěšném zadání náhodný token (`secrets.token_urlsafe(32)`) v cookie `HttpOnly`, `Secure`, `SameSite=Strict` s cestou jen pro administraci; platnost 10 min bez prodlužování, jen v paměti procesu (restart = nové zadání), odhlášení ho zruší.
+- **Ochrana CSRF:** každý formulář nese samostatný náhodný token svázaný s oprávněním a `POST` navíc ověří `Origin` (nebo `Referer`) proti povolenému `Host`. Jen `application/x-www-form-urlencoded` s malým tělem (např. 1 KiB), žádné JSON API.
+- **Tajemství nikdy v URL, logu ani repozitáři:** PIN jen v těle `POST`; výpis, události ani chybové stránky ho neobsahují, hlavičky `Cookie` a těla požadavků se nevypisují; `Cache-Control: no-store`.
+- **Akce:** potvrzení jedné závady s viditelnou závažností a jas 5–100 %; u `CRITICAL` tlačítko není. Stránka ukáže odpověď (`Reply`: přijato nebo odmítnuto s důvodem, uloženo do souboru). Veřejný web administraci nikdy nenabízí.
 
 ## Jednoduchost a způsob vývoje
 

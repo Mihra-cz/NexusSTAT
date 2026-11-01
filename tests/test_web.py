@@ -543,7 +543,8 @@ class MainWebTest(unittest.TestCase):
         self.assertEqual(start(None), HISTORY_OFF)  # výchozí: historie vypnutá, nic se neotevírá
         enabled = '[history]\nenabled = true\npath = "/nonexistent/history.sqlite3"\n'
         self.assertEqual(start(None, enabled), HISTORY_FAILED)  # zapnutá, ale nespustila se
-        link = SimpleNamespace(path=Path("/nonexistent/history.sqlite3"), stop=lambda: None)
+        link = SimpleNamespace(path=Path("/nonexistent/history.sqlite3"), stop=lambda: None,
+                               record_event=lambda *args, **kwargs: True)
         charts = start(link, enabled)
         self.assertIsInstance(charts, HistoryCharts)
         self.assertEqual((charts.path, charts.role, charts.interval_seconds, charts.reads),

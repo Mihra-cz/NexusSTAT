@@ -263,9 +263,9 @@ Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje d
 6. Pironman nahrazovat po funkcích (OLED, RGB, tlačítko, ventilátory), u každé s vlastním kritériem úspěchu. Pironman při přechodu jen zastavit a zakázat, neodinstalovat; návrat = obnovit zálohované konfigurace a znovu povolit a spustit `pironman5.service`. Postup návratu vyzkoušet předem.
 7. RGB (návrh): read-only zjistit, jak Pironman LED ovládá (zařízení, zapojení, jeho konfigurace), a konfiguraci zálohovat. Vypnout jen RGB Pironmanu jeho vlastní volbou; kvůli RGB nikdy nezastavovat `pironman5.service`, protože řídí boční ventilátory. LED smí ovládat jen jeden program, teprve potom zapnout RGB NexusSTAT. Pironman ovládá RGB až do samostatně schváleného převzetí. Návrh kritéria úspěchu: všechny stavy z tabulky v sekci RGB LED fyzicky ověřené a LED zhasnuté po startu i po korektním zastavení NexusSTAT; po pádu procesu mohou WS2812 držet poslední barvu (provozní omezení). Návrat: vypnout RGB NexusSTAT a obnovit konfiguraci RGB Pironmanu.
 
-## RGB LED a potvrzení závad (schválený návrh 2026-10-23, neimplementováno)
+## RGB LED a potvrzení závad (schválený návrh 2026-10-23; ovladač LED a administrace neimplementované)
 
-Na Nexusu nic z toho neběží: LED ovládá Pironman a NexusSTAT nemá ovladač RGB, web ani trvale uložená potvrzení. Na notebooku lze chování vyzkoušet v živém náhledu (RGB-1, viz Živý simulátor OLED a RGB LED). Požadavky a rozhodnutí jsou v `REQUIREMENTS.md`, datové vazby v `ARCHITECTURE.md`. Budoucí význam LED pro správce:
+Na Nexusu nic z toho neběží: LED ovládá Pironman a NexusSTAT nemá ovladač RGB ani administrační web; trvalé uložení potvrzení a jasu existuje od M6-4A jen lokálně (Uživatelský stav). Na notebooku lze chování vyzkoušet v živém náhledu (RGB-1, viz Živý simulátor OLED a RGB LED). Požadavky a rozhodnutí jsou v `REQUIREMENTS.md`, datové vazby v `ARCHITECTURE.md`. Budoucí význam LED pro správce:
 
 | LED | Význam |
 | --- | --- |
@@ -281,7 +281,18 @@ Kategorie: 1 Nexus a systém, 2 NAS a jeho dostupnost, 3 AnimeDB, 4 zálohy a Re
 
 - Potvrzení „Beru na vědomí / pracuji na nápravě“ jen eviduje, že o závadě víš: nic neopravuje, nemění diagnostický stav, OLED ani historii měření a přetrvá restart. Zanikne až po doloženém odeznění (nejméně tři po sobě jdoucí platná měření bez závady, nebo delší řada podle alarmového pravidla; `UNKNOWN` se nepočítá). Nová epizoda nebo zhoršení na `ERROR` chce nové potvrzení; `CRITICAL` bliká dál.
 - Probuzení OLED kódy potvrzených závad jednou přehraje, pokud nebliká `CRITICAL` ani nepotvrzená závada; pak LED zhasnou. Další stisky mají dosavadní význam.
-- Jediný jas 5–100 % (výchozí 20 %), bílá asi na polovině. Jas a potvrzení budou v samostatném malém souboru v `appdata/nexusstat/` (atomický zápis, soukromá oprávnění, zahrnutý do záloh); nastavovat je smí jen přihlášený správce v LAN.
+- Jediný jas 5–100 % (výchozí 20 %), bílá asi na polovině. Jas a potvrzení jsou od M6-4A v samostatném malém souboru (`[user_state] path`, viz Uživatelský stav); měnit je bude jen správce po zadání administračního PINu v LAN (M6-4B, neimplementováno).
+
+## Uživatelský stav: potvrzení a jas (M6-4A, lokálně, na Nexusu nenasazeno)
+
+- **Výchozí stav:** bez sekce `[user_state]` žijí potvrzení a jas jen v paměti procesu `nexusstat.run`; restart je zapomene a nic se nezapisuje. Při startu to řekne řádek `Uživatelský stav: …`.
+- **Zapnutí na notebooku:** adresář vytvoří správce (aplikace ho nevytváří), např. `mkdir -p -m 700 ~/.local/state/nexusstat`, a do lokálního `config/config.toml` přidá `[user_state]` s `path = "/home/<uživatel>/.local/state/nexusstat/user_state.json"`. Na Nexusu navržená cesta `/srv/nexus/appdata/nexusstat/user_state.json` (až po schválení nasazení, M7).
+- **Dnes stav nic nemění:** administrační web (M6-4B) neexistuje, takže nevznikne žádné potvrzení ani změna jasu. Smyčka jen načte soubor, hlídá zánik načtených potvrzení a soubor zapíše jen tehdy, když nějaké potvrzení doloženě zanikne.
+- **Četnost zápisu:** jen při skutečné změně (nové nebo zvýšené potvrzení, zánik potvrzení, změna jasu), nikdy v taktu smyčky; po selhání zápisu nejvýš jeden pokus za 60 s, stav mezitím platí v paměti.
+- **Soubor:** JSON s oprávněními `0600` (`format`, `brightness`, `acknowledgements`). Prohlížet jen pro čtení, např. `python3 -m json.tool <soubor>`. Ručně neupravovat za běhu NexusSTAT: smyčka by ho při další změně přepsala svým stavem.
+- **Poškozený nebo podezřelý soubor** (neplatný obsah, symlink, cizí vlastník, zápis pro skupinu či ostatní) se nepoužije: start vypíše důvod, platí výchozí stav bez potvrzení a jas 20 % a soubor zůstane beze změny do první skutečné změny. Závady tak znovu blikají, nikdy nemlčí falešně.
+- **Zálohy:** soubor patří do záloh `appdata`. Obnova ze zálohy jen se zastaveným NexusSTAT (zkopírovat soubor a nastavit `0600`). **Riziko:** starší soubor může vrátit potvrzení epizody, která mezitím skončila; trvá-li v tu chvíli u téže kontroly nová závada stejné nebo nižší závažnosti, bere se jako potvrzená. Po obnově proto obsah souboru zkontrolovat a nepotřebná potvrzení odstranit smazáním souboru.
+- **Rollback:** odebrat sekci `[user_state]` (stav jen v paměti) a případně smazat soubor; tím zmizí všechna potvrzení (bezpečný směr: závady znovu blikají) a jas se vrátí na 20 %. Historie SQLite ani jiné soubory se nemění.
 
 ## SQLite: provoz a zálohování (implementováno lokálně, na Nexusu nenasazeno)
 

@@ -390,6 +390,25 @@ class HistoryLink:
                              "měření pokračuje bez historie.")
             return False
 
+    def record_event(self, kind, severity, message, observed_utc, check_id=None, data=None):
+        """Předá událost (např. potvrzení závady, M6-4A) frontě zapisovače; vrací True při přijetí.
+
+        Čas je čas měření taktu; `synced` jen s doloženou synchronizací hodin
+        z posledního dotazu, jinak `unsynced` (vymyšlená značka nevznikne).
+        Výjimku do smyčky měření nepustí, selhání se započítá jako u `record()`.
+        """
+        try:
+            moment = max(1, math.floor(observed_utc.timestamp()))
+            quality = "synced" if self._synced is True and moment >= history.MIN_TRUSTED_UTC else "unsynced"
+            event = history.Event(moment, quality, kind, severity, message, check_id, data)
+            return bool(self.worker.submit_event(event))
+        except Exception as error:
+            self.submit_failures += 1
+            if self.submit_failures == 1:
+                self._output(f"Historie: předání události selhalo ({type(error).__name__}: {error}); "
+                             "měření pokračuje bez historie.")
+            return False
+
     def check(self, now, observed_utc):
         """Kontrola `history.storage` ze snímku stavu zapisovače."""
         expires = now + (self.validity_seconds or 0)

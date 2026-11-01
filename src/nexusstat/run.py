@@ -54,6 +54,7 @@ from .mounts import RootMountMonitor
 from .nas_monitor import NasMonitor
 from .network_monitor import NetworkMonitor
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
+from .user_state import UserState
 from .web import DEFAULT_PORT, HISTORY_FAILED, LOOPBACK, check_port, start_web, stop_web, web_access
 
 
@@ -369,7 +370,7 @@ def history_results(monitor, results, now, observed_utc, validity_seconds):
 
 
 def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now, sleep=time.sleep,
-             output=print_now, history_link=None, stopper=None, tick_seconds=None, board=None):
+             output=print_now, history_link=None, stopper=None, tick_seconds=None, board=None, user_state=None):
     """Hlavní smyčka měření. Běží do Ctrl+C nebo SIGTERM a vrací poslední výsledky.
 
     `config` je CollectorConfig, `evaluator` AlarmEvaluator s pravidly [alarms].
@@ -387,6 +388,9 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
     SUMMARY_SECONDS, nikdy při každém taktu.
     `board` (web.StateBoard, M6-1) dostane po každém taktu tytéž vyhodnocené
     výsledky jako výpis; web je jen čte, sám nic neměří.
+    `user_state` (user_state.UserState, M6-4A) je jediný vlastník potvrzení
+    a jasu: v každém taktu vyřídí čekající požadavky, započte měření pro
+    zánik potvrzení a soubor zapíše jen při skutečné změně.
     """
     interval = config.interval_seconds
     tick = interval if tick_seconds is None else tick_seconds
@@ -450,6 +454,9 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
                 # 10 s padne do taktu s měřením CPU po 5 s. Zmeškané se nedohánějí.
                 next_record = grid_after(record_origin, interval, now)
             results = [*results, *history_checks]
+            if user_state is not None:
+                # Potvrzení a jas mění jen tato smyčka; diagnostický stav výsledků se nemění.
+                user_state.tick(results, now, observed_utc)
             if board is not None:
                 board.publish(results, now, observed_utc)
             measurements += 1
@@ -549,10 +556,14 @@ def main(argv=None):
         print_now(f"Web: http://{access.bind}:{server.server_address[1]}/ jen pro čtení, {clients}; "
                   "ukazuje výsledky této smyčky, sám nic neměří.")
     stopper = Stopper()
-    link = None
+    link = user_state = None
     try:
         stopper.install()
         link = start_history(config)
+        # Potvrzení a jas (M6-4A) mají jediného vlastníka v této smyčce; události jdou do historie, je-li zapnutá.
+        user_state = UserState(config.alarms, config.user_state.path, output=print_now,
+                               on_event=None if link is None else link.record_event)
+        print_now(f"Uživatelský stav: {user_state.load()}")
         if server is not None:
             # Grafy (M6-2) čtou historii jen pro čtení a jen na požádání stránky /history.
             if link is not None:
@@ -561,7 +572,8 @@ def main(argv=None):
                 server.history = HISTORY_FAILED
         print_now(live_note())
         run_loop(monitor, config.collector, AlarmEvaluator(config.alarms),
-                 history_link=link, stopper=stopper, tick_seconds=LIVE_TICK_SECONDS, board=board)
+                 history_link=link, stopper=stopper, tick_seconds=LIVE_TICK_SECONDS, board=board,
+                 user_state=user_state)
     except KeyboardInterrupt:
         # Signál mimo smyčku (např. během spouštění historie): ukončení je
         # řízené i tady, jen bez řádku o počtu měření.
@@ -572,6 +584,8 @@ def main(argv=None):
         stopper.stopping = True
         if server is not None:
             stop_web(server)
+        if user_state is not None:
+            user_state.close()
         if link is not None:
             link.stop()
         stopper.restore()
