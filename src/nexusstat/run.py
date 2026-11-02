@@ -25,6 +25,8 @@ S přepínačem --web (M6-1) ukazuje poslední výsledky i lokální web jen pro
 na http://127.0.0.1:8765/ (web.py): jen z tohoto počítače, nic neměří. S --web-tls-cert
 a --web-tls-key běží web přes HTTPS a s --web-admin-password nabídne na /admin
 chráněné potvrzení závad a jas LED (M6-4B, admin.py); bez HTTPS administrace není.
+Se zapnutou sekcí [heartbeat] (M6-5, výchozí vypnuto) posílá jednou za 300 s
+podepsaný odchozí HTTPS heartbeat jen s celkovým stavem a časem (heartbeat.py).
 Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nepřistupuje
 k displeji, mountům NAS ani jinému hardwaru a do sítě posílá jen zapnuté kontroly AnimeDB a NAS. Se zapnutou historií
 ([history] enabled = true s výslovnou cestou) předává vyhodnocené výsledky
@@ -52,6 +54,7 @@ from .config import (CPU_INTERVAL_SECONDS, DISK_INTERVAL_SECONDS, FAN_INTERVAL_S
 from .core import ALERT_STATES, CheckResult, State, effective, overall_state
 from .fan_monitor import FanMonitor
 from .history_charts import HistoryCharts
+from .heartbeat import Heartbeat, HeartbeatError, client_context, load_secret
 from .history_link import open_history
 from .mounts import RootMountMonitor
 from .nas_monitor import NasMonitor
@@ -374,7 +377,8 @@ def history_results(monitor, results, now, observed_utc, validity_seconds):
 
 
 def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now, sleep=time.sleep,
-             output=print_now, history_link=None, stopper=None, tick_seconds=None, board=None, user_state=None):
+             output=print_now, history_link=None, stopper=None, tick_seconds=None, board=None, user_state=None,
+             heartbeat=None):
     """Hlavní smyčka měření. Běží do Ctrl+C nebo SIGTERM a vrací poslední výsledky.
 
     `config` je CollectorConfig, `evaluator` AlarmEvaluator s pravidly [alarms].
@@ -395,6 +399,8 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
     `user_state` (user_state.UserState, M6-4A) je jediný vlastník potvrzení
     a jasu: v každém taktu vyřídí čekající požadavky, započte měření pro
     zánik potvrzení a soubor zapíše jen při skutečné změně.
+    `heartbeat` (heartbeat.Heartbeat, M6-5) v každém taktu jen porovná čas; v termínu
+    složí veřejný stav z týchž výsledků a předá ho vláknu přenosu, nic nečeká.
     """
     interval = config.interval_seconds
     tick = interval if tick_seconds is None else tick_seconds
@@ -461,6 +467,8 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
             if user_state is not None:
                 # Potvrzení a jas mění jen tato smyčka; diagnostický stav výsledků se nemění.
                 user_state.tick(results, now, observed_utc)
+            if heartbeat is not None:
+                heartbeat.tick(results, now, observed_utc)
             if board is not None:
                 board.publish(results, now, observed_utc)
             measurements += 1
@@ -561,7 +569,11 @@ def main(argv=None):
             tls = tls_context(args.web_tls_cert, args.web_tls_key)
         if args.web_admin_password is not None:
             password_hash = load_password_file(args.web_admin_password)
-    except (AdminError, ConfigError, OSError, ValueError) as error:
+        if config.heartbeat.enabled:
+            # Tajemství a CA se ověří před měřením: chybná konfigurace = žádný start, ne tichý vypnutý heartbeat.
+            heartbeat_secret = load_secret(config.heartbeat.secret_file)
+            heartbeat_context = client_context(config.heartbeat.ca_file)
+    except (AdminError, ConfigError, HeartbeatError, OSError, ValueError) as error:
         # Neplatná konfigurace = žádné měření, ne tiché použití výchozích hodnot.
         parser.error(str(error))
     monitor = live_monitor(config)  # jen vytvoření kolektorů, nic se neměří
@@ -581,7 +593,7 @@ def main(argv=None):
         print_now(f"Web: {scheme}://{access.bind}:{server.server_address[1]}/ jen pro čtení, {clients}; "
                   f"ukazuje výsledky této smyčky, sám nic neměří{admin_note}.")
     stopper = Stopper()
-    link = user_state = None
+    link = user_state = heartbeat = None
     try:
         stopper.install()
         link = start_history(config)
@@ -600,10 +612,15 @@ def main(argv=None):
                 server.history = HistoryCharts(link.path, HISTORY_ROLE, config.collector.interval_seconds)
             elif config.history.enabled:
                 server.history = HISTORY_FAILED
+        if config.heartbeat.enabled:
+            heartbeat = Heartbeat(config.heartbeat.url, heartbeat_secret, heartbeat_context, monitor.labels,
+                                  config.collector.validity_seconds, output=print_now)
+            print_now(f"Heartbeat: https://{heartbeat.host}:{heartbeat.port}{heartbeat.path}, jen celkový stav a čas, "
+                      "první za 60 s, pak po 300 s bez opakování; podpis HMAC-SHA256.")
         print_now(live_note())
         run_loop(monitor, config.collector, AlarmEvaluator(config.alarms),
                  history_link=link, stopper=stopper, tick_seconds=LIVE_TICK_SECONDS, board=board,
-                 user_state=user_state)
+                 user_state=user_state, heartbeat=heartbeat)
     except KeyboardInterrupt:
         # Signál mimo smyčku (např. během spouštění historie): ukončení je
         # řízené i tady, jen bez řádku o počtu měření.
@@ -614,6 +631,8 @@ def main(argv=None):
         stopper.stopping = True
         if server is not None:
             stop_web(server)
+        if heartbeat is not None:
+            heartbeat.close()
         if user_state is not None:
             user_state.close()
         if link is not None:

@@ -317,6 +317,22 @@ Jen tři akce: potvrzení jedné závady `WARNING`/`ERROR`, jas LED 5–100 % a 
 - **Výsledek akce:** `Provedeno` (s informací, zda je uložené v souboru stavu), `Odmítnuto` (s důvodem, nic se nezměnilo) nebo `Nejisté` (smyčka požadavek převzala, ale odpověď nepřišla včas; stav ověř na stránce administrace). Potvrzení nemění stav závady ani OLED; zhoršená závada a `CRITICAL` potvrdit nejdou.
 - **Rollback:** spustit bez `--web-admin-password` (HTTPS jen pro čtení) nebo bez `--web-tls-*` (HTTP jako dřív) a případně smazat soubor otisku. Potvrzení a jas zůstávají v souboru uživatelského stavu (viz výše); jejich zrušení = smazat ten soubor.
 
+## Veřejný heartbeat (M6-5, odesílač lokálně, nenasazeno)
+
+Přijímač na `mh42.cz` zatím neexistuje, takže heartbeat dnes nemá kam posílat; nepovoluj ho proti vymyšlené adrese. Kontrakt přijímače je v `REQUIREMENTS.md` (Kontrakt přijímače heartbeatu).
+
+1. **Tajemství** vytvoří správce mimo repozitář (aspoň 32 znaků ASCII bez mezer, `chmod 600`), stejné pak dostane přijímač:
+
+   ```bash
+   (umask 077; python3 -c "import secrets; print(secrets.token_hex(32))" > ~/.config/nexusstat/heartbeat.secret)
+   ```
+
+2. **Konfigurace** v lokálním `config/config.toml`: `[heartbeat]` s `enabled = true`, `url = "https://…"` (jen skutečně existující přijímač), `secret_file = "/home/<uživatel>/.config/nexusstat/heartbeat.secret"`, případně `ca_file` pro vlastní CA. Chybějící, cizí nebo cizím čitelné tajemství i neplatná CA zastaví start.
+3. **Provoz:** po startu řádek `Heartbeat: https://…`; první hlášení za 60 s, pak po 300 s. Výpis jen při prvním doručení, při začátku řady selhání (`Heartbeat: hlášení nedoručeno (důvod)`) a po obnově; vynechané hlášení kvůli běžícímu přenosu má vlastní řádek. Veřejný stav ignoruje NEXUS bez vlastní kontroly, proto se může lišit od záhlaví lokálního dashboardu (`UNKNOWN`) a OLED (`?`).
+- **Pomalé DNS:** překlad názvu nemá limit NexusSTAT (rozhoduje systémový resolver). Měření běží dál, další hlášení se jen vynechají a po vypršení celkového limitu ani po ukončení se pozdě dokončený přenos neodešle; Ctrl+C a SIGTERM proces ukončí do 2 s.
+- **Síť:** nejvýš 288 požadavků HTTPS denně; jedno hlášení na loopbacku asi 0,9 kB ven a 1,4 kB zpět (TLS 1.3, malý certifikát EC), se skutečným řetězcem certifikátů víc. Žádné opakování ani dohánění.
+- **Rollback:** `enabled = false` (nebo sekci odebrat) a restart; nic dalšího se nemění, žádná data se lokálně neukládají.
+
 ## SQLite: provoz a zálohování (implementováno lokálně, na Nexusu nenasazeno)
 
 Na Nexusu databáze NexusSTAT neexistuje. Návrh M2 je v `HISTORY.md` (schválený 2026-10-20 kromě R11, R13, R15 (odloženo do M7); nasazení neschváleno); lokálně je implementovaný v M3 a ověřený na notebooku nad dočasnými a vývojovými databázemi, na Nexusu se ověří až v M7 se schválením. Nic z toho dnes na serveru neexistuje.

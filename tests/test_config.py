@@ -46,7 +46,8 @@ class DefaultsTest(unittest.TestCase):
         # aby nevypadaly funkčně, dokud je kód nenačítá.
         with open(EXAMPLE_CONFIG, "rb") as file:
             self.assertEqual(set(tomllib.load(file)),
-                             {"oled", "collector", "network", "alarms", "history", "services", "user_state"})
+                             {"oled", "collector", "network", "alarms", "history", "services", "user_state",
+                              "heartbeat"})
 
     def test_example_config_keeps_user_state_in_memory(self):
         # Ukázka nesmí nabídnout výchozí cestu k souboru potvrzení (M6-4A).

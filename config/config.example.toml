@@ -161,6 +161,21 @@ timeout_seconds = 2
 [user_state]
 # path = "/home/uzivatel/.local/state/nexusstat/user_state.json"
 
+# Odchozí HTTPS heartbeat pro veřejný web (M6-5). Výchozí stav: vypnuto.
+# Posílá jen {"v":1,"state":"OK|WARNING|ERROR|CRITICAL|UNKNOWN","ts":<Unix UTC>}
+# podepsané HMAC-SHA256 (hlavička X-NexusSTAT-Signature), první za 60 s po
+# startu, pak jednou za 300 s bez dohánění a bez opakování při selhání.
+# Při enabled = true jsou povinné url (jen https://název[:port]/cesta, bez
+# údajů v adrese, query a fragmentu) a secret_file (absolutní cesta k souboru
+# správce s chmod 600, aspoň 32 znaků ASCII bez mezer, mimo repozitář).
+# ca_file je volitelná vlastní CA, jinak systémové. Přijímač na veřejném webu
+# zatím neexistuje; adresu si nevymýšlej.
+[heartbeat]
+enabled = false
+# url = "https://status.example.invalid/nexusstat/heartbeat"
+# secret_file = "/home/uzivatel/.config/nexusstat/heartbeat.secret"
+# ca_file = "/home/uzivatel/.config/nexusstat/heartbeat-ca.pem"
+
 # --- Budoucí možnosti: zatím NEIMPLEMENTOVÁNO a nenačítá se ---
 # Nápis na první stránce je pevně NEXUS, hodiny jsou vždy 24h.
 # Symboly na stránce NEXUS (trojúhelník / "?") nelze vypnout.

@@ -60,6 +60,7 @@ KNOWN_ANIMEDB_KEYS = {"enabled", "url", "timeout_seconds", "interval_seconds"}
 KNOWN_NAS_KEYS = {"enabled", "host", "port", "timeout_seconds", "interval_seconds"}
 KNOWN_BACKUP_KEYS = {"enabled", "unit", "timer", "timeout_seconds"}
 KNOWN_USER_STATE_KEYS = {"path"}
+KNOWN_HEARTBEAT_KEYS = {"enabled", "url", "secret_file", "ca_file"}
 
 # Healthcheck AnimeDB (SERVICES-1): limit celé kontroly v sekundách (spojení,
 # odeslání i příjem dohromady). Měřicí smyčka je jednovláknová, takže se
@@ -125,7 +126,7 @@ DEFAULT_CLEAR_COUNT = 2
 
 # Načítané sekce. Ostatní ([web], [storage], ...) jsou chyba,
 # dokud je kód skutečně nepoužívá, jinak by se tiše ignorovaly.
-KNOWN_SECTIONS = {"oled", "collector", "network", "alarms", "history", "services", "user_state"}
+KNOWN_SECTIONS = {"oled", "collector", "network", "alarms", "history", "services", "user_state", "heartbeat"}
 
 # Role databáze historie v tomto kroku: jen vývojová databáze na notebooku.
 # Konfigurace roli nenastavuje, takže produkční databázi nelze zapnout omylem
@@ -456,6 +457,54 @@ class UserStateConfig:
             raise ConfigError(f"path musí být soubor s příponou {USER_STATE_SUFFIX}, ne {self.path!r}")
 
 
+def _check_absolute_file(name, value):
+    if not isinstance(value, str) or not value or "\x00" in value or not value.startswith("/") or value.endswith("/"):
+        raise ConfigError(f"{name} musí být absolutní cesta k souboru, ne {value!r}")
+
+
+@dataclass(frozen=True)
+class HeartbeatConfig:
+    """Odchozí HTTPS heartbeat pro veřejný web (M6-5, heartbeat.py); výchozí vypnuto.
+
+    Při zapnutí je povinná adresa přijímače `https://název[:port]/cesta` (bez
+    přihlašovacích údajů, query a fragmentu) a absolutní cesta k souboru se
+    sdíleným tajemstvím pro podpis HMAC; `ca_file` je volitelná vlastní CA
+    (jinak systémové). Nic z toho nemá výchozí hodnotu ani se neodvozuje.
+    """
+
+    enabled: bool = False
+    url: str | None = None
+    secret_file: str | None = None
+    ca_file: str | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(f"enabled musí být true nebo false, ne {self.enabled!r}")
+        if self.url is not None:
+            check_heartbeat_url(self.url)
+        for name in ("secret_file", "ca_file"):
+            if getattr(self, name) is not None:
+                _check_absolute_file(name, getattr(self, name))
+        if self.enabled and (self.url is None or self.secret_file is None):
+            raise ConfigError("zapnutý heartbeat vyžaduje url a secret_file")
+
+
+def check_heartbeat_url(url):
+    """Adresa přijímače heartbeatu: jen https://název[:port]/cesta, tisknutelné ASCII bez mezer."""
+    problem = f"url musí být https://název[:port]/cesta bez přihlašovacích údajů, query a fragmentu, ne {url!r}"
+    if not isinstance(url, str) or not 0 < len(url) <= MAX_URL_LENGTH or not all("!" <= ch <= "~" for ch in url):
+        raise ConfigError(problem)
+    try:
+        parts = urlsplit(url)
+        port = parts.port  # neplatný nebo příliš velký port vyvolá ValueError
+    except ValueError:
+        raise ConfigError(problem) from None
+    if (parts.scheme != "https" or not parts.hostname or "@" in parts.netloc or "?" in url or "#" in url
+            or port == 0 or not parts.path.startswith("/")):
+        raise ConfigError(problem)
+    return parts
+
+
 def check_health_url(url):
     """Ověří adresu healthchecku a vrátí ji rozloženou (urlsplit).
 
@@ -637,6 +686,7 @@ class Config:
     history: HistoryConfig = field(default_factory=HistoryConfig)
     services: ServicesConfig = field(default_factory=ServicesConfig)
     user_state: UserStateConfig = field(default_factory=UserStateConfig)
+    heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 
     def __post_init__(self):
         # Vytížení CPU jde do historie jako měření za celé okno zápisu (SCHED-2).
@@ -684,6 +734,15 @@ def history_config_from_dict(section):
         raise ConfigError(f"[history.snapshot] {error}") from error
     keys = {name: value for name, value in section.items() if name != "snapshot"}
     return HistoryConfig(**keys, snapshot=snapshot)
+
+
+def heartbeat_config_from_dict(section):
+    """Vytvoří HeartbeatConfig ze slovníku sekce [heartbeat]."""
+    _check_section("heartbeat", section, KNOWN_HEARTBEAT_KEYS)
+    try:
+        return HeartbeatConfig(**section)
+    except ConfigError as error:
+        raise ConfigError(f"[heartbeat] {error}") from error
 
 
 def user_state_config_from_dict(section):
@@ -750,4 +809,5 @@ def load_config(path):
         history=history_config_from_dict(data.get("history", {})),
         services=services_config_from_dict(data.get("services", {})),
         user_state=user_state_config_from_dict(data.get("user_state", {})),
+        heartbeat=heartbeat_config_from_dict(data.get("heartbeat", {})),
     )
