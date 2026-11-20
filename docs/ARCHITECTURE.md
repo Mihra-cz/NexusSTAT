@@ -33,7 +33,7 @@ Podrobnosti skutečné instalace (názvy služeb, cesty mountů, výsledky inven
 
 - Raspberry Pi 5, Debian 13, ARM64.
 - Referenční verze Pironman 5 1.3.20 (pm_auto 2.0.6), služba `pironman5.service`. V jejím procesu běží moduly ventilátorů, OLED a RGB (`FanAddon`, `OLEDAddon`, `WS2812Addon`), které má NexusSTAT postupně nahradit.
-- Boční ventilátory drží od M7-S2 (2026-11-20) v úrovni HIGH kernelový gpio-hog na GPIO6 (`dtoverlay=gpio-hog,gpio=6`), nezávisle na Pironmanu i NexusSTAT; dřív je Pironman řídil přes lgpio a při svém zastavení vypínal (inventura M7-S1). Pironman je zastavený a zakázaný, takže jeho OLED, RGB a tlačítko nefungují; NexusSTAT běží od M7-S3 jako služba systemd jen s read-only měřením a od M7-S6 s dashboardem jen pro čtení v domácí LAN. Podrobnosti v `OPERATIONS.md` (Nexus: nasazení M7-S1 až M7-S3).
+- Boční ventilátory drží od M7-S2 (2026-11-20) v úrovni HIGH kernelový gpio-hog na GPIO6 (`dtoverlay=gpio-hog,gpio=6`), nezávisle na Pironmanu i NexusSTAT; dřív je Pironman řídil přes lgpio a při svém zastavení vypínal (inventura M7-S1). Pironman je zastavený a zakázaný, takže jeho OLED, RGB a tlačítko nefungují; NexusSTAT běží od M7-S3 jako služba systemd jen s read-only měřením a od M7-S6 s dashboardem jen pro čtení v domácí LAN, od M7-S7 se SQLite historií na lokálním NVMe. Podrobnosti v `OPERATIONS.md` (Nexus: nasazení M7-S1 až M7-S3).
 - Hostitel zálohuje Resticem na NAS a NAS je připojený síťovými mounty; metadata mountu samy nezaručují online dostupnost NAS.
 - AnimeDB: inventura M7-S1 našla na Nexusu jednotky AnimeDB (`anime-db.service` běží), ačkoli se dřív uvádělo, že tam není; NexusSTAT ji nesleduje (healthcheck SERVICES-1 vypnutý). Vyjasní správce.
 
@@ -56,7 +56,7 @@ NexusSTAT má převzít aplikační funkce Pironmanu po jednotlivých funkcích.
 | RGB (`WS2812Addon`) | rozhodovací logika RGB oddělená od ovladače (Adafruit NeoPixel SPI), chování schválené 2026-10-23 | jen schválený návrh; LED zhasnuté, neovládá je nic | jediný vlastník LED: Pironman vypnutý (M7-S2), HW test, rollback |
 | Tlačítko | obsluha události Linux input | pravidlo udev 71: logind `pwr_button` nesleduje, krátký stisk bez akce (M7-S2); obsluha nic | obsluha s výhradním grabem, rozhodnutí o dlouhém stisku |
 | Ventilátory (`FanAddon`) | hlavní CPU ventilátor: Linux řídí, NexusSTAT čte; boční: nezávislé řízení kernelovým gpio-hog + monitoring | hlavní CPU ventilátor read-only i na Nexusu (M7-S3), boční drží gpio-hog (M7-S2) | splněno: oba boční fyzicky ověřené 2026-11-20 po restartu i po zastavení Pironmanu |
-| Historie (InfluxDB) | SQLite na lokálním SSD | implementováno lokálně (M3), nenasazeno | ověřená záloha a obnova na Nexusu (M7) |
+| Historie (InfluxDB) | SQLite na lokálním SSD | od M7-S7 na Nexusu (lokální NVMe, šest grafů na webu), snímky vypnuté | záloha a obnova záměrně ne: historie je postradatelná (rozhodnutí 2026-11-20) |
 | Webový dashboard | lokální web NexusSTAT (dashboard M6-1 a historie M6-2) | od M7-S6 dashboard jen pro čtení v domácí LAN; dashboard Pironmanu neběží | historie na Nexusu, admin PIN pro změny (vypnuto) |
 
 - Návrat: Pironman se při převzetí jen zastaví a zakáže, neodinstaluje; jeho konfigurace i dotčené systémové soubory se předem zálohují a postup návratu se vyzkouší.
@@ -329,7 +329,7 @@ Prahy jsou data (`AlarmsConfig`/`AlarmRule`), ne kód, a spravují se jen ručn�
 ## Zálohování
 
 - Projektové zdrojáky budou v plánovaném `/srv/nexus/projects/nexusstat` a jejich pokrytí Resticem musí být reálně ověřené.
-- Provozní SQLite (návrh M2, implementováno lokálně v M3, nenasazeno): lokální SSD, živá databáze v `/srv/nexus/appdata/nexusstat/history/`, snímky přes SQLite Backup API jako **neměnné generace** v `/srv/nexus/appdata/nexusstat/snapshot/<generace>/` (rozpracované v `snapshot-work/`), nikdy NAS/CIFS. Restic zahrne jen `snapshot/`, živou databázi s `-wal` a `-shm` vyloučí. Kontrola integrity snímku a test obnovitelnosti jsou implementované lokálně (M3.4); test obnovy na Nexusu a zápis do manifestu až s nasazením (`HISTORY.md`, sekce 9, postup v `OPERATIONS.md`).
+- Provozní SQLite (návrh M2, implementováno lokálně v M3, nenasazeno): lokální SSD, živá databáze v `/srv/nexus/appdata/nexusstat/history/`, snímky přes SQLite Backup API jako **neměnné generace** v `/srv/nexus/appdata/nexusstat/snapshot/<generace>/` (rozpracované v `snapshot-work/`), nikdy NAS/CIFS. Restic zahrne jen `snapshot/`, živou databázi s `-wal` a `-shm` vyloučí. **Na Nexusu od M7-S8:** snímky jsou vypnuté a živá databáze (`history/`) je vyloučená z noční zálohy, takže se historie nezálohuje; při ztrátě se založí nová (rozhodnutí správce 2026-11-20). Kontrola integrity snímku a test obnovitelnosti jsou implementované lokálně (M3.4); test obnovy na Nexusu a zápis do manifestu až s nasazením (`HISTORY.md`, sekce 9, postup v `OPERATIONS.md`).
 - Nová aplikace NESMÍ sama měnit nebo spouštět Restic job bez schválení.
 
 ## Plán milníků (návrh k posouzení)

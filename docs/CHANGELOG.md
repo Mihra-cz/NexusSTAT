@@ -1,5 +1,12 @@
 # Changelog NexusSTAT
 
+## 2026-11-20 – M7-S7 a M7-S8: SQLite historie na Nexusu a vyloučení ze zálohy
+
+- **Historie (M7-S7):** konfigurace `/etc/nexusstat/config.toml` (`root:nexusstat 0640`) se `[collector] interval_seconds = 10` a `[history]`, ostatní výchozí, snímky vypnuté. Databáze `/srv/nexus/appdata/nexusstat/history/history.sqlite3` na lokálním NVMe (ext4) vznikla existujícím `history.create_database()` pod účtem `nexusstat` (schéma v1, role `development`); adresář `nexusstat:nexusstat 0750`, soubory `0600`, ACL `u:nexusstat:--x` na `/srv/nexus/appdata`. Drop-in `10-web.conf` dostal jen `--config /etc/nexusstat/config.toml`; skutečný `ExecStart` je `/usr/bin/python3 -B -m nexusstat.run --config /etc/nexusstat/config.toml --web --web-bind <IP_NEXUSU> --web-allow <LAN_ROZSAH>`. Hlavní jednotka ani omezení se nezměnily (`ProtectSystem=full` nechá `/srv` zapisovatelné).
+- **Ověřeno:** jediný zapisovač, synchronizace hodin doložená, `history.storage` `INFO`, 0 restartů, journal bez chyb. Za 60 s 36 nových vzorků (6 řad po 10 s), dávky po 60 s; po 3 minutách databáze 64 KiB, `-wal` asi 85 KiB, `-shm` 32 KiB. `/history` ukazuje z LAN šest grafů ze skutečných vzorků, dashboard dál aktuální měření.
+- **Záloha (M7-S8):** noční zálohovací skript hostitele zálohoval celý `/srv/nexus` včetně živé databáze. Přibyl jediný řádek `--exclude /srv/nexus/appdata/nexusstat/history` vedle existujícího vyloučení živé databáze AnimeDB; ostatní zdroje, vyloučení, časování, retence a NAS beze změny. Ověřeno diffem, `bash -n`, vlastníkem a právy (`root:root 0750`) a `restic backup --dry-run` do dočasného lokálního repozitáře bez NAS (5 položek z `history/` → 0, ostatních 20 zůstalo). Skutečná záloha se nespouštěla; kopie originálu `.orig-m7s8` (`root:root 0640`) je vedle skriptu.
+- **Rozhodnutí správce:** historie diagnostických hodnot je postradatelná; snímky se nezapínají, při ztrátě se založí nová databáze. Schéma v2 ani nové agregace se nezavádějí.
+
 ## 2026-11-20 – M7-S5 a M7-S6: dashboard jen pro čtení v domácí LAN
 
 - **M7-S5:** drop-in `/etc/systemd/system/nexusstat.service.d/10-web.conf` přidal `--web` a `IPAddressAllow=localhost` (`IPAddressDeny=any` blokuje i loopback). Web běží v témže procesu na `127.0.0.1:8765`: `GET /` 200, `HEAD` 200, `/history` 200 s vypnutou historií, `POST` 405, `/admin` 403, cizí `Host` 403, hodnoty odpovídají systému a časy měření na stránce dokládají, že web sám neměří. `UNKNOWN` v záhlaví pochází jen ze zástupce `NEXUS NO DATA` bez vlastní kontroly.

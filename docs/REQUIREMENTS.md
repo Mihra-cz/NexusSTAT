@@ -20,6 +20,7 @@ Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic,
 ## Historie a databáze SQLite (schválený směr; implementováno lokálně v M3, nenasazeno)
 
 - Hlavní databází NexusSTAT pro historii měření, alarmů a událostí bude **SQLite**. NexusSTAT nesmí vyžadovat InfluxDB Pironmanu ani na ní stavět.
+- **M7-S7 a M7-S8 (2026-11-20):** na Nexusu běží SQLite historie (schéma v1, role `development`, lokální NVMe, zápis po 10 s v dávkách po 60 s, automatická agregace a retence beze změny). **Rozhodnutí správce:** historie diagnostických hodnot je postradatelná, denní snímky se nezapínají a živá databáze je vyloučená z noční zálohy Resticem; při ztrátě se založí nová databáze.
 - Po úspěšném nahrazení Pironmanu nebude jeho ukládání historie potřeba. Vypnutí příslušné instance InfluxDB je cíl, ale až po ověření, že ji nepoužívá žádná jiná aplikace, a po schválení.
 - Druhy dat:
   1. **Aktuální měření**: rychlé hodnoty pro OLED, alarmy a web, v paměti procesu s časem platnosti; základní interval měření 10 s. Nečtou se z databáze a výpadek databáze je neovlivní.

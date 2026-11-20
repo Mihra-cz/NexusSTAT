@@ -2,7 +2,7 @@
 
 ## Skutečný stav
 
-Na Nexusu běží od 2026-11-20 (M7-S3) služba `nexusstat.service`: jediný proces `nexusstat.run` s výchozí konfigurací (bez historie, webu, heartbeatu a služeb), jen read-only měření a výpis do journalu; od M7-S6 v témže procesu dashboard jen pro čtení v domácí LAN na portu 8765 (adresa Nexusu s rezervací DHCP, jediné pravidlo UFW). Administrace, heartbeat ani SQLite historie aktivované nejsou. Zdroje commitu `54648cc` jsou v `/srv/nexus/projects/nexusstat`. Pironman je zastavený a zakázaný a boční ventilátory drží kernelový gpio-hog na GPIO6 (M7-S2). Stav `testing`: chování po restartu Raspberry Pi a obnova zatím neověřeny. Provoz, rollback a další kroky jsou v sekci Nexus: nasazení M7-S1 až M7-S3. Příkazy v sekcích o budoucím provozu níže nejsou příkazem k nasazení.
+Na Nexusu běží od 2026-11-20 (M7-S3) služba `nexusstat.service`: jediný proces `nexusstat.run` s výchozí konfigurací (bez historie, webu, heartbeatu a služeb), jen read-only měření a výpis do journalu; od M7-S6 v témže procesu dashboard jen pro čtení v domácí LAN na portu 8765 (adresa Nexusu s rezervací DHCP, jediné pravidlo UFW). Od M7-S7 zapisuje SQLite historie na lokálním NVMe (snímky vypnuté, živá databáze od M7-S8 vyloučená z noční zálohy). Administrace ani heartbeat aktivované nejsou. Zdroje commitu `54648cc` jsou v `/srv/nexus/projects/nexusstat`. Pironman je zastavený a zakázaný a boční ventilátory drží kernelový gpio-hog na GPIO6 (M7-S2). Stav `testing`: chování po restartu Raspberry Pi a obnova zatím neověřeny. Provoz, rollback a další kroky jsou v sekci Nexus: nasazení M7-S1 až M7-S3. Příkazy v sekcích o budoucím provozu níže nejsou příkazem k nasazení.
 
 ## Lokální vývoj (simulace, read-only kolektory a pravidelné měření)
 
@@ -267,7 +267,7 @@ Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje d
 
 ## Nexus: nasazení M7-S1 až M7-S3 (stav 2026-11-20)
 
-Stav `testing`: na Nexusu běží služba `nexusstat.service` s read-only měřením, výpisem do journalu a od M7-S6 s dashboardem jen pro čtení v domácí LAN, bez historie, heartbeatu, administrace a služeb (zdroje commitu `54648cc` v `/srv/nexus/projects/nexusstat`). Pironman je zastavený a zakázaný, ale nainstalovaný; oba boční ventilátory drží kernelový gpio-hog na GPIO6. OLED, RGB a tlačítko do převzetí NexusSTAT nefungují, web a historie na Nexusu neběží. InfluxDB běží dál. Chování po restartu Raspberry Pi se službou a bez Pironmanu ani obnova zatím ověřené nejsou.
+Stav `testing`: na Nexusu běží služba `nexusstat.service` s read-only měřením, výpisem do journalu od M7-S6 s dashboardem jen pro čtení v domácí LAN a od M7-S7 se SQLite historií, bez heartbeatu, administrace a služeb (zdroje commitu `54648cc` v `/srv/nexus/projects/nexusstat`). Pironman je zastavený a zakázaný, ale nainstalovaný; oba boční ventilátory drží kernelový gpio-hog na GPIO6. OLED, RGB a tlačítko do převzetí NexusSTAT nefungují, web a historie na Nexusu neběží. InfluxDB běží dál. Chování po restartu Raspberry Pi se službou a bez Pironmanu ani obnova zatím ověřené nejsou.
 
 ### Služba nexusstat (M7-S3, běží od 2026-11-20)
 
@@ -396,7 +396,8 @@ Služba běží vždy pod `nexusstat`, nikdy jako root, bez capabilities. `Priva
 | měření `/proc`, `/sys` | žádné | `ProtectKernelTunables` jen zakáže zápis; nepoužít `ProcSubset=pid` (skryl by `/proc/stat`, `/proc/meminfo`, `/proc/net/route`) |
 | režim `/` | `ProtectSystem=full` | `strict` dává falešný `ROOT READ-ONLY` (viz výše) |
 | web (M7-S5, M7-S6) | `IPAddressAllow=localhost <LAN_ROZSAH>`, `After=network-online.target` | hotovo; `IPAddressDeny=any` blokuje i loopback |
-| historie, uživatelský stav | `ReadWritePaths=/srv/nexus/appdata/nexusstat/…`, adresář vlastní `nexusstat` | jinak bez zápisu |
+| historie (M7-S7) | nic navíc: `ProtectSystem=full` nechá `/srv` zapisovatelné, adresář `history/` vlastní `nexusstat`, ACL `--x` na `/srv/nexus/appdata` | hotovo |
+| uživatelský stav | soubor v `appdata/nexusstat`, adresář pro `nexusstat` | zatím jen v paměti |
 | stav hodin pro historii | bez `ProtectClock=` | blokoval by i dotaz `adjtimex` (`modes = 0`) |
 | OLED | `DeviceAllow=/dev/i2c-1 rw`, `SupplementaryGroups=i2c` | jen sběrnice 1 |
 | RGB | `DeviceAllow=/dev/spidev0.0 rw`, `SupplementaryGroups=spi` | bez `/dev/gpiomem*` a `/dev/gpiochip*`; vyžaduje-li je ovladač Adafruit (Blinka), raději malý ovladač nad systémovým `spidev` |
@@ -412,7 +413,7 @@ Zařízení jdou zpřístupnit přes `PrivateDevices=no` s `DevicePolicy=closed`
 
 Dashboard jen pro čtení běží v témže procesu a ukazuje výsledky jeho smyčky; nic neměří a nic nezapisuje. M7-S5 ho zapnul na `127.0.0.1:8765`, M7-S6 (rozhodnutí správce 2026-11-20) ho přesunul na adresu Nexusu v domácí LAN. Ta má na routeru rezervaci DHCP (potvrdil správce). Skutečná adresa a rozsah jsou jen v konfiguraci Nexusu, zde `<IP_NEXUSU>` a `<LAN_ROZSAH>`.
 
-Drop-in `/etc/systemd/system/nexusstat.service.d/10-web.conf`:
+Drop-in `/etc/systemd/system/nexusstat.service.d/10-web.conf` (od M7-S7 s `--config`; skutečný `ExecStart` služby):
 
 ```ini
 [Unit]
@@ -421,15 +422,45 @@ After=network-online.target
 
 [Service]
 ExecStart=
-ExecStart=/usr/bin/python3 -B -m nexusstat.run --web --web-bind <IP_NEXUSU> --web-allow <LAN_ROZSAH>
+ExecStart=/usr/bin/python3 -B -m nexusstat.run --config /etc/nexusstat/config.toml --web --web-bind <IP_NEXUSU> --web-allow <LAN_ROZSAH>
 IPAddressAllow=localhost <LAN_ROZSAH>
 ```
 
 - **`After=network-online.target`:** web je vázaný na adresu LAN. Bez přidělené adresy by start skončil kódem 2 a s ním i měření (bez restartu kvůli `RestartPreventExitStatus=2`); totéž po změně adresy, proto rezervace DHCP.
 - **Síť:** `IPAddressDeny=any` z hlavní jednotky platí dál, povolený je jen loopback a domácí LAN. UFW má jediné nové pravidlo `sudo ufw allow proto tcp from <LAN_ROZSAH> to <IP_NEXUSU> port 8765 comment 'NexusSTAT read-only web'`; výchozí politika (`deny` příchozí) a pravidlo SSH se nezměnily. Starší pravidlo pro dashboard Pironmanu (TCP 34001) zůstalo, ačkoli Pironman neběží.
 - **Ověřeno 2026-11-20** z notebooku v LAN: `GET /` 200, `HEAD /` 200, `/history` 200 („Historie je vypnutá“), `POST /` 405, `/admin` 403 („Administrace je vypnutá“), cizí hlavička `Host` 403 (M7-S5). Naslouchá jen `<IP_NEXUSU>:8765`, na loopbacku už ne. Hodnoty odpovídají měření a časy měření na stránce dokládají, že web sám neměří. SSH funguje, journal je bez chyb, 0 restartů.
-- **Kandidáti** jsou v `pre-m7-2026-11-20/`: `10-web.conf` (jen loopback) a `10-web-lan.conf` (LAN).
+- **Kandidáti** jsou v `pre-m7-2026-11-20/`: `10-web.conf` (jen loopback), `10-web-lan.conf` (LAN bez historie) a `10-web-lan-history.conf` (LAN s historií, aktivní).
 - **Rollback na loopback** (`P` = adresář zálohy): `sudo install -m 0644 "$P/10-web.conf" /etc/systemd/system/nexusstat.service.d/10-web.conf && sudo ufw delete allow proto tcp from <LAN_ROZSAH> to <IP_NEXUSU> port 8765 && sudo systemctl daemon-reload && sudo systemctl restart nexusstat.service`. Úplné vypnutí webu: smazat drop-in, `daemon-reload` a restart.
+
+### SQLite historie (M7-S7, běží)
+
+- **Konfigurace** `/etc/nexusstat/config.toml` (`root:nexusstat 0640`, adresář `0750`); vše ostatní výchozí (alarmy, služby, heartbeat, uživatelský stav, snímky vypnuté):
+
+```toml
+[collector]
+interval_seconds = 10
+
+[history]
+enabled = true
+path = "/srv/nexus/appdata/nexusstat/history/history.sqlite3"
+```
+
+- **Databáze** `/srv/nexus/appdata/nexusstat/history/history.sqlite3` na lokálním NVMe (ext4), schéma v1, role `development`, otisk tohoto stroje. Adresář `history/` je `nexusstat:nexusstat 0750`, soubory (`history.sqlite3`, `-wal`, `-shm`, `history.lock`) `0600`. Účet `nexusstat` má na `/srv/nexus/appdata` (0750, `mirek`) jen ACL `--x`. Databázi vytvořil existující `history.create_database()` pod účtem `nexusstat`; aplikace sama databázi nikdy nevytváří.
+- **Ověřeno 2026-11-20:** jediný zapisovač (jeden proces se třemi vlákny: smyčka, zapisovač, web; jediný řádek `Historie:` v journalu, zámek `history.lock`), synchronizace hodin doložená, `history.storage` od prvního zápisu `INFO`, journal bez chyb, 0 restartů. Za 60 s přibylo 36 vzorků (6 řad po 10 s, asi 52 tisíc denně), dávky po 60 s; po prvních minutách `sample` 49, `metric` 7, `check_change` 13, `event` 1. Velikost po 3 minutách: databáze 64 KiB, `-wal` asi 85 KiB, `-shm` 32 KiB. `/history` ukazuje šest grafů (CPU, teplota CPU, RAM, RX, TX, obsazenost ROOT) ze skutečných vzorků.
+- **Stav a velikost** (jen čtení, `-wal` a `-shm` patří k databázi):
+
+```bash
+cd / && sudo -u nexusstat env PYTHONPATH=/srv/nexus/projects/nexusstat/src python3 -B -m nexusstat.history info --no-integrity /srv/nexus/appdata/nexusstat/history/history.sqlite3
+```
+
+- **Postradatelná historie (rozhodnutí správce 2026-11-20):** denní snímky (`[history.snapshot]`) jsou vypnuté a živá databáze se nezálohuje. Při ztrátě nebo poškození: zastavit službu, adresář `history/` přesunout stranou (nikdy nemazat jen `-wal`), založit novou databázi stejným příkazem jako v M7-S7 a službu spustit.
+- **Rollback (služba bez historie, web v LAN zůstane):** `sudo install -m 0644 "$P/10-web-lan.conf" /etc/systemd/system/nexusstat.service.d/10-web.conf && sudo systemctl daemon-reload && sudo systemctl restart nexusstat.service`; databáze a konfigurace zůstanou.
+
+### Záloha Resticem: vyloučení živé historie (M7-S8)
+
+- Noční zálohovací skript hostitele (Restic, mimo repozitář NexusSTAT; cesta v soukromé dokumentaci Nexusu) zálohuje mimo jiné celý `/srv/nexus` a už dřív vylučoval živou databázi AnimeDB. Do stejného seznamu přibyl jediný řádek `--exclude /srv/nexus/appdata/nexusstat/history`; zálohované zdroje, ostatní vyloučení, časování, retence ani NAS se nezměnily.
+- **Ověřeno bez skutečné zálohy:** přesný diff (jediný přidaný řádek), `bash -n`, stejný vlastník a práva (`root:root 0750`) a `restic backup --dry-run` nad `appdata/nexusstat` do dočasného lokálního repozitáře bez NAS: 5 položek z `history/` bez vyloučení, 0 s vyloučením, ostatních 20 položek zůstalo. Úloha od změny neběžela, první noční běh s vyloučením je ten následující.
+- **Rollback:** kopie originálu leží vedle skriptu s příponou `.orig-m7s8` (`root:root 0640`); obnova `sudo install -m 0750 -o root -g root <skript>.orig-m7s8 <skript>`.
 
 ### InfluxDB
 
@@ -514,9 +545,9 @@ Přijímač na `mh42.cz` zatím neexistuje, takže heartbeat dnes nemá kam pos�
 - **Síť:** nejvýš 288 požadavků HTTPS denně; jedno hlášení na loopbacku asi 0,9 kB ven a 1,4 kB zpět (TLS 1.3, malý certifikát EC), se skutečným řetězcem certifikátů víc. Žádné opakování ani dohánění.
 - **Rollback:** `enabled = false` (nebo sekci odebrat) a restart; nic dalšího se nemění, žádná data se lokálně neukládají.
 
-## SQLite: provoz a zálohování (implementováno lokálně, na Nexusu nenasazeno)
+## SQLite: provoz a zálohování (implementováno; na Nexusu od M7-S7 bez snímků)
 
-Na Nexusu databáze NexusSTAT neexistuje. Návrh M2 je v `HISTORY.md` (schválený 2026-10-20 kromě R11, R13, R15 (odloženo do M7); nasazení neschváleno); lokálně je implementovaný v M3 a ověřený na notebooku nad dočasnými a vývojovými databázemi, na Nexusu se ověří až v M7 se schválením. Nic z toho dnes na serveru neexistuje.
+Na Nexusu od M7-S7 běží databáze NexusSTAT (viz SQLite historie v sekci Nexus); snímky jsou vypnuté a živá databáze je vyloučená z noční zálohy, protože historie je postradatelná (rozhodnutí správce 2026-11-20). Zbytek sekce popisuje plný návrh se snímky pro případ, že se zálohování historie později zapne. Návrh M2 je v `HISTORY.md` (schválený 2026-10-20 kromě R11, R13, R15 (odloženo do M7)); lokálně je implementovaný v M3 a ověřený na notebooku nad dočasnými a vývojovými databázemi. Na Nexusu běží jen živá databáze; snímky, generace ani test obnovy tam neexistují.
 
 - Umístění (návrh M2, uspořádání snímků podle M3.4a): živá databáze `/srv/nexus/appdata/nexusstat/history/history.sqlite3` s `-wal`, `-shm` a zámkem `history.lock`; rozpracované generace snímků v `snapshot-work/` (Restic nezálohuje) a hotové **neměnné generace** v `snapshot/<generace>/` (jméno = čas snímku), každá s `history-snapshot.sqlite3` a `history-snapshot.json` (identita generace, čas, SHA-256, velikost, počty řádků, schéma). Lokální SSD, nikdy NAS/CIFS: zamykání souborů přes síť není spolehlivé a výpadek NAS by zastavil zápis. Všechny adresáře vytváří správce, aplikace nikdy.
 - Režim WAL (`synchronous=FULL`, dávka 60 s): čtení webem neblokuje zápis. Soubory `-wal` a `-shm` patří k databázi. Viz [WAL](https://www.sqlite.org/wal.html).
