@@ -23,7 +23,7 @@ read-only kolektory          Core                            výstupy
                                                   kopie přes Backup API -> existující Restic
 
 Linux kernel/firmware -> hlavní CPU ventilátor (NexusSTAT jen čte jeho stav)
-Linux GPIO controller  -> boční ventilátory, až po samostatně ověřeném přechodu
+kernelový gpio-hog     -> boční ventilátory přes GPIO6 trvale HIGH (od M7-S2, NexusSTAT ani Pironman je neřídí)
 InfluxDB Pironmanu     -> NexusSTAT ji nepoužívá; vypnutí až po ověření dalších uživatelů
 ```
 
@@ -33,9 +33,9 @@ Podrobnosti skutečné instalace (názvy služeb, cesty mountů, výsledky inven
 
 - Raspberry Pi 5, Debian 13, ARM64.
 - Referenční verze Pironman 5 1.3.20 (pm_auto 2.0.6), služba `pironman5.service`. V jejím procesu běží moduly ventilátorů, OLED a RGB (`FanAddon`, `OLEDAddon`, `WS2812Addon`), které má NexusSTAT postupně nahradit.
-- Boční ventilátory řídí Pironman přes GPIO6 v režimu Always On; kernelový `gpio-hog` je jen návrh, není aktivovaný. Read-only inventura M7-S1 (2026-11-20): Pironman drží GPIO6 přes lgpio a při svém zastavení ho vypíná; jeho RGB i vypnuté každou sekundu zapisuje na SPI0 a tlačítko drží výhradním grabem evdev. Vypnutí Pironmanu je proto zatím BLOCKER (GPIO6, tlačítko). Podrobnosti a návrh hogu v `OPERATIONS.md` (Nexus po M7-S1).
+- Boční ventilátory drží od M7-S2 (2026-11-20) v úrovni HIGH kernelový gpio-hog na GPIO6 (`dtoverlay=gpio-hog,gpio=6`), nezávisle na Pironmanu i NexusSTAT; dřív je Pironman řídil přes lgpio a při svém zastavení vypínal (inventura M7-S1). Pironman je zastavený a zakázaný, takže jeho OLED, RGB a tlačítko nefungují; NexusSTAT běží od M7-S3 jako služba systemd jen s read-only měřením. Podrobnosti v `OPERATIONS.md` (Nexus: nasazení M7-S1 až M7-S3).
 - Hostitel zálohuje Resticem na NAS a NAS je připojený síťovými mounty; metadata mountu samy nezaručují online dostupnost NAS.
-- AnimeDB zatím na Nexusu neběží.
+- AnimeDB: inventura M7-S1 našla na Nexusu jednotky AnimeDB (`anime-db.service` běží), ačkoli se dřív uvádělo, že tam není; NexusSTAT ji nesleduje (healthcheck SERVICES-1 vypnutý). Vyjasní správce.
 
 ## Datový kontrakt (návrh)
 
@@ -51,11 +51,11 @@ NexusSTAT má převzít aplikační funkce Pironmanu po jednotlivých funkcích.
 
 | Funkce Pironmanu | Cíl v NexusSTAT | Stav dnes | Podmínka převzetí |
 | --- | --- | --- | --- |
-| Systémový monitoring | `system_monitor`, smyčka měření, alarmy | read-only kolektor a smyčka na notebooku | ověření na RPi 5 (M7) |
-| OLED (`OLEDAddon`) | `oled`, `oled_text`, `render` + ovladač SSD1306 (Adafruit) | jen simulace | HW test displeje; Pironman ho v té době nesmí ovládat |
-| RGB (`WS2812Addon`) | rozhodovací logika RGB oddělená od ovladače (Adafruit NeoPixel SPI), chování schválené 2026-10-23 | jen schválený návrh | jediný vlastník LED: RGB Pironmanu vypnuté jeho konfigurací bez zastavení služby, HW test, rollback |
-| Tlačítko | obsluha události Linux input | nic | ověření `systemd-logind` a `evdev` grabu |
-| Ventilátory (`FanAddon`) | hlavní CPU ventilátor: Linux řídí, NexusSTAT čte; boční: nezávislé řízení (návrh gpio-hog) + monitoring | hlavní CPU ventilátor read-only jen lokálně (M4-1), boční nic | fyzicky ověřené nezávislé řízení bočních ventilátorů s rollbackem |
+| Systémový monitoring | `system_monitor`, smyčka měření, alarmy | od M7-S3 služba systemd na Nexusu (read-only, výpis do journalu) | ověření po restartu RPi |
+| OLED (`OLEDAddon`) | `oled`, `oled_text`, `render` + ovladač SSD1306 (Adafruit) | jen simulace; od vypnutí Pironmanu (M7-S2) displej zhasnutý | HW test displeje; Pironman vypnutý |
+| RGB (`WS2812Addon`) | rozhodovací logika RGB oddělená od ovladače (Adafruit NeoPixel SPI), chování schválené 2026-10-23 | jen schválený návrh; LED zhasnuté, neovládá je nic | jediný vlastník LED: Pironman vypnutý (M7-S2), HW test, rollback |
+| Tlačítko | obsluha události Linux input | pravidlo udev 71: logind `pwr_button` nesleduje, krátký stisk bez akce (M7-S2); obsluha nic | obsluha s výhradním grabem, rozhodnutí o dlouhém stisku |
+| Ventilátory (`FanAddon`) | hlavní CPU ventilátor: Linux řídí, NexusSTAT čte; boční: nezávislé řízení kernelovým gpio-hog + monitoring | hlavní CPU ventilátor read-only i na Nexusu (M7-S3), boční drží gpio-hog (M7-S2) | splněno: oba boční fyzicky ověřené 2026-11-20 po restartu i po zastavení Pironmanu |
 | Historie (InfluxDB) | SQLite na lokálním SSD | implementováno lokálně (M3), nenasazeno | ověřená záloha a obnova na Nexusu (M7) |
 | Webový dashboard | lokální web NexusSTAT (dashboard M6-1 a historie M6-2 jen na `127.0.0.1`) | nic | bezpečnostní review LAN, admin PIN pro změny, schválení firewallu (M6) |
 
@@ -163,7 +163,7 @@ OledController.mode po update(now) ->      |  Signal: OFF | WHITE | CODES(sekven
 
 - Pironman zůstává v provozu a má RGB pod svou kontrolou až do samostatně schváleného bezpečného převzetí. Ovladač RGB je ve výchozím stavu vypnutý a zapne se až po ověřeném vypnutí RGB Pironmanu jeho vlastní konfigurací, bez zastavení `pironman5.service`, který dál řídí boční ventilátory. Druhého zapisovatele na SPI NexusSTAT spolehlivě nepozná, proto rozhoduje postup, ne detekce.
 - Před převzetím read-only ověřit, jak Pironman LED ovládá (zařízení, zapojení, konfigurace). Bez schválení žádná změna `config.txt`, overlayů, oprávnění ani služeb.
-- **M7-S1 (2026-11-20):** ověřeno read-only, že WS2812 Pironmanu s `rgb_enable=false` dál každou sekundu posílá černou na SPI0. Vypnutí vlastní konfigurací proto jediného vlastníka LED nezajistí a převzetí RGB vyžaduje zastavený Pironman, tedy nejdřív nezávislé řízení bočních ventilátorů. Čeká na rozhodnutí správce.
+- **M7-S1 (2026-11-20):** ověřeno read-only, že WS2812 Pironmanu s `rgb_enable=false` dál každou sekundu posílá černou na SPI0. Vypnutí vlastní konfigurací proto jediného vlastníka LED nezajistí a převzetí RGB vyžaduje zastavený Pironman, tedy nejdřív nezávislé řízení bočních ventilátorů. M7-S2 (2026-11-20): Pironman je zastavený, LED nikdo neovládá a převzetí RGB čeká na ovladač NexusSTAT.
 - **Provozní omezení:** ovladač zhasne LED při inicializaci a korektním vypnutí, ale WS2812 po pádu procesu drží poslední barvu a pouhé ukončení aplikace to neodstraní. Svit LED po pádu NexusSTAT proto nic nedokládá; hardwarový watchdog ani další elektronika se nenavrhují.
 - Návrat: vypnout RGB v NexusSTAT a vrátit konfiguraci RGB Pironmanu ze zálohy.
 

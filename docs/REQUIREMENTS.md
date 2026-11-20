@@ -6,14 +6,15 @@
 
 Lokální diagnostika a stavová signalizace Nexusu (systém, NVMe, NAS, Restic, služby, později AnimeDB; Docker se samostatně nesleduje, rozhodnutí správce 2026-10-31). **Cílem je nahradit aplikační software Pironman 5 vlastním NexusSTAT**, ne ho trvale provozovat vedle Pironmanu; hardwarové ochranné funkce a chlazení přitom nesmí utrpět (viz Náhrada Pironmanu 5). Žádná povinná cloudová závislost.
 
-## Náhrada Pironmanu 5 (schválený cíl, zatím neimplementováno)
+## Náhrada Pironmanu 5 (schválený cíl, rozpracováno: od M7-S3 jen monitoring na Nexusu)
 
 - NexusSTAT postupně převezme aplikační funkce Pironman 5: systémový monitoring, obrazovky OLED, signalizaci RGB, obsluhu dostupných funkcí fyzického tlačítka, monitoring ventilátorů, historii naměřených hodnot a lokální webové rozhraní.
-- Dnes existuje jen lokální vývoj na notebooku (offline simulace OLED, read-only kolektory systému, sítě a CPU FAN, lokální SQLite historie). Na Nexusu nic neběží a Pironman dál plní všechny své funkce.
+- Od 2026-11-20 (M7-S2, M7-S3) běží na Nexusu NexusSTAT jako služba systemd jen s read-only měřením do journalu. Pironman je zastavený a zakázaný (neodinstalovaný) a oba boční ventilátory drží kernelový gpio-hog na GPIO6. OLED, RGB, tlačítko, historie a web NexusSTAT na Nexusu zatím neběží, takže tyto funkce tam do převzetí chybí. Ostatní (offline simulace OLED, lokální SQLite historie, web) existuje jen na notebooku.
 - Hardwarové ochranné mechanismy Raspberry Pi (firmware, teplotní omezování výkonu, nouzové vypnutí při přehřátí) se neodstraňují ani neobcházejí.
 - Hlavní CPU ventilátor dál bezpečně řídí Linux (kernel/firmware); NexusSTAT ho jen čte.
 - Oba boční ventilátory Pironmanu musí mít před vypnutím původního softwaru bezpečně ověřené nezávislé řízení (fyzická kontrola, teplotní dohled, rollback).
 - Pironman se nevypne, dokud není ověřené předání všech potřebných funkcí. Převzetí probíhá po jednotlivých funkcích, ne najednou.
+- **Rozhodnutí správce 2026-11-20 (M7-S2):** Pironman je zastavený a zakázaný už po fyzicky ověřeném nezávislém chlazení bočních ventilátorů; dočasná ztráta OLED, RGB a tlačítka je vědomě přijatá, InfluxDB zůstává v provozu.
 - Návrat k původnímu softwaru musí zůstat možný: při přechodu se Pironman nejdřív jen zastaví a zakáže, neodinstaluje se, a jeho konfigurace se předem zálohuje.
 
 ## Historie a databáze SQLite (schválený směr; implementováno lokálně v M3, nenasazeno)
@@ -377,7 +378,8 @@ Dashboard a historie zůstávají **bez přihlášení a jen pro čtení**. Výc
 - Fyzický `pwr_button` je událost Linux input zařízení, nikoliv libovolný GPIO pin. Číslo zařízení `/dev/input/eventN` se může lišit a není trvalý kontrakt.
 - Návrh krátkého/dlouhého stisku pro řízené vypnutí je **neuzavřený do HW testů**. Dlouhé 10s gesto reboot se **neimplementuje**, může kolidovat s hardwarovým vypnutím.
 - Ovládání tlačítka při přechodu ověřit proti `systemd-logind` a přítomnosti exkluzivního `evdev` grabu.
-- **M7-S1 (read-only, 2026-11-20):** tlačítko (`pwr_button`, jen `KEY_POWER`) dnes drží Pironman výhradním grabem (krátký stisk OLED, podržení 2–5 s a puštění vypne systém, po déle než 5 s nic). Bez grabu ho obslouží logind s `HandlePowerKey=poweroff`, takže po zastavení Pironmanu nebo pádu budoucího ovladače krátký stisk systém vypne: pro vypnutí Pironmanu **BLOCKER**. Návrh ochrany v `OPERATIONS.md` (Nexus po M7-S1), chování po převzetí rozhodne správce.
+- **M7-S2 (2026-11-20):** pravidlo `/etc/udev/rules.d/71-nexusstat-pwr-button.rules` odebírá tag `power-switch` jen zařízení `pwr_button`; logind ho od restartu nesleduje (ostatní zařízení s tagem beze změny) a Pironman je vypnutý, takže krátký stisk teď v Linuxu nic neudělá. Obsluha krátkého a dlouhého stisku v NexusSTAT zatím není.
+- **M7-S1 (read-only, 2026-11-20):** tlačítko (`pwr_button`, jen `KEY_POWER`) tehdy držel Pironman výhradním grabem (krátký stisk OLED, podržení 2–5 s a puštění vypne systém, po déle než 5 s nic). Bez grabu ho obslouží logind s `HandlePowerKey=poweroff`, takže po zastavení Pironmanu nebo pádu budoucího ovladače krátký stisk systém vypne: pro vypnutí Pironmanu **BLOCKER**. Návrh ochrany v `OPERATIONS.md` (Nexus: nasazení M7-S1 až M7-S3), chování po převzetí rozhodne správce.
 
 ## RGB LED a potvrzování závad (schválený návrh 2026-10-23; lokálně rozhodovací logika, simulace v náhledu a od M6-4A trvalý stav)
 
@@ -454,7 +456,7 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 
 ### Bezpečnost hardwaru a převzetí od Pironmanu
 
-- Pironman zůstává v provozu a má RGB pod svou kontrolou až do samostatně schváleného bezpečného převzetí. LED smí ovládat vždy jen jeden program; NexusSTAT je neotevře, dokud je ovládá Pironman (`WS2812Addon`). Souběžný zápis dvou programů nejde spolehlivě odhalit, proto rozhoduje ověřený postup, ne automatická detekce.
+- Pironman zůstává v provozu a má RGB pod svou kontrolou až do samostatně schváleného bezpečného převzetí. **M7-S2 (2026-11-20):** Pironman je zastavený, LED teď neovládá žádný program a jsou zhasnuté; ovladač RGB NexusSTAT zatím není. LED smí ovládat vždy jen jeden program; NexusSTAT je neotevře, dokud je ovládá Pironman (`WS2812Addon`). Souběžný zápis dvou programů nejde spolehlivě odhalit, proto rozhoduje ověřený postup, ne automatická detekce.
 - Převzetí RGB nesmí zastavit Pironman jako celek, dokud nejsou ověřené boční ventilátory: RGB Pironmanu se vypne jen jeho vlastní konfigurací, jinak až při celkovém přechodu (M7). Konkrétní volbu Pironmanu i zapojení LED (předpoklad SPI pro Adafruit NeoPixel SPI) je nutné nejdřív ověřit read-only.
 - **M7-S1 (read-only, 2026-11-20):** LED jsou na SPI0 (`/dev/spidev0.0`, MOSI GPIO10) a RGB Pironmanu je vypnuté (`rgb_enable=false`), jeho WS2812 ale i tak každou sekundu posílá černou. Vypnutí vlastní volbou Pironmanu proto jediného vlastníka LED nezajistí; RGB půjde převzít až se zastaveným Pironmanem, tedy po ověřeném nezávislém řízení bočních ventilátorů. Rozhodnutí správce čeká.
 - Budoucí ovladač RGB bude ve výchozím stavu vypnutý a při inicializaci i korektním vypnutí odešle zhasnutí všech LED. Selhání LED nesmí zastavit měření, alarmy, OLED ani historii. Návrat: vypnout RGB v NexusSTAT a vrátit původní nastavení RGB Pironmanu.
@@ -473,10 +475,10 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 ## Ventilátory
 
 - Hlavní PWM ventilátor CPU ponechat stávající linuxové regulaci.
-- Oba boční ventilátory nyní ovládá Pironman přes GPIO6 v režimu Always On (`gpio_fan_mode=0`); GPIO6 bylo při read-only kontrole `HIGH`. Kernelový gpio-hog je **návrh**, není nasazen ani fyzicky otestován.
-- **M7-S1 (read-only, 2026-11-20):** GPIO6 je výstup HIGH s konzumentem `lg` (lgpio v procesu Pironmanu), jiné řízení ani gpio-hog neexistuje. Pironman při zastavení GPIO6 výslovně vypíná a při startu ho nejdřív nastaví LOW, takže samotné zastavení `pironman5.service` boční ventilátory zastaví: pro vypnutí Pironmanu **BLOCKER**. Konkrétní návrh hogu a rollback: `OPERATIONS.md` (Nexus po M7-S1).
+- Do 2026-11-20 ovládal oba boční ventilátory Pironman přes GPIO6 v režimu Always On (`gpio_fan_mode=0`). **Od M7-S2 (2026-11-20)** drží GPIO6 v úrovni HIGH kernelový gpio-hog (`dtoverlay=gpio-hog,gpio=6`, konzument `hog`), nezávisle na Pironmanu i NexusSTAT; oba ventilátory správce fyzicky ověřil po restartu i po zastavení Pironmanu.
+- **M7-S1 (read-only, 2026-11-20):** GPIO6 byl výstup HIGH s konzumentem `lg` (lgpio v procesu Pironmanu), jiné řízení ani gpio-hog neexistovalo. Pironman při zastavení GPIO6 výslovně vypíná a při startu ho nejdřív nastaví LOW, takže samotné zastavení `pironman5.service` boční ventilátory zastaví: pro vypnutí Pironmanu **BLOCKER**. Konkrétní návrh hogu a rollback: `OPERATIONS.md` (Nexus: nasazení M7-S1 až M7-S3).
 - **M7-S1, CPU FAN:** historie Pironmanu obsahuje za 30 dní 309 osamocených nenulových vzorků (asi 10 denně; 3218, 3280, 3401 a 3528 RPM) při 26,5–38,6 °C, tedy pod prvním trip pointem (nejspíš falešné pulzy tachometru, fyzicky neověřeno). Samotné RPM > 0 proto zatím nedokládá otáčení; pravidlo potvrzení je otevřený bod.
-- Nezastavovat Pironman, dokud není schválené a ověřené předání řízení ventilátorů a tlačítka.
+- Nezastavovat Pironman, dokud není schválené a ověřené předání řízení ventilátorů a tlačítka. Splněno pro ventilátory (M7-S2); u tlačítka zabraňuje nechtěnému vypnutí pravidlo udev 71 (viz Tlačítko), jeho obsluha v NexusSTAT zbývá.
 - Monitoring ventilátorů: CPU FAN read-only je od M4-1 implementovaný lokálně (`fan_monitor.py`, čtvrtý řádek stránky SYSTEM), na Raspberry Pi 5 neověřený. U bočních ventilátorů se nejdřív ověří, zda vůbec poskytují otáčky; bez tachometru lze jejich stav nanejvýš odvodit z řídicího signálu, a i jeho čtení (GPIO) vyžaduje samostatné schválení.
 
 ## Web / přístup
