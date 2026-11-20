@@ -1,9 +1,8 @@
 """Odchozí HTTPS heartbeat pro veřejný web (M6-5): jen celkový stav a čas.
 
 Veřejný stav počítají stávající pravidla (complete_service_results, effective
-v overall_state) nad výsledky měřicí smyčky. Jediný rozdíl proti lokálnímu
-webu a OLED: NEXUS, který zatím nemá vlastní kontrolu a je jen doplněné
-UNKNOWN, se nezapočítá (jinak by zdravý systém nikdy nebyl OK). Zapnutá
+v overall_state) nad výsledky měřicí smyčky, stejně jako souhrn lokálního webu
+a OLED: NEXUS bez vlastní kontroly je N/A a nepočítá se (M7-S9A). Zapnutá
 kontrola bez výsledku a prošlý výsledek jsou UNKNOWN, vypnuté (N/A) se
 nepočítají, INFO i OK jsou veřejně OK. Potvrzení závad veřejný stav nemění
 a simulovaná data nikdy nejsou OK.
@@ -41,7 +40,7 @@ from socket import SHUT_RDWR
 from urllib.parse import urlsplit
 
 from .core import CheckResult, State, overall_state
-from .services import NEXUS_SERVICES_ID, SERVICE_LABELS, complete_service_results
+from .services import SERVICE_LABELS, complete_service_results
 
 FIRST_DELAY_SECONDS = 60
 INTERVAL_SECONDS = 300
@@ -66,15 +65,13 @@ def public_state(results, now, observed_utc, monitored, validity_seconds):
 
     `results` jsou výsledky taktu smyčky, `monitored` id kontrol zapnutých
     kolektorů (labels). Služby doplní complete_service_results stejně jako na
-    lokálním webu (zapnutá bez výsledku UNKNOWN, vypnutá N/A); vynechá se jen
-    NEXUS doplněný bez vlastní kontroly. Pro ostatní sledované kontroly platí
+    lokálním webu (zapnutá bez výsledku UNKNOWN, vypnutá a NEXUS bez kontroly
+    N/A, která se nepočítá). Pro ostatní sledované kontroly platí
     totéž: chybí-li výsledek, počítá se UNKNOWN (pojistka, kolektory dnes vždy
     vracejí všechny své kontroly).
     """
-    present = {result.id for result in results}
     expires = now + validity_seconds
-    counted = [result for result in complete_service_results(results, observed_utc, expires, monitored=monitored)
-               if result.id != NEXUS_SERVICES_ID or result.id in present]
+    counted = complete_service_results(results, observed_utc, expires, monitored=monitored)
     seen = {result.id for result in counted}
     counted += [CheckResult(check_id, State.UNKNOWN, "bez dat", observed_utc, expires, simulated=False)
                 for check_id in sorted(set(monitored) - seen - set(SERVICE_LABELS))]

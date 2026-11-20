@@ -9,6 +9,7 @@ from nexusstat.core import (
     effective,
     has_monitor_data,
     overall_state,
+    summary_state,
 )
 
 OBSERVED = datetime(2026, 10, 19, 10, 0, tzinfo=timezone.utc)
@@ -119,6 +120,39 @@ class OverallStateTest(unittest.TestCase):
     def test_expired_error_with_valid_ok_is_unknown(self):
         results = [result("a", State.ERROR, expires=5), result("b", State.OK)]
         self.assertEqual(overall_state(results, now=10), State.UNKNOWN)
+
+
+class SummaryStateTest(unittest.TestCase):
+    """Souhrn pro web a OLED (M7-S9A): jen platné INFO a OK je OK, jinak jako overall_state."""
+
+    def summary(self, *results, now=10):
+        return summary_state(list(results), now)
+
+    def test_valid_info_and_ok_is_ok(self):
+        self.assertIs(self.summary(result("cpu", State.INFO), result("ram", State.INFO)), State.OK)
+        self.assertIs(self.summary(result("cpu", State.INFO), result("backup", State.OK),
+                                   result("nexus", State.NA)), State.OK)
+
+    def test_unknown_and_faults_keep_their_order(self):
+        self.assertIs(self.summary(result("cpu", State.INFO), result("net", State.UNKNOWN)), State.UNKNOWN)
+        self.assertIs(self.summary(result("disk", State.ERROR), result("net", State.UNKNOWN)), State.ERROR)
+        self.assertIs(self.summary(result("a", State.WARNING), result("b", State.CRITICAL), result("c", State.ERROR)),
+                      State.CRITICAL)
+
+    def test_nothing_monitored_is_unknown(self):
+        self.assertIs(self.summary(), State.UNKNOWN)
+        self.assertIs(self.summary(result("a", State.NA), result("b", State.NA)), State.UNKNOWN)
+
+    def test_expired_measurement_is_unknown(self):
+        # Zastavená smyčka se nesmí tvářit jako zdravý server.
+        self.assertIs(self.summary(result("cpu", State.INFO, expires=5)), State.UNKNOWN)
+        self.assertIs(self.summary(result("cpu", State.INFO, expires=5), result("ram", State.INFO)), State.UNKNOWN)
+
+    def test_individual_results_keep_info(self):
+        results = [result("cpu", State.INFO), result("ram", State.INFO)]
+        self.assertIs(summary_state(results, 10), State.OK)
+        self.assertIs(overall_state(results, 10), State.INFO)  # výpis smyčky beze změny
+        self.assertEqual([r.state for r in results], [State.INFO, State.INFO])
 
 
 class MeasurementTest(unittest.TestCase):

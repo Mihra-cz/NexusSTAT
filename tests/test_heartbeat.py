@@ -28,7 +28,7 @@ from unittest import mock
 from nexusstat import heartbeat, rgb
 from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmsConfig, CollectorConfig, ConfigError, HeartbeatConfig, load_config
-from nexusstat.core import CheckResult, State, overall_state
+from nexusstat.core import CheckResult, State, summary_state
 from nexusstat.heartbeat import (Heartbeat, HeartbeatError, client_context, encode_report, load_secret,
                                  public_state, sign)
 from nexusstat.network_monitor import ADDRESS, INTERFACE, IPV4_ID
@@ -72,11 +72,14 @@ class PublicStateTest(unittest.TestCase):
 
     def test_healthy_with_unimplemented_nexus_is_ok(self):
         self.assertEqual(self.state(healthy()), "OK")
-        # Lokální web a OLED počítají s doplněným NEXUS (UNKNOWN); rozdíl je jen tento a je dokumentovaný.
-        local = overall_state(complete_service_results(healthy(), UTC, 100.0, monitored=MONITORED), 50.0)
-        self.assertEqual(local, State.UNKNOWN)
+        # M7-S9A: lokální web a OLED mají stejný souhrn (NEXUS bez kolektoru N/A), žádný rozdíl.
+        completed = complete_service_results(healthy(), UTC, 100.0, monitored=MONITORED)
+        self.assertIs(summary_state(completed, 50.0), State.OK)
+        self.assertIs({r.id: r for r in completed}[NEXUS_SERVICES_ID].state, State.NA)
         # Skutečný výsledek NEXUS (budoucí kolektor) se už započítá.
         self.assertEqual(self.state(healthy() + [result(NEXUS_SERVICES_ID, State.WARNING)]), "WARNING")
+        # Zapnutý kolektor NEXUS bez výsledku je i veřejně UNKNOWN, ne OK.
+        self.assertEqual(self.state(healthy(), MONITORED | {NEXUS_SERVICES_ID}), "UNKNOWN")
 
     def test_mapping(self):
         cases = {

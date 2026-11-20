@@ -179,8 +179,8 @@ def run_live(output_dir, config):
             break
         time.sleep(LIVE_TICK_SECONDS)
         taken += LIVE_TICK_SECONDS
-    # Kolektor NEXUS zatím není: je UNKNOWN (bez dat) na všech obrazovkách.
-    # AnimeDB, NAS a BACKUP jsou N/A, ledaže je zapnutá jejich kontrola.
+    # Kolektor NEXUS zatím není: je N/A jako AnimeDB, NAS a BACKUP bez zapnuté
+    # kontroly (M7-S9A) a do symbolu NEXUS ani STATUS se nepočítá.
     results = complete_service_results(results, observed_utc, now + config.collector.validity_seconds,
                                        monitored=monitor.labels)
     for result in results:

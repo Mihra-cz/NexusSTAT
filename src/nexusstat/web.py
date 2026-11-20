@@ -52,7 +52,7 @@ from socket import SHUT_RDWR
 from urllib.parse import parse_qs
 
 from .config import DISK_INTERVAL_SECONDS
-from .core import Measurement, State, active_problems, effective, has_monitor_data, overall_state
+from .core import Measurement, State, active_problems, effective, has_monitor_data, summary_state
 from .history_charts import CHART_CHECKS, DEFAULT_RANGE, RANGES, ChartError, Series
 from .mounts import ROOT_MODE_ID
 from .network_monitor import IPV4_ID, LINK_ID, RX_RATE_ID, TX_RATE_ID
@@ -229,7 +229,7 @@ def render_page(board, now, admin=False):
         if age >= board.validity_seconds:
             updated += " Smyčka se neozývá: hodnoty jsou zastaralé."
     current = {result.id: effective(result, now) for result in results}
-    overall = overall_state(results, now)
+    overall = summary_state(results, now)
     problems = active_problems(results, now)
     if problems:
         items = "".join(f"<li>{badge(problem.state)} {esc(status_texts(problem, now)[0])}</li>" for problem in problems)

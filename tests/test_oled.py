@@ -10,7 +10,7 @@ from unittest import mock
 from nexusstat import simulate
 
 from nexusstat.config import OledConfig
-from nexusstat.core import CheckResult, State, active_problems, effective, has_monitor_data
+from nexusstat.core import CheckResult, State, active_problems, effective, has_monitor_data, summary_state
 from nexusstat.oled import (
     ALERT_SYMBOL,
     CAROUSEL_PAGES,
@@ -317,36 +317,52 @@ def problem_states(results, now=10):
 class ServiceConsistencyTest(unittest.TestCase):
     """SERVICES, symbol na stránce NEXUS a STATUS vycházejí ze stejných výsledků."""
 
-    def test_completion_adds_unknown_and_na(self):
+    def test_completion_adds_na_and_unknown_only_for_monitored(self):
         added = complete_service_results([], OBSERVED, 30)
+        # M7-S9A: NEXUS bez vlastního kolektoru je N/A jako vypnuté služby, ne umělé UNKNOWN.
         self.assertEqual([(r.id, r.state) for r in added], [
-            (NEXUS_SERVICES_ID, State.UNKNOWN), (ANIMEDB_ID, State.NA), (NAS_ID, State.NA), (BACKUP_ID, State.NA),
+            (NEXUS_SERVICES_ID, State.NA), (ANIMEDB_ID, State.NA), (NAS_ID, State.NA), (BACKUP_ID, State.NA),
         ])
+        self.assertEqual(added[0].summary, "NEXUS: samostatná kontrola není implementovaná")
         # Od SERVICES-2 je NAS volitelná služba: bez zapnutého sledování N/A, se zapnutým UNKNOWN.
         self.assertEqual(added[2].summary, "NAS: sledování vypnuto")
         monitored = complete_service_results([], OBSERVED, 30, monitored={NAS_ID})
         self.assertEqual((monitored[2].state, monitored[2].summary), (State.UNKNOWN, "NAS: bez dat"))
+        # Budoucí zapnutý kolektor NEXUS bez výsledku zůstává UNKNOWN, nikdy N/A.
+        nexus = complete_service_results([], OBSERVED, 30, monitored={NEXUS_SERVICES_ID})
+        self.assertEqual((nexus[0].state, nexus[0].summary), (State.UNKNOWN, "NEXUS: bez dat"))
         # Doplněné výsledky tvrdí jen skutečnost (data nejsou), proto nejsou simulované a nemají hodnotu.
         self.assertFalse(any(result.simulated for result in added))
         self.assertEqual({result.measurement for result in added}, {None})
 
-    def test_unmonitored_services_are_unknown_on_all_screens(self):
+    def test_healthy_system_without_nexus_collector_has_no_false_unknown(self):
         # Skutečný režim dnes: systém měřený bez závady, NEXUS nemá kolektor,
-        # AnimeDB, NAS a zálohy mají sledování ve výchozím stavu vypnuté.
+        # AnimeDB, NAS a zálohy mají sledování ve výchozím stavu vypnuté (M7-S9A).
         results = complete_service_results(real_system_results(), OBSERVED, 30)
         self.assertEqual(service_rows(results, 10),
-                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
-        self.assertEqual(home_symbol(results, 10), UNKNOWN_SYMBOL)  # "?", ne trojúhelník
-        self.assertEqual(problem_states(results), {NEXUS_SERVICES_ID: State.UNKNOWN})
-        # UNKNOWN není potvrzená závada.
-        self.assertFalse(any(state in (State.WARNING, State.ERROR, State.CRITICAL) for state in problem_states(results).values()))
+                         [("NEXUS", "N/A"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
+        self.assertIsNone(home_symbol(results, 10))  # žádné "?" ani trojúhelník
+        self.assertEqual(problem_states(results), {})  # žádné NEXUS NO DATA ve STATUS
+        self.assertIs(summary_state(results, 10), State.OK)
 
-    def test_nexus_is_never_ok_without_healthcheck(self):
+    def test_nexus_without_collector_is_na_never_ok(self):
         for results in ([], real_system_results(), real_system_results(State.OK)):
             completed = complete_service_results(results, OBSERVED, 30)
             with self.subTest(results=len(results)):
-                self.assertEqual(service_rows(completed, 10)[0], ("NEXUS", "UNKN"))
-                self.assertIs(problem_states(completed)[NEXUS_SERVICES_ID], State.UNKNOWN)
+                self.assertEqual(service_rows(completed, 10)[0], ("NEXUS", "N/A"))
+                self.assertNotIn(NEXUS_SERVICES_ID, problem_states(completed))
+        # Bez skutečných měření zůstává souhrn UNKNOWN: samotné N/A nejsou data ani OK.
+        nothing = complete_service_results([], OBSERVED, 30)
+        self.assertFalse(has_monitor_data(nothing))
+        self.assertIs(summary_state(nothing, 10), State.UNKNOWN)
+        self.assertEqual(home_symbol(nothing, 10), UNKNOWN_SYMBOL)
+
+    def test_real_nexus_result_has_priority(self):
+        results = complete_service_results(real_system_results() + [service(NEXUS_SERVICES_ID, State.ERROR)],
+                                           OBSERVED, 30)
+        self.assertEqual(service_rows(results, 10)[0], ("NEXUS", "ERR"))
+        self.assertEqual(problem_states(results), {NEXUS_SERVICES_ID: State.ERROR})
+        self.assertEqual(home_symbol(results, 10), ALERT_SYMBOL)
 
     def test_unmonitored_animedb_is_na_without_alarm(self):
         results = complete_service_results(real_system_results(), OBSERVED, 30)
@@ -362,11 +378,13 @@ class ServiceConsistencyTest(unittest.TestCase):
         self.assertEqual(active_problems(only_na, 10), [])
 
     def test_confirmed_fault_has_priority_over_unknown(self):
-        results = complete_service_results(real_system_results() + [service(BACKUP_ID, State.WARNING)], OBSERVED, 30)
+        # Zapnuté sledování NAS bez výsledku je skutečné UNKNOWN a zůstává vidět.
+        results = complete_service_results(real_system_results() + [service(BACKUP_ID, State.WARNING)], OBSERVED, 30,
+                                           monitored={NAS_ID, BACKUP_ID})
         self.assertEqual(home_symbol(results, 10), ALERT_SYMBOL)  # trojúhelník má přednost před "?"
         problems = active_problems(results, 10)
         self.assertEqual([(p.id, p.state) for p in problems],
-                         [(BACKUP_ID, State.WARNING), (NEXUS_SERVICES_ID, State.UNKNOWN)])
+                         [(BACKUP_ID, State.WARNING), (NAS_ID, State.UNKNOWN)])
         self.assertEqual(service_rows(results, 10)[3], ("BACKUP", "WARN"))
 
     def test_existing_results_are_kept(self):
@@ -442,7 +460,7 @@ class SimulatorScenarioTest(unittest.TestCase):
             simulate.main(["/neexistujici-vystup", "--live"])
         lines = {line.split()[0]: line.split()[1] for line in output.getvalue().splitlines()}
         self.assertEqual({service_id: lines[service_id] for service_id in SERVICE_LABELS}, {
-            NEXUS_SERVICES_ID: "UNKNOWN", ANIMEDB_ID: "N/A", NAS_ID: "N/A", BACKUP_ID: "N/A",
+            NEXUS_SERVICES_ID: "N/A", ANIMEDB_ID: "N/A", NAS_ID: "N/A", BACKUP_ID: "N/A",
         })
         identify.assert_called_once_with()  # zařízení ROOT jednou za běh, ne pro každý snímek
         self.assertEqual(lines["root_device"], "INFO")

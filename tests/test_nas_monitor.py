@@ -459,8 +459,9 @@ class DisplayAndRgbTest(unittest.TestCase):
                     self.assertEqual(signal.steps, ((State.ERROR, 2),))
                     self.assertEqual(symbol, ALERT_SYMBOL)
                 else:
-                    # NEXUS nemá kolektor (UNKNOWN), proto "?" i při dostupném NAS.
-                    self.assertEqual(symbol, UNKNOWN_SYMBOL)
+                    # M7-S9A: NEXUS bez kolektoru je N/A. "?" jen při skutečně neznámém stavu služby,
+                    # jinak bez symbolu, stejně jako bílé LED ve zdravém stavu.
+                    self.assertEqual(symbol, UNKNOWN_SYMBOL if row == "UNKN" else None)
 
     def test_status_texts_fit_and_offline_only_for_confirmed_outage(self):
         outage = run_checks(REFUSED, REFUSED, REFUSED, ACCEPTED)
@@ -499,9 +500,9 @@ class DisplayAndRgbTest(unittest.TestCase):
         states = {r.id: r.state for r in measured}
         self.assertEqual((states[ANIMEDB_ID], states[NAS_ID]), (State.ERROR, State.ERROR))
         results = complete_service_results(measured, OBSERVED, now + VALIDITY, monitored=collectors.labels)
-        # Potvrzené výpadky první; NEXUS bez kolektoru za nimi jako UNKNOWN.
+        # Jen skutečné potvrzené výpadky; NEXUS bez kolektoru je N/A a do STATUS nepatří (M7-S9A).
         self.assertEqual([status_texts(p, now)[0] for p in active_problems(results, now)],
-                         ["ANIMEDB DOWN", "NAS OFFLINE", "NEXUS NO DATA"])
+                         ["ANIMEDB DOWN", "NAS OFFLINE"])
         self.assertEqual(rgb.rgb_signal(measured, rgb.Acknowledgements(), True, False, now),
                          rgb.Signal(rgb.CODES, ((State.ERROR, 2), (State.ERROR, 3))))
 
@@ -893,9 +894,9 @@ class PreviewTest(unittest.TestCase):
         self.assertEqual([frame.lit for frame in frames[:2]], [False, False])  # nepotvrzeno: tma, ne bílá
         self.assertEqual(frames[2].color, rgb.RED)  # potvrzeno: červený kód 2
         row, status, signal = self.view(session)
-        # LIVE na notebooku: NEXUS nemá kolektor, ve STATUS je za potvrzeným výpadkem.
+        # LIVE na notebooku: NEXUS bez kolektoru je N/A, ve STATUS je jen skutečný výpadek (M7-S9A).
         self.assertEqual((row, status, signal.steps),
-                         ("ERR", ["NAS OFFLINE", "NEXUS NO DATA"], ((State.ERROR, 2),)))
+                         ("ERR", ["NAS OFFLINE"], ((State.ERROR, 2),)))
 
     def test_live_reachable_gives_white_and_disabled_is_na(self):
         session = self.session(LIVE, FakeConnect(ACCEPTED))

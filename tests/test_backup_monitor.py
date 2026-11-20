@@ -611,7 +611,9 @@ class DisplayAndRgbTest(unittest.TestCase):
                     self.assertEqual(blink_groups(signal), [(color, 4)])
                     self.assertEqual(symbol, ALERT_SYMBOL)
                 else:
-                    self.assertEqual(symbol, UNKNOWN_SYMBOL)  # NEXUS nemá kolektor
+                    # M7-S9A: NEXUS bez kolektoru je N/A. "?" jen při skutečně neznámém stavu služby,
+                    # jinak bez symbolu, stejně jako bílé LED ve zdravém stavu.
+                    self.assertEqual(symbol, UNKNOWN_SYMBOL if row == "UNKN" else None)
 
     def test_expired_result_is_stale(self):
         result = check(FakeSystemctl(SUCCESS))

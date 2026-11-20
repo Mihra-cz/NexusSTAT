@@ -171,6 +171,17 @@ def overall_state(results, now):
     return State.UNKNOWN
 
 
+def summary_state(results, now):
+    """Souhrnný stav pro záhlaví webu a celkový stav OLED (M7-S9A).
+
+    Stejně jako overall_state (závažnější stav má přednost, N/A se nepočítá,
+    prošlé výsledky jsou UNKNOWN, bez sledovaných výsledků UNKNOWN), jen samé
+    platné INFO a OK je souhrnně OK. Jednotlivé výsledky se nemění.
+    """
+    state = overall_state(results, now)
+    return State.OK if state is State.INFO else state
+
+
 def has_monitor_data(results):
     """True, pokud existuje aspoň jeden sledovaný výsledek (cokoli kromě N/A)."""
     return any(result.state is not State.NA for result in results)

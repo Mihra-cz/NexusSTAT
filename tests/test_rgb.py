@@ -11,7 +11,7 @@ from nexusstat import history_link, rgb
 from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmRule, AlarmsConfig
 from nexusstat.core import CheckResult, Measurement, State
-from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID
+from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID
 
 UTC = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
@@ -117,6 +117,21 @@ class NormalStateTest(unittest.TestCase):
         # N/A je záměrně nesledovaná integrace.
         results = healthy() + [check("system.cpu_fan", State.NA)]
         self.assertEqual(rgb.rgb_signal(results, rgb.Acknowledgements(), True, False, 1.0).kind, rgb.LIGHT)
+
+    def test_completed_services_do_not_change_the_led_decision(self):
+        # M7-S9A: doplněné služby (NEXUS bez kolektoru N/A) nevytvoří falešnou bílou ani závadu.
+        measured = [check(CPU_USAGE_ID, State.INFO), check(CPU_TEMP_ID, State.INFO)]
+        cases = {
+            "zdravé": (measured, 1.0, rgb.LIGHT),
+            "ztráta platných měření": (measured, VALIDITY, rgb.OFF),
+            "skutečná závada": (measured + [check(NAS_ID, State.ERROR)], 1.0, rgb.CODES),
+        }
+        for name, (results, now, kind) in cases.items():
+            with self.subTest(name):
+                completed = complete_service_results(results, UTC, now + VALIDITY)
+                self.assertIs({r.id: r for r in completed}[NEXUS_SERVICES_ID].state, State.NA)
+                for given in (results, completed):
+                    self.assertEqual(rgb.rgb_signal(given, rgb.Acknowledgements(), True, False, now).kind, kind)
 
     def test_no_monitored_data_is_not_white(self):
         for results in ([], [check(ANIMEDB_ID, State.NA)]):

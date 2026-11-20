@@ -466,9 +466,10 @@ class ScenarioTextTest(unittest.TestCase):
         self.assertEqual(self.lines("ok"), [])
         self.assertEqual(self.lines("warning"), [("WARN", "CPU TEMP 74°C")])
         self.assertEqual(self.lines("error"), [("CRIT", "NAS OFFLINE"), ("ERR", "CPU TEMP 86°C")])
-        # NAS, AnimeDB a zálohy mají ve výchozí konfiguraci sledování vypnuté (N/A), do STATUS nepatří.
-        self.assertEqual(self.lines("unconnected"), [("UNKN", "NEXUS NO DATA")])
-        self.assertEqual(self.lines(LIVE), [("UNKN", "ROOT NO DATA"), ("UNKN", "NEXUS NO DATA")])
+        # NAS, AnimeDB a zálohy mají ve výchozí konfiguraci sledování vypnuté (N/A) a NEXUS bez
+        # vlastní kontroly je také N/A (M7-S9A): do STATUS nepatří, žádné falešné NEXUS NO DATA.
+        self.assertEqual(self.lines("unconnected"), [])
+        self.assertEqual(self.lines(LIVE), [("UNKN", "ROOT NO DATA")])
         self.assertEqual(self.lines("nas_animedb"), [("ERR", "ANIMEDB DOWN"), ("ERR", "NAS OFFLINE")])
 
     def test_network_scenarios(self):

@@ -7,7 +7,7 @@ takže testy mohou čas libovolně posouvat a nemusí skutečně čekat.
 
 from enum import Enum
 
-from .core import ALERT_STATES, State, overall_state
+from .core import ALERT_STATES, State, summary_state
 
 
 class Mode(Enum):
@@ -31,8 +31,8 @@ UNKNOWN_SYMBOL = "?"  # chybí platná data, závadu nelze potvrdit ani vylouči
 
 def home_symbol(results, now):
     """Symbol pro stránku NEXUS: ALERT_SYMBOL, UNKNOWN_SYMBOL nebo None (vše platně OK)."""
-    # Rozhoduje nejzávažnější stav, takže trojúhelník má přednost před "?".
-    overall = overall_state(results, now)
+    # Rozhoduje souhrn jako v záhlaví webu, takže trojúhelník má přednost před "?".
+    overall = summary_state(results, now)
     if overall in ALERT_STATES:
         return ALERT_SYMBOL
     if overall is State.UNKNOWN:

@@ -21,14 +21,14 @@ from nexusstat.core import CheckResult, Measurement, State, active_problems, ove
 from nexusstat.fan_monitor import LABELS as FAN_LABELS, FanMonitor
 from nexusstat.mounts import ROOT_MODE_ID, RootMountMonitor
 from nexusstat.network_monitor import LABELS as NETWORK_LABELS, NetworkMonitor
-from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, Mode, home_symbol
+from nexusstat.oled import ALERT_SYMBOL, Mode, home_symbol
 from nexusstat.oled_text import network_rows, page_rows, service_rows, status_texts
 from nexusstat import rgb
 from nexusstat.preview import (LED_OFF_FILL, LIVE, SCENARIOS, SIM_UNKNOWN_DEVICE, SPEEDS, PreviewSession, SessionClock,
                                led_fill, main)
 from nexusstat.root_device import identify_root_device
 from nexusstat.run import Collectors, live_monitor
-from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, SERVICE_LABELS
+from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID, SERVICE_LABELS
 from nexusstat.system_monitor import CPU_TEMP_ID, LABELS as SYSTEM_LABELS, SystemMonitor
 
 try:
@@ -280,7 +280,7 @@ class ScenarioTest(unittest.TestCase):
             "error": {State.ERROR, State.CRITICAL},
             "unknown": {State.UNKNOWN},
             "many": {State.CRITICAL, State.ERROR, State.WARNING, State.UNKNOWN},
-            "unconnected": {State.UNKNOWN},
+            "unconnected": set(),  # M7-S9A: NEXUS bez kolektoru je N/A, ne UNKNOWN
             # DOWN, chybějící IPv4 i provoz jsou platná měření (INFO), ne závady.
             "net_down": set(),
             "net_no_ipv4": set(),
@@ -307,10 +307,11 @@ class ScenarioTest(unittest.TestCase):
     def test_unconnected_services_match_reality(self):
         session, _ = make_session("unconnected")
         now = session.clock.now()
+        # M7-S9A: NEXUS bez kolektoru je N/A jako vypnuté služby: bez "?" a bez falešné závady.
         self.assertEqual(service_rows(session.results, now),
-                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
-        self.assertEqual(home_symbol(session.results, now), UNKNOWN_SYMBOL)
-        self.assertEqual({p.id for p in active_problems(session.results, now)}, {NEXUS_SERVICES_ID})
+                         [("NEXUS", "N/A"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
+        self.assertIsNone(home_symbol(session.results, now))
+        self.assertEqual(active_problems(session.results, now), [])
 
     def test_switch_resets_data_and_window(self):
         session, real = make_session("many")
@@ -402,7 +403,7 @@ class LiveTest(unittest.TestCase):
         now = session.clock.now()
         self.assertFalse(any(result.simulated for result in session.results))
         self.assertEqual(service_rows(session.results, now),
-                         [("NEXUS", "UNKN"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
+                         [("NEXUS", "N/A"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
 
     def test_live_applies_alarm_rules(self):
         config = Config(alarms=AlarmsConfig(cpu_temp=AlarmRule(True, 70, 80, 5)))
@@ -699,17 +700,18 @@ class RgbSessionTest(unittest.TestCase):
         session, _ = make_session("unknown")
         session.press()
         self.assertEqual(led_signal(session), rgb.Signal(rgb.OFF, reason="chybí platná data (UNKNOWN)"))
-        # Služby bez kolektoru (dnešní stav Nexusu) bílou neblokují; OLED přitom ukazuje "?".
+        # Služby bez kolektoru (dnešní stav Nexusu) bílou neblokují a od M7-S9A ani OLED
+        # neukazuje "?": bílé LED a stránka NEXUS bez symbolu říkají totéž.
         session, _ = make_session("unconnected")
         session.press()
         self.assertEqual(led_signal(session).kind, rgb.LIGHT)
-        self.assertEqual(home_symbol(session.results, session.clock.now()), UNKNOWN_SYMBOL)
+        self.assertIsNone(home_symbol(session.results, session.clock.now()))
 
     def test_live_uses_only_collector_results(self):
         FakeMonitor.fail = False
         session, real = make_session(LIVE)
         session.press()
-        # Doplněné služby jsou UNKNOWN, ale nejsou to aktivní kolektory: bílá svítí.
+        # Doplněné služby (N/A) nejsou aktivní kolektory: bílá svítí.
         self.assertEqual(led_signal(session).kind, rgb.LIGHT)
         FakeMonitor.fail = True
         try:

@@ -24,13 +24,14 @@ from unittest import mock
 from nexusstat import admin, web
 from nexusstat.alarms import AlarmEvaluator
 from nexusstat.config import AlarmsConfig, CollectorConfig
-from nexusstat.core import CheckResult, Measurement, State
+from nexusstat.core import CheckResult, Measurement, State, summary_state
 from nexusstat.fan_monitor import CPU_FAN_ID, FAN_ON, FAN_STATE, SOURCE, SOURCE_RPM
 from nexusstat.history_charts import RANGES, Bucket, ChartError, Charts, HistoryCharts, Series
 from nexusstat.mounts import ROOT_MODE_ID
 from nexusstat.network_monitor import ADDRESS, INTERFACE, IPV4_ID, LINK, LINK_ID, LINK_UP, RX_RATE_ID, TX_RATE_ID
 from nexusstat.run import main, run_loop
-from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID
+from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, home_symbol
+from nexusstat.services import ANIMEDB_ID, BACKUP_ID, NAS_ID, NEXUS_SERVICES_ID, complete_service_results
 from nexusstat.system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
 from nexusstat.web import (HISTORY_FAILED, HISTORY_OFF, DashboardServer, StateBoard, WebAccess, is_loopback,
                            render_history_page, render_page, start_web, stop_web, web_access)
@@ -81,10 +82,11 @@ class PageTest(unittest.TestCase):
             self.assertIn(f'<td class="v">{value}</td>', page)
         self.assertIn('<td>ETH0</td><td class="v">UP</td>', page)
         for state in ("info", "ok", "warning", "error", "critical", "unknown", "na"):
-            self.assertIn(f'class="s {state}"', page)  # AnimeDB bez kolektoru je N/A, NEXUS UNKNOWN
+            self.assertIn(f'class="s {state}"', page)  # AnimeDB a NEXUS bez kolektoru jsou N/A
         problems = page.split("<h2>Aktivní závady a UNKNOWN</h2>")[1].split("</section>")[0]
-        for text in ("NAS OFFLINE", "ROOT READ-ONLY", "CPU TEMP 74°C", "NEXUS NO DATA", "CPU NO DATA"):
+        for text in ("NAS OFFLINE", "ROOT READ-ONLY", "CPU TEMP 74°C", "CPU NO DATA"):
             self.assertIn(text, problems)
+        self.assertNotIn("NEXUS NO DATA", problems)  # M7-S9A: NEXUS bez kolektoru není závada
         self.assertIn("poslední platné měření 2026-10-31 12:00:05 UTC", page)
         self.assertNotIn("Český popis", page)  # summary se nezobrazuje
         # ROOT DEV je jen údaj pro zobrazení: bez štítku stavu, ani když zařízení nepodporujeme.
@@ -96,11 +98,45 @@ class PageTest(unittest.TestCase):
         self.assertIn('<span class="s unknown">UNKNOWN</span>', empty)
         self.assertIn("Zatím žádné měření.", empty)
         self.assertIn("Žádná data.", empty)
-        # Všechno změřené INFO, ale NEXUS nemá kolektor: celkový stav UNKNOWN, ne OK.
+        # Změřené jen INFO a OK, ale zapnutá kontrola NAS výsledek nedodala: UNKNOWN, ne OK.
         healthy = [result for result in results() if result.state in (State.INFO, State.OK)]
         page = render_page(board_with(healthy), 101.0)
         self.assertIn('<h1>NexusSTAT <span class="s unknown">UNKNOWN</span></h1>', page)
         self.assertNotIn('class="s ok">OK</span></h1>', page)
+        self.assertIn("NAS NO DATA", page)
+
+    def test_healthy_measurements_are_ok_with_nexus_na(self):
+        # M7-S9A: zdravá měření a NEXUS bez vlastního kolektoru = souhrnně OK, NEXUS N/A.
+        healthy = [result for result in results() if result.state in (State.INFO, State.OK)]
+        healthy += [check(CPU_USAGE_ID, State.INFO, 3), check(NAS_ID, State.OK)]
+        page = render_page(board_with(healthy), 101.0)
+        self.assertIn('<h1>NexusSTAT <span class="s ok">OK</span></h1>', page)
+        self.assertIn('<td>NEXUS</td><td class="v">N/A</td><td><span class="s na">N/A</span></td>', page)
+        self.assertIn("Žádné aktivní závady.", page)
+        self.assertNotIn("NEXUS NO DATA", page)
+        # Jednotlivé kontroly si stav nechávají: INFO zůstává INFO, jen souhrn je OK.
+        self.assertIn('<td>RAM</td><td class="v">24%</td><td><span class="s info">INFO</span></td>', page)
+
+    def test_web_header_and_oled_symbol_share_the_summary(self):
+        cases = {
+            "zdravé": ([check(MEMORY_ID, State.INFO, 24), check(BACKUP_ID, State.OK)], State.OK, None),
+            "jen N/A": ([], State.UNKNOWN, UNKNOWN_SYMBOL),
+            "UNKNOWN": ([check(MEMORY_ID, State.INFO, 24), check(CPU_USAGE_ID, State.UNKNOWN)], State.UNKNOWN,
+                        UNKNOWN_SYMBOL),
+            "ERROR i UNKNOWN": ([check(DISK_ROOT_ID, State.ERROR), check(CPU_USAGE_ID, State.UNKNOWN)], State.ERROR,
+                                ALERT_SYMBOL),
+            "skutečný NEXUS ERROR": ([check(MEMORY_ID, State.INFO, 24), check(NEXUS_SERVICES_ID, State.ERROR)],
+                                     State.ERROR, ALERT_SYMBOL),
+        }
+        for name, (taken, state, symbol) in cases.items():
+            with self.subTest(name):
+                board = StateBoard(validity_seconds=30)
+                board.publish(taken, 100.0, OBSERVED)
+                page = render_page(board, 101.0)
+                self.assertIn(f'<h1>NexusSTAT <span class="s {state.name.lower()}">{state.value}</span></h1>', page)
+                completed = complete_service_results(taken, OBSERVED, 130)
+                self.assertIs(summary_state(completed, 101.0), state)
+                self.assertEqual(home_symbol(completed, 101.0), symbol)
 
     def test_values_expire_when_the_loop_stops(self):
         board = board_with()

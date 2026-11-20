@@ -180,8 +180,8 @@ def scenario_many(sim):
 
 def scenario_unconnected(sim):
     # Fiktivní systém a síť, služby bez výsledku: doplnění je ukáže jako dnes
-    # ve skutečnosti s výchozí konfigurací (NEXUS UNKNOWN; AnimeDB, NAS a BACKUP
-    # se sledováním vypnutým N/A).
+    # ve skutečnosti s výchozí konfigurací (NEXUS bez kolektoru a AnimeDB, NAS
+    # a BACKUP se sledováním vypnutým N/A, M7-S9A).
     return system_and_services(sim)[:4] + [root_mode(sim)] + network(sim, rx=1_234_000, tx=85_300)
 
 

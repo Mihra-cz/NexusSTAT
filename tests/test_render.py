@@ -13,7 +13,7 @@ from nexusstat.config import OledConfig
 from nexusstat.core import CheckResult, Measurement, State
 from nexusstat.oled import ALERT_SYMBOL, CAROUSEL_PAGES, UNKNOWN_SYMBOL, OledController
 from nexusstat.oled_text import HEALTH_TEXT, STATE_TEXT, service_rows
-from nexusstat.services import SERVICE_LABELS, complete_service_results
+from nexusstat.services import NAS_ID, SERVICE_LABELS, complete_service_results
 from nexusstat.simulate import sample_results
 
 try:
@@ -248,10 +248,13 @@ class ServicesRenderTest(RenderCase):
     def test_unknown_services_differ_from_ok(self):
         ok = [CheckResult(i, State.OK, "ok", OBSERVED, 1000, simulated=False) for i in SERVICE_LABELS]
         self.assertNotEqual(self.services(ok).tobytes(), self.services([]).tobytes())
-        # Bez kolektorů nikde OK: UNKN a N/A se kreslí jinak.
+        # Bez kolektorů nikde OK: N/A (NEXUS bez kontroly, vypnuté služby) i UNKN se kreslí jinak.
         unmonitored = complete_service_results([], OBSERVED, 1000)
-        self.assertEqual(service_rows(unmonitored, 40)[0], ("NEXUS", "UNKN"))
+        self.assertEqual(service_rows(unmonitored, 40)[0], ("NEXUS", "N/A"))
         self.assertNotEqual(self.services(unmonitored).tobytes(), self.services(ok).tobytes())
+        unknown = complete_service_results([], OBSERVED, 1000, monitored={NAS_ID})
+        self.assertEqual(service_rows(unknown, 40)[2], ("NAS", "UNKN"))
+        self.assertNotEqual(self.services(unknown).tobytes(), self.services(unmonitored).tobytes())
 
     def test_services_page_differs_from_value_pages(self):
         results = sample_results(OBSERVED)
@@ -359,19 +362,26 @@ class NetworkRenderTest(RenderCase):
 class ServiceConsistencyRenderTest(RenderCase):
     """Neznámé služby jsou vidět i na stránce NEXUS ("?") a ve STATUS, nejen na SERVICES."""
 
-    def real_results(self):
+    def real_results(self, monitored=()):
         system = [CheckResult(i, State.INFO, "50 %", OBSERVED, 1000, simulated=False) for i in ("a", "b")]
-        return complete_service_results(system, OBSERVED, 1000)
+        return complete_service_results(system, OBSERVED, 1000, monitored=monitored)
 
     def test_nexus_page_shows_question_mark(self):
         question = symbol_area(self.nexus([result("u", State.UNKNOWN)]))
-        self.assertEqual(symbol_area(self.nexus(self.real_results())), question)
+        # Zapnuté sledování NAS bez výsledku je skutečně neznámý stav.
+        self.assertEqual(symbol_area(self.nexus(self.real_results(monitored={NAS_ID}))), question)
+        # NEXUS bez vlastní kontroly je N/A: zdravý systém je bez symbolu (M7-S9A).
+        healthy = symbol_area(self.nexus([result("ok", State.OK)]))
+        self.assertNotEqual(healthy, question)
+        self.assertEqual(symbol_area(self.nexus(self.real_results())), healthy)
 
     def test_status_lists_unknown_services(self):
-        # Tři neznámé služby: STATUS není "NO ACTIVE ISSUES" (to by tvrdilo, že nic nechybí).
-        with_unknown = self.status(self.real_results()).tobytes()
+        # Neznámá služba: STATUS není "NO ACTIVE ISSUES" (to by tvrdilo, že nic nechybí).
+        with_unknown = self.status(self.real_results(monitored={NAS_ID})).tobytes()
         no_issues = self.status([result("ok", State.OK)]).tobytes()
         self.assertNotEqual(with_unknown, no_issues)
+        # Jen NEXUS bez kontroly (N/A): žádné falešné NEXUS NO DATA, zdravý systém (M7-S9A).
+        self.assertEqual(self.status(self.real_results()).tobytes(), no_issues)
 
 
 @unittest.skipIf(render_screen is None, "Pillow není dostupné")

@@ -27,11 +27,14 @@ SERVICE_LABELS = {
     BACKUP_ID: "BACKUP",
 }
 
-# Služby, které se sledují jen po výslovném zapnutí v konfiguraci. Bez zapnutého
-# kolektoru jsou N/A, tedy ani alarm, ani neznámý stav. Zapnutý kolektor má
-# vždy přednost: jeho výsledek zůstává beze změny a bez výsledku je služba
-# UNKNOWN, nikdy N/A (complete_service_results, parametr `monitored`).
+# Služby, které se sledují jen po výslovném zapnutí v konfiguraci, a NEXUS, pro
+# který samostatná kontrola zatím není (M7-S9A). Bez zapnutého kolektoru jsou
+# N/A, tedy ani alarm, ani neznámý stav, a do celkového stavu se nepočítají;
+# N/A neznamená ověřeně zdravou službu. Zapnutý kolektor má vždy přednost: jeho
+# výsledek zůstává beze změny a bez výsledku je služba UNKNOWN, nikdy N/A
+# (complete_service_results, parametr `monitored`).
 OPTIONAL_SERVICES = {
+    NEXUS_SERVICES_ID: "NEXUS: samostatná kontrola není implementovaná",
     ANIMEDB_ID: "AnimeDB: sledování vypnuto",
     NAS_ID: "NAS: sledování vypnuto",
     BACKUP_ID: "Záloha: sledování vypnuto",
@@ -144,14 +147,15 @@ def complete_service_results(results, observed_utc, expires_monotonic, monitored
     """Doplní služby z katalogu, pro které nepřišel žádný výsledek.
 
     Sledovaná služba bez výsledku je UNKNOWN ("bez dat"), volitelná služba
-    bez zapnutého kolektoru N/A. `monitored` jsou id kontrol, které měří
-    některý zapnutý kolektor (např. `labels` kolektorů z run.live_monitor):
+    bez zapnutého kolektoru N/A (od M7-S9A i NEXUS, který kolektor zatím
+    nemá). `monitored` jsou id kontrol, které měří některý zapnutý kolektor
+    (např. `labels` kolektorů z run.live_monitor):
     taková služba bez výsledku je UNKNOWN i tehdy, když je volitelná, protože
     sledování je zapnuté a stav neznáme.
     Stránka SERVICES, symbol na stránce NEXUS i STATUS pak vycházejí ze stejných
     výsledků, takže stav služby nemůže být na jedné obrazovce neznámý a na
-    jiné chybět. Nevykonaná kontrola nikdy nevypadá jako OK; ani NEXUS
-    nemá OK, dokud nebude mít jednoznačně definovaný healthcheck s kolektorem.
+    jiné chybět. Nevykonaná kontrola nikdy nevypadá jako OK: N/A se do
+    celkového stavu nepočítá, ale zdravou službu nedokládá.
     Doplněné výsledky nejsou simulované: tvrdí jen to, co skutečně víme.
     Výsledky, které přišly (i simulované), zůstávají beze změny.
     """
