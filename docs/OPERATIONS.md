@@ -2,7 +2,7 @@
 
 ## Skutečný stav
 
-Na Nexusu zatím neběží žádný kód, service ani port. Není co instalovat, spouštět či zastavovat. Příkazy v sekcích o Nexusu níže nejsou příkazem k nasazení.
+Na Nexusu neběží žádný kód, service ani port. Od M7-S1 (2026-11-20) jsou v `/srv/nexus/projects/nexusstat` zdroje commitu `54648cc` (SHA-256 ověřené, serverový `manifest.toml` beze změny) a proběhl jediný ruční běh `nexusstat.run` na 45 s bez konfigurace (výsledek v sekci Nexus po M7-S1). Žádná služba, data v `appdata` ani změna hardwaru. Příkazy v sekcích o Nexusu níže nejsou příkazem k nasazení.
 
 ## Lokální vývoj (simulace, read-only kolektory a pravidelné měření)
 
@@ -34,7 +34,7 @@ Ventilátor CPU (M4-1, jen čtení): `python3 -m nexusstat.fan_monitor` vypíše
 - `UNKN` — zdroj existuje, ale data jsou nečitelná, nevěrohodná, prošlá, nebo je zdrojů víc a žádný není prokazatelně hlavní,
 - `N/A` — na tomto stroji **není prokazatelný zdroj** (není co sledovat, tedy ani závada). Tak to vypadá i na vývojovém notebooku, který žádný ventilátor v hwmon nemá; co se našlo a nepřiřadilo, uvádí popis výsledku.
 
-Zařízení se vybírá podle identity (`name` ovladače, například `pwmfan`, nebo `fanN_label` od zařízení), nikdy podle čísla `hwmonX` ani podle jména souboru. Zdroje Raspberry Pi 5 je nutné read-only ověřit na Nexusu (M7); pravidlo o závadě při rozporu „požadavek > 0, otáčky 0“ zatím neexistuje a kolektor žádnou závadu nevyhodnocuje.
+Zařízení se vybírá podle identity (`name` ovladače, například `pwmfan`, nebo `fanN_label` od zařízení), nikdy podle čísla `hwmonX` ani podle jména souboru. Zdroje Raspberry Pi 5 jsou od M7-S1 read-only ověřené na Nexusu (hwmon `pwmfan` s `fan1_input` a `pwm1`, chladicí zařízení `pwm-fan`; ojedinělé falešné otáčky viz Nexus po M7-S1); pravidlo o závadě při rozporu „požadavek > 0, otáčky 0“ zatím neexistuje a kolektor žádnou závadu nevyhodnocuje.
 
 Síťové rozhraní (v0.6): bez `[network] interface` se vybírá automaticky (fyzické s výchozí trasou IPv4 a nejnižší metrikou → fyzické s linkou UP → jakékoli fyzické, při shodě abecedně; Docker, VPN, loopback ani jiná virtuální rozhraní ne). Pro lokální zkoušku jiného rozhraní stačí `python3 -m nexusstat.network_monitor <rozhraní>` nebo vlastní `config/config.toml` mimo Git. Neexistující rozhraní je `UNKNOWN` („rozhraní nenalezeno“), neplatný název ukončí program kódem 2. První měření rychlosti RX/TX je vždy `UNKNOWN`. Výpis obsahuje lokální IPv4 notebooku: do dokumentace, issue ani veřejného repozitáře ji nekopíruj (příklady používají dokumentační rozsah 192.0.2.0/24).
 
@@ -251,7 +251,7 @@ Skutečné názvy jednotek a cesty mountů jsou v soukromé dokumentaci Nexusu, 
 
 Kontrola mountu nikdy není náhradou za ověřený read-only test dostupnosti NAS s timeoutem. Nespouštěj restic backup, retention ani test zápisu bez schválení.
 
-Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje dat na RPi 5, např. typy a stav `/sys/class/thermal/cooling_device*` (`type`, `cur_state`, `max_state`), dostupnost otáček v `/sys/class/hwmon/hwmon*/` (`name`, `fan*_input`) a rozhraní v `/sys/class/net/*/operstate` (název ethernetu na RPi 5 s Debianem 13, např. `eth0` nebo `end0`, a zda automatický výběr zvolí správné rozhraní). Nic se nezapisuje; GPIO se ani nečte bez samostatného schválení. Pro healthcheck AnimeDB (SERVICES-1) až po nasazení AnimeDB ručně jen `curl --noproxy '*' --max-time 2 http://<adresa>/health` (očekávané HTTP 200 a `{"status":"ok"}`), bez zásahu do AnimeDB.
+Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje dat na RPi 5, např. typy a stav `/sys/class/thermal/cooling_device*` (`type`, `cur_state`, `max_state`), dostupnost otáček v `/sys/class/hwmon/hwmon*/` (`name`, `fan*_input`) a rozhraní v `/sys/class/net/*/operstate` (název ethernetu na RPi 5 s Debianem 13, např. `eth0` nebo `end0`, a zda automatický výběr zvolí správné rozhraní; M7-S1: na Nexusu `eth0`, automatický výběr ho zvolil). Nic se nezapisuje; GPIO se ani nečte bez samostatného schválení. Pro healthcheck AnimeDB (SERVICES-1) až po nasazení AnimeDB ručně jen `curl --noproxy '*' --max-time 2 http://<adresa>/health` (očekávané HTTP 200 a `{"status":"ok"}`), bez zásahu do AnimeDB.
 
 ## Před přechodem na hardware
 
@@ -261,7 +261,201 @@ Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje d
 4. Tlačítko: ověřit výchozí logind akce a evdev grab; neimplementovat konfliktní dlouhé držení.
 5. InfluxDB nevypínat, dokud nejsou doložené všechny závislosti a zálohy. NexusSTAT ji nepotřebuje; před vypnutím read-only zjistit, kdo ji používá (klienti, dashboardy, skripty), a zálohovat data.
 6. Pironman nahrazovat po funkcích (OLED, RGB, tlačítko, ventilátory), u každé s vlastním kritériem úspěchu. Pironman při přechodu jen zastavit a zakázat, neodinstalovat; návrat = obnovit zálohované konfigurace a znovu povolit a spustit `pironman5.service`. Postup návratu vyzkoušet předem.
-7. RGB (návrh): read-only zjistit, jak Pironman LED ovládá (zařízení, zapojení, jeho konfigurace), a konfiguraci zálohovat. Vypnout jen RGB Pironmanu jeho vlastní volbou; kvůli RGB nikdy nezastavovat `pironman5.service`, protože řídí boční ventilátory. LED smí ovládat jen jeden program, teprve potom zapnout RGB NexusSTAT. Pironman ovládá RGB až do samostatně schváleného převzetí. Návrh kritéria úspěchu: všechny stavy z tabulky v sekci RGB LED fyzicky ověřené a LED zhasnuté po startu i po korektním zastavení NexusSTAT; po pádu procesu mohou WS2812 držet poslední barvu (provozní omezení). Návrat: vypnout RGB NexusSTAT a obnovit konfiguraci RGB Pironmanu.
+7. RGB (návrh): read-only zjistit, jak Pironman LED ovládá (zařízení, zapojení, jeho konfigurace), a konfiguraci zálohovat. Vypnout jen RGB Pironmanu jeho vlastní volbou; kvůli RGB nikdy nezastavovat `pironman5.service`, protože řídí boční ventilátory. LED smí ovládat jen jeden program, teprve potom zapnout RGB NexusSTAT. Pironman ovládá RGB až do samostatně schváleného převzetí. Návrh kritéria úspěchu: všechny stavy z tabulky v sekci RGB LED fyzicky ověřené a LED zhasnuté po startu i po korektním zastavení NexusSTAT; po pádu procesu mohou WS2812 držet poslední barvu (provozní omezení). Návrat: vypnout RGB NexusSTAT a obnovit konfiguraci RGB Pironmanu. **M7-S1:** vlastní volba Pironmanu nestačí, protože i s `rgb_enable=false` posílá jeho WS2812 každou sekundu na SPI0 černou (viz Nexus po M7-S1); postup převzetí RGB musí znovu schválit správce.
+
+## Nexus po M7-S1 (stav 2026-11-20; návrhy neprovedeny)
+
+Na Nexusu jsou jen zdroje commitu `54648cc` bez služby, portu a dat; nejde o produkční aktivaci. `pironman5.service` je aktivní a povolený a dál řídí boční ventilátory, OLED, RGB i tlačítko. **Vypnutí Pironmanu je BLOCKER** (GPIO6 bez nezávislého řízení, tlačítko by bez Pironmanu vypnulo systém) a ovladače OLED, RGB ani tlačítka v NexusSTAT nejsou. Mimo zdroje se na Nexusu nic nezměnilo, takže návrat k Pironmanu je dnešní stav.
+
+### Ruční běh (proběhl jednou, M7-S1)
+
+```bash
+cd /srv/nexus/projects/nexusstat && PYTHONPATH=src python3 -B -m nexusstat.run
+```
+
+- `-B` brání vzniku `__pycache__` v adresáři projektu; bez `--config` platí výchozí konfigurace (bez historie, webu, heartbeatu a služeb). Ukončení `kill -TERM <PID>` nebo Ctrl+C, kód 0.
+- Výsledek, srovnání se systémem a doklad `strace` jsou v `CHANGELOG.md` (M7-S1). Testy `unittest` na Raspberry Pi zatím neběžely: potřebují `TMPDIR` na lokálním disku (`/tmp` je na Nexusu tmpfs) a testy webu otevírají porty na loopbacku, proto jen po schválení.
+
+### Zjištěný stav hardwaru (read-only, Pironman 5 1.3.20, pm_auto 2.0.6)
+
+| Funkce | Dnes řídí | Zjištěno |
+| --- | --- | --- |
+| hlavní CPU ventilátor | kernel (`pwm-fan`, step_wise, trip pointy 50/60/67,5/75 °C) | hwmon `pwmfan` (`fan1_input`, `pwm1`), chladicí zařízení `pwm-fan` 0–4; Pironman ho na Debianu jen čte. Osamocené falešné otáčky při stojícím ventilátoru (asi 10 denně, viz CHANGELOG) |
+| boční ventilátory | Pironman FanAddon přes GPIO6 (lgpio, konzument `lg`), Always On | GPIO6 výstup HIGH, bez tachometru, bez gpio-hog. **Zastavení Pironmanu GPIO6 vypne**; start ho nastaví LOW a při prvním cyklu (do 1 s) HIGH |
+| OLED | Pironman OLEDAddon, I²C-1 (SSD1306 na 0x3C nebo 0x3D) | Pironman do displeje zapisuje i s `oled_enable=false`: při svém startu (inicializace a uspání) a při zastavení |
+| RGB | Pironman WS2812Addon, SPI0 (`/dev/spidev0.0`, MOSI GPIO10), 4 LED GRB | `rgb_enable=false`, přesto každou sekundu posílá černou |
+| tlačítko | Pironman, výhradní grab evdev `pwr_button` | krátký stisk OLED (probudit, další stránka), dvojitý předchozí stránka, podržení 2–5 s a puštění vypne systém (po déle než 5 s nic); bez grabu logind `HandlePowerKey=poweroff` |
+| IR přijímač | overlay `sunfounder-pironman5` (GPIO13) | NexusSTAT ho nepoužívá |
+
+### M7-S2: nezávislé řízení GPIO6 kernelovým gpio-hog (návrh, neprovedeno)
+
+Cíl: boční ventilátory zapnuté nezávisle na Pironmanu i NexusSTAT, už od inicializace jádra (před uživatelskými službami), při zastavení `pironman5.service`, při pádu NexusSTAT i po restartu. Jediný nový řádek v `/boot/firmware/config.txt`, sekce `[all]`, za `dtoverlay=sunfounder-pironman5`:
+
+```text
+dtoverlay=gpio-hog,gpio=6
+```
+
+Ověřeno read-only (bez restartu):
+
+- **Overlay:** `/boot/firmware/overlays/gpio-hog.dtbo` z balíčku firmware obsahuje uzel `gpio-hog` s `output-high`; parametr `gpio` (výchozí 26) určuje linku, `active_low` by přepnul na `output-low`, a proto se nepoužije.
+- **Cíl overlaye:** label `gpio` míří na `/axi/pcie@1000120000/rp1/gpio@d0000`, tedy na RP1 (`gpiochip0`, `pinctrl-rp1`, linka 6 = `GPIO6`). Stejně se na něj váže IR overlay Pironmanu (GPIO13, konzument `ir-receiver@d`).
+- **Úroveň:** GPIO6 je dnes výstup HIGH (`pinctrl get 6`: `op dh pn | hi`) při `gpio_fan_mode=0` (Always On), takže HIGH = ventilátory běží. Odvozeno z kódu a stavu linky, fyzicky potvrdit.
+- **FanAddon při obsazené lince:** `GPIOFan.__init__` volá `Pin(6, OUT)` → `RPi.GPIO.setup` (systémový `python3-rpi-lgpio`), ten linku přes lgpio čte a nárokuje. Jádro hogovanou linku žádnému programu nepřidělí, výjimku zachytí `GPIOFan.__init__` („GPIO Fan init error“), FanAddon zaloguje „GPIO Fan init failed, disable gpio_fan control“ a všechna další volání (`set`, `off`, `close`) jsou kvůli `check_ready` bez účinku. Úklid nepovedeného objektu `Pin` může do journalu zapsat ignorovanou výjimku; linku změnit nemůže. Ostatní addony (OLED, RGB, tlačítko, systém) běží dál. Do historie a dashboardu Pironmanu přestane chodit `gpio_fan_state`. Ověřeno čtením kódu Pironmanu 1.3.20, pm_auto 2.0.6 a rpi-lgpio, za běhu až po restartu.
+- **Jiné řízení:** jiný konzument GPIO6 neexistuje (`gpioinfo`: jen `lg`), žádný uzel `gpio-fan`, `gpio-leds` ani hog v živém device tree. Pironman `config.txt` za běhu nemění; jeho instalátor ano, proto po každé aktualizaci Pironmanu řádek ověřit.
+- NexusSTAT GPIO6 nikdy neovládá, jeho pád ventilátory neovlivní.
+- **Zbývající okno:** od resetu SoC do sondování ovladače RP1 (jednotky sekund při bootu) má GPIO6 výchozí stav po resetu. Dnes je toto okno delší (až do startu Pironmanu po `multi-user.target`). Chování v něm jen fyzicky pozorovat. `gpio=6=op,dh` (nastavení už ve firmware) je pro RP1 neověřené a bez samostatného ověření se nepřidává.
+- **Zamítnuto:** služba s `gpioset` (závisí na běžícím procesu), řízení z NexusSTAT (chlazení zůstává oddělené od diagnostiky), overlay `gpio-fan` (zbytečné pro Always On).
+
+### M7-S2: rollback při neúspěšném bootu
+
+- **Doporučeno, je-li podporováno:** mechanismus `tryboot` bootloaderu Raspberry Pi. `tryboot.txt` je úplná kopie `config.txt` s řádkem hogu, `sudo reboot '0 tryboot'` ho firmware použije pro jediný boot a další restart nebo vypnutí a zapnutí naběhne zase s nezměněným `config.txt`. Do `config.txt` se řádek přidá až po ověření. Bootloader Nexusu je z 2026-09-25 a `tryboot.txt` dnes neexistuje; podporu na Pi 5 s bootem z NVMe ověřit v dokumentaci Raspberry Pi, jinak přímá změna `config.txt`.
+- **Bez tryboot:** vrátit `config.txt` ze zálohy přes SSH (ověřit SHA-256) a restartovat. Když SSH nenaběhne: fyzicky, upravit `config.txt` na oddílu boot NVMe z jiného počítače podle `NEXUS-RECOVERY.md` na Nexusu. Overlay se špatným parametrem firmware obvykle jen nepoužije; boot se tím zastavit nemá, ale počítá se s horším případem.
+- **Kritéria přerušení:** kterýkoli boční ventilátor stojí, GPIO6 není HIGH nebo nemá konzumenta hogu, Pironman hlásí jinou chybu než očekávané varování k GPIO fan, teplota CPU nad 70 °C nebo throttling jiný než `0x0`.
+
+### M7-S2: fyzická kontrola obou bočních ventilátorů
+
+Vyžaduje přítomnost správce u Nexusu: před změnou (výchozí stav, oba běží), během bootu (od zapnutí do přihlášení, kdy se rozběhnou), po bootu, během krátké zkoušky zastavení Pironmanu a po jeho opětovném startu. Ke každému bodu čas, `vcgencmd measure_temp` a `vcgencmd get_throttled`. Otáčky bočních ventilátorů měřit nejde (nemají tachometr), rozhoduje pohled a sluch.
+
+### M7-S2: tlačítko (návrh, neprovedeno)
+
+- **Zařízení:** `pwr_button` (gpio-keys, `/devices/platform/pwr_button`), dnes `/dev/input/event5`, stabilní cesta `/dev/input/by-path/platform-pwr_button-event`; jediné vstupní zařízení jen s `KEY_POWER`. Je to tlačítko Raspberry Pi 5; tlačítko skříně Pironman se podle všeho chová stejně (jediné takové zařízení), fyzicky ověřit: krátký stisk každého z nich teď probudí OLED Pironmanu.
+- **Proč ne globální změna logind:** tag `power-switch` mají i HDMI CEC (`vc4-hdmi-0`, `vc4-hdmi-1`), klávesnice a IR přijímač. `HandlePowerKey=ignore` v `logind.conf` by změnil i jejich chování.
+- **Doporučení:** cílené pravidlo udev jen pro `pwr_button`, které mu odebere tag `power-switch`, takže ho logind přestane sledovat; `logind.conf` a ostatní zařízení beze změny (syntaxi ověřit `udevadm test`, uplatní se po restartu):
+
+  ```text
+  # /etc/udev/rules.d/70-nexusstat-pwr-button.rules
+  SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pwr_button", TAG-="power-switch"
+  ```
+
+  Bez běžícího ovladače pak krátký stisk v Linuxu nic neudělá a čisté vypnutí jde přes SSH. Funkce firmwaru mimo Linux (zapnutí vypnutého Pi tlačítkem, případné vynucené vypnutí dlouhým držením) se tím nemění; jejich přesné chování na Nexusu neověřeno. Zavést jen spolu s převzetím tlačítka, ne dřív: dokud tlačítko drží Pironman, pravidlo nic nemění.
+- **Varianta:** drop-in logind `HandlePowerKey=ignore` a `HandlePowerKeyLongPress=poweroff` (dlouhý stisk čistě vypne i bez NexusSTAT), ale globálně pro všechna zařízení s tagem a délku dlouhého stisku logind v man stránce neuvádí.
+- **Obsluha v NexusSTAT (plán):** výhradní grab (když ho už drží Pironman, grab selže a NexusSTAT tlačítko nepřevezme a ohlásí to), krátký stisk do `OledController`, dlouhý stisk rozlišený časem stisku a puštění podle schváleného návrhu (10s gesto reboot se neimplementuje). Pokud má dlouhý stisk systém čistě vypnout, stačí pravidlo polkit jen pro uživatele `nexusstat` a akci `org.freedesktop.login1.power-off`, ne root ani sudo. Rozhodne správce.
+- Během zkoušky zastavení Pironmanu v M7-S2 tlačítko nemačkat (logind by systém vypnul).
+
+### M7-S2: InfluxDB
+
+Zatím nevypínat. Noční zálohovací úloha hostitele podle svého journalu nejdřív připraví a zkontroluje online zálohu InfluxDB a uloží ji s Nexusem do Resticu; Pironman má `Wants=influxdb.service`. Před jakýmkoli vypnutím: root přečte skript zálohy (jen čtení), zjistí jeho chování bez InfluxDB, zálohu dat a úpravu úlohy navrhne a schválí správce.
+
+### Záloha před jakoukoli změnou (návrh)
+
+```bash
+B=/srv/nexus/appdata/nexusstat/pre-m7-$(date +%F); mkdir -m 700 "$B"
+sudo cp -a /boot/firmware/config.txt /boot/firmware/cmdline.txt /opt/pironman5/config.json /etc/systemd/system/pironman5.service "$B"/
+sudo chown mirek:mirek "$B"/*; (cd "$B" && sha256sum * > SHA256SUMS)
+systemctl show pironman5.service > "$B"/pironman5.show
+gpioinfo -c gpiochip0 > "$B"/gpioinfo.txt; pinctrl get 0-27 > "$B"/pinctrl.txt
+/opt/pironman5/venv/bin/pip freeze > "$B"/pironman5-venv.txt
+```
+
+Adresář zahrne denní Restic (`/srv/nexus`). Pironman přepisuje `config.json` při každém startu; obnovuje se proto jen se zastaveným Pironmanem.
+
+### Rollback převzetí
+
+- gpio-hog: s tryboot stačí běžný restart; jinak `sudo cp "$B"/config.txt /boot/firmware/config.txt`, ověřit SHA-256 proti `SHA256SUMS`, restart. GPIO6 pak znovu ovládá Pironman (`gpioinfo`: konzument `lg`, HIGH).
+- Pironman zastavený nebo zakázaný: nejdřív zastavit NexusSTAT (uvolní OLED, SPI a tlačítko), případně vrátit `/opt/pironman5/config.json` ze zálohy, pak `sudo systemctl enable --now pironman5`.
+- Pravidlo udev tlačítka: smazat soubor a restartovat; logind pak tlačítko znovu sleduje.
+- Pironman se nikdy neodinstalovává; `/opt/pironman5` i jeho venv zůstávají.
+
+### Návrh služby systemd (neinstalováno)
+
+Služba běží vždy pod systémovým uživatelem `nexusstat` bez přihlášení a bez capabilities, nikdy jako root. `/srv/nexus` (0750, `mirek`) mu zpřístupní jen průchod přes ACL, `projects/nexusstat` je čitelný pro ostatní a `appdata/nexusstat` dostane až s historií.
+
+```bash
+sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin nexusstat
+```
+
+```bash
+sudo setfacl -m u:nexusstat:--x /srv/nexus
+```
+
+**Etapa 1 (jen monitoring, stejně jako ruční běh):** `/etc/systemd/system/nexusstat.service`:
+
+```ini
+[Unit]
+Description=NexusSTAT - lokální diagnostika Nexusu (jen čtení)
+Documentation=file:///srv/nexus/projects/nexusstat/docs/OPERATIONS.md
+After=network.target
+# Záměrně bez vazby na pironman5.service: NexusSTAT neřídí chlazení.
+
+[Service]
+Type=simple
+User=nexusstat
+Group=nexusstat
+WorkingDirectory=/srv/nexus/projects/nexusstat
+Environment=PYTHONPATH=/srv/nexus/projects/nexusstat/src PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -B -m nexusstat.run
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`PrivateDevices=yes` a `IPAddressDeny=any` platí **jen pro etapu 1**: žádné zařízení a žádný provoz IP (dotaz `SIOCGIFADDR` provozem není). Cílový NexusSTAT potřebuje I²C, SPI, tlačítko a povolené služby v LAN; oprávnění se proto přidávají po funkcích, každé zvlášť schválené a ověřené:
+
+| Funkce | Minimální oprávnění | Poznámka |
+| --- | --- | --- |
+| měření `/proc`, `/sys` | žádné | `ProtectKernelTunables` jen zakáže zápis; nepoužít `ProcSubset=pid` (skryl by `/proc/stat`, `/proc/meminfo`, `/proc/net/route`) |
+| historie, uživatelský stav | `ReadWritePaths=/srv/nexus/appdata/nexusstat`, adresář vlastní `nexusstat` | jinak `ProtectSystem=strict` |
+| stav hodin pro historii | bez `ProtectClock=` | blokoval by i dotaz `adjtimex` (`modes = 0`) |
+| OLED | `DeviceAllow=/dev/i2c-1 rw`, `SupplementaryGroups=i2c` | jen sběrnice 1 |
+| RGB | `DeviceAllow=/dev/spidev0.0 rw`, `SupplementaryGroups=spi` | bez `/dev/gpiomem*` a `/dev/gpiochip*`; vyžaduje-li je ovladač Adafruit (Blinka), raději malý ovladač nad systémovým `spidev` |
+| tlačítko | `DeviceAllow=/dev/input/by-path/platform-pwr_button-event r`, `SupplementaryGroups=input` | skupina `input` by dovolila číst i klávesnici, cgroup `DeviceAllow` ale pustí jen toto zařízení; grab stačí s deskriptorem jen pro čtení. Zda systemd přijme cestu přes symlink, ověřit, jinak vlastní symlink udev |
+| boční ventilátory, CPU FAN | žádné | GPIO drží jádro (hog), NexusSTAT GPIO nepotřebuje |
+| kontrola záloh | `AF_UNIX` (systemd po D-Bus) | bez sudo |
+| web v LAN | `SocketBindAllow=tcp:8765`, `SocketBindDeny=any`, `IPAddressAllow=localhost <LAN_ROZSAH>` | port nad 1024 nepotřebuje capability; UFW zvlášť |
+| AnimeDB, NAS | `IPAddressAllow=<adresa>` | jen nastavené adresy |
+| heartbeat | `IPAddressAllow=<IP přijímače>`, nebo vědomě bez filtru IP | proměnná veřejná adresa filtr IP neumožní |
+| dlouhý stisk = vypnutí | pravidlo polkit jen pro `nexusstat` a `org.freedesktop.login1.power-off` | jen je-li schváleno |
+
+Zařízení jdou zpřístupnit dvěma způsoby: `PrivateDevices=no` s `DevicePolicy=closed` a `DeviceAllow=` (doporučeno, jednodušší), nebo `PrivateDevices=yes` s `BindPaths=` uzlů a `DeviceAllow=`. Obojí ověřit `systemd-analyze security nexusstat.service` a krátkým během.
+
+- `RestartPreventExitStatus=2`: neplatná konfigurace se nespouští dokola. SIGTERM ukončí běh řízeně, `TimeoutStopSec=20` pokryje i dopsání historie (nejvýš 10 s).
+- Výpis jde do journalu (`journalctl -u nexusstat`), tichý: řádek při změně, jinak jednou za 30 min.
+
+Instalace (po schválení; nejdřív start bez `enable`):
+
+```bash
+sudo install -m 0644 -o root -g root nexusstat.service /etc/systemd/system/nexusstat.service
+sudo systemd-analyze verify /etc/systemd/system/nexusstat.service
+sudo systemctl daemon-reload
+sudo systemctl start nexusstat.service
+journalctl -u nexusstat.service -n 20 --no-pager
+systemd-analyze security nexusstat.service
+sudo systemctl enable nexusstat.service
+```
+
+Rollback služby: `sudo systemctl disable --now nexusstat.service`, `sudo rm /etc/systemd/system/nexusstat.service`, `sudo systemctl daemon-reload`, případně `sudo setfacl -x u:nexusstat /srv/nexus` a `sudo userdel nexusstat`. Pironman ani chlazení se nemění.
+
+### Co zbývá pro OLED, RGB a tlačítko
+
+- **OLED:** ovladač SSD1306 (Adafruit SSD1306, nebo malá vrstva nad systémovým `python3-smbus2` 0.4.3), kreslení `render_screen()` mimo měřicí smyčku, vypnutí displeje ve SLEEP, izolace chyb I²C, zhasnutí při ukončení. Jediný vlastník: Pironman do displeje zapisuje při svém startu a zastavení i s `oled_enable=false` a probouzení potřebuje tlačítko, které drží Pironman; plné převzetí proto se zastaveným Pironmanem.
+- **Tlačítko:** čtení `/dev/input/by-path/platform-pwr_button-event` s výhradním grabem (stačí standardní knihovna; `python3-evdev` v systému není), krátký a dlouhý stisk podle návrhu výše. Převzetí jen se zastaveným Pironmanem a s ochranou proti nechtěnému vypnutí.
+- **RGB:** ovladač Adafruit NeoPixel SPI (`/dev/spidev0.0`, 4 LED GRB), vlákno blikání, zhasnutí při startu a ukončení. Jen se zastaveným Pironmanem, protože jeho WS2812 píše i vypnutý.
+- **Závislosti:** v systémovém Pythonu 3.13.5 jsou Pillow 11.1.0, `spidev` 3.6 a `smbus2`, Adafruit Blinka, SSD1306 a NeoPixel SPI ne. Systémový Python se nemění: buď venv projektu (umístění schválit), nebo malé ovladače nad systémovými balíčky.
+- **Boční ventilátory:** bez tachometru a bez přístupu NexusSTAT ke GPIO; stav dokládá jen hog v jádře a fyzická kontrola.
+- **CPU FAN:** `ON` jen s potvrzením (např. `pwm1 > 0` nebo dvě po sobě jdoucí měření), aby osamocený falešný pulz tachometru nebyl vydáván za otáčení.
 
 ## RGB LED a potvrzení závad (schválený návrh 2026-10-23; ovladač LED a administrace neimplementované)
 

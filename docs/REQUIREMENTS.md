@@ -377,6 +377,7 @@ Dashboard a historie zůstávají **bez přihlášení a jen pro čtení**. Výc
 - Fyzický `pwr_button` je událost Linux input zařízení, nikoliv libovolný GPIO pin. Číslo zařízení `/dev/input/eventN` se může lišit a není trvalý kontrakt.
 - Návrh krátkého/dlouhého stisku pro řízené vypnutí je **neuzavřený do HW testů**. Dlouhé 10s gesto reboot se **neimplementuje**, může kolidovat s hardwarovým vypnutím.
 - Ovládání tlačítka při přechodu ověřit proti `systemd-logind` a přítomnosti exkluzivního `evdev` grabu.
+- **M7-S1 (read-only, 2026-11-20):** tlačítko (`pwr_button`, jen `KEY_POWER`) dnes drží Pironman výhradním grabem (krátký stisk OLED, podržení 2–5 s a puštění vypne systém, po déle než 5 s nic). Bez grabu ho obslouží logind s `HandlePowerKey=poweroff`, takže po zastavení Pironmanu nebo pádu budoucího ovladače krátký stisk systém vypne: pro vypnutí Pironmanu **BLOCKER**. Návrh ochrany v `OPERATIONS.md` (Nexus po M7-S1), chování po převzetí rozhodne správce.
 
 ## RGB LED a potvrzování závad (schválený návrh 2026-10-23; lokálně rozhodovací logika, simulace v náhledu a od M6-4A trvalý stav)
 
@@ -455,6 +456,7 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 
 - Pironman zůstává v provozu a má RGB pod svou kontrolou až do samostatně schváleného bezpečného převzetí. LED smí ovládat vždy jen jeden program; NexusSTAT je neotevře, dokud je ovládá Pironman (`WS2812Addon`). Souběžný zápis dvou programů nejde spolehlivě odhalit, proto rozhoduje ověřený postup, ne automatická detekce.
 - Převzetí RGB nesmí zastavit Pironman jako celek, dokud nejsou ověřené boční ventilátory: RGB Pironmanu se vypne jen jeho vlastní konfigurací, jinak až při celkovém přechodu (M7). Konkrétní volbu Pironmanu i zapojení LED (předpoklad SPI pro Adafruit NeoPixel SPI) je nutné nejdřív ověřit read-only.
+- **M7-S1 (read-only, 2026-11-20):** LED jsou na SPI0 (`/dev/spidev0.0`, MOSI GPIO10) a RGB Pironmanu je vypnuté (`rgb_enable=false`), jeho WS2812 ale i tak každou sekundu posílá černou. Vypnutí vlastní volbou Pironmanu proto jediného vlastníka LED nezajistí; RGB půjde převzít až se zastaveným Pironmanem, tedy po ověřeném nezávislém řízení bočních ventilátorů. Rozhodnutí správce čeká.
 - Budoucí ovladač RGB bude ve výchozím stavu vypnutý a při inicializaci i korektním vypnutí odešle zhasnutí všech LED. Selhání LED nesmí zastavit měření, alarmy, OLED ani historii. Návrat: vypnout RGB v NexusSTAT a vrátit původní nastavení RGB Pironmanu.
 - **Provozní omezení (M7):** WS2812 mohou po pádu procesu držet poslední barvu. Pouhé ukončení aplikace to neodstraní, takže svit LED po pádu NexusSTAT nic nedokládá (zamrzlá bílá neznamená OK). Hardwarový watchdog ani další elektronika se nenavrhují.
 
@@ -472,6 +474,8 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 
 - Hlavní PWM ventilátor CPU ponechat stávající linuxové regulaci.
 - Oba boční ventilátory nyní ovládá Pironman přes GPIO6 v režimu Always On (`gpio_fan_mode=0`); GPIO6 bylo při read-only kontrole `HIGH`. Kernelový gpio-hog je **návrh**, není nasazen ani fyzicky otestován.
+- **M7-S1 (read-only, 2026-11-20):** GPIO6 je výstup HIGH s konzumentem `lg` (lgpio v procesu Pironmanu), jiné řízení ani gpio-hog neexistuje. Pironman při zastavení GPIO6 výslovně vypíná a při startu ho nejdřív nastaví LOW, takže samotné zastavení `pironman5.service` boční ventilátory zastaví: pro vypnutí Pironmanu **BLOCKER**. Konkrétní návrh hogu a rollback: `OPERATIONS.md` (Nexus po M7-S1).
+- **M7-S1, CPU FAN:** historie Pironmanu obsahuje za 30 dní 309 osamocených nenulových vzorků (asi 10 denně; 3218, 3280, 3401 a 3528 RPM) při 26,5–38,6 °C, tedy pod prvním trip pointem (nejspíš falešné pulzy tachometru, fyzicky neověřeno). Samotné RPM > 0 proto zatím nedokládá otáčení; pravidlo potvrzení je otevřený bod.
 - Nezastavovat Pironman, dokud není schválené a ověřené předání řízení ventilátorů a tlačítka.
 - Monitoring ventilátorů: CPU FAN read-only je od M4-1 implementovaný lokálně (`fan_monitor.py`, čtvrtý řádek stránky SYSTEM), na Raspberry Pi 5 neověřený. U bočních ventilátorů se nejdřív ověří, zda vůbec poskytují otáčky; bez tachometru lze jejich stav nanejvýš odvodit z řídicího signálu, a i jeho čtení (GPIO) vyžaduje samostatné schválení.
 

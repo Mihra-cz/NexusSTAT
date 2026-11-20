@@ -33,7 +33,7 @@ Podrobnosti skutečné instalace (názvy služeb, cesty mountů, výsledky inven
 
 - Raspberry Pi 5, Debian 13, ARM64.
 - Referenční verze Pironman 5 1.3.20 (pm_auto 2.0.6), služba `pironman5.service`. V jejím procesu běží moduly ventilátorů, OLED a RGB (`FanAddon`, `OLEDAddon`, `WS2812Addon`), které má NexusSTAT postupně nahradit.
-- Boční ventilátory řídí Pironman přes GPIO6 v režimu Always On; kernelový `gpio-hog` je jen návrh, není aktivovaný.
+- Boční ventilátory řídí Pironman přes GPIO6 v režimu Always On; kernelový `gpio-hog` je jen návrh, není aktivovaný. Read-only inventura M7-S1 (2026-11-20): Pironman drží GPIO6 přes lgpio a při svém zastavení ho vypíná; jeho RGB i vypnuté každou sekundu zapisuje na SPI0 a tlačítko drží výhradním grabem evdev. Vypnutí Pironmanu je proto zatím BLOCKER (GPIO6, tlačítko). Podrobnosti a návrh hogu v `OPERATIONS.md` (Nexus po M7-S1).
 - Hostitel zálohuje Resticem na NAS a NAS je připojený síťovými mounty; metadata mountu samy nezaručují online dostupnost NAS.
 - AnimeDB zatím na Nexusu neběží.
 
@@ -163,6 +163,7 @@ OledController.mode po update(now) ->      |  Signal: OFF | WHITE | CODES(sekven
 
 - Pironman zůstává v provozu a má RGB pod svou kontrolou až do samostatně schváleného bezpečného převzetí. Ovladač RGB je ve výchozím stavu vypnutý a zapne se až po ověřeném vypnutí RGB Pironmanu jeho vlastní konfigurací, bez zastavení `pironman5.service`, který dál řídí boční ventilátory. Druhého zapisovatele na SPI NexusSTAT spolehlivě nepozná, proto rozhoduje postup, ne detekce.
 - Před převzetím read-only ověřit, jak Pironman LED ovládá (zařízení, zapojení, konfigurace). Bez schválení žádná změna `config.txt`, overlayů, oprávnění ani služeb.
+- **M7-S1 (2026-11-20):** ověřeno read-only, že WS2812 Pironmanu s `rgb_enable=false` dál každou sekundu posílá černou na SPI0. Vypnutí vlastní konfigurací proto jediného vlastníka LED nezajistí a převzetí RGB vyžaduje zastavený Pironman, tedy nejdřív nezávislé řízení bočních ventilátorů. Čeká na rozhodnutí správce.
 - **Provozní omezení:** ovladač zhasne LED při inicializaci a korektním vypnutí, ale WS2812 po pádu procesu drží poslední barvu a pouhé ukončení aplikace to neodstraní. Svit LED po pádu NexusSTAT proto nic nedokládá; hardwarový watchdog ani další elektronika se nenavrhují.
 - Návrat: vypnout RGB v NexusSTAT a vrátit konfiguraci RGB Pironmanu ze zálohy.
 
