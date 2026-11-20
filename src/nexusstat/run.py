@@ -28,7 +28,10 @@ chráněné potvrzení závad a jas LED (M6-4B, admin.py); bez HTTPS administrac
 Se zapnutou sekcí [heartbeat] (M6-5, výchozí vypnuto) posílá jednou za 300 s
 podepsaný odchozí HTTPS heartbeat jen s celkovým stavem a časem (heartbeat.py).
 Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nepřistupuje
-k displeji, mountům NAS ani jinému hardwaru a do sítě posílá jen zapnuté kontroly AnimeDB a NAS. Se zapnutou historií
+k displeji, mountům NAS ani jinému hardwaru a do sítě posílá jen zapnuté kontroly AnimeDB a NAS.
+S [oled] device (M7-S9, výchozí bez něj) kreslí tytéž výsledky na skutečný OLED
+SSD1306 přes I²C (oled_device.py); displej spí do krátkého stisku, který zatím
+zastupuje signál SIGUSR1. Se zapnutou historií
 ([history] enabled = true s výslovnou cestou) předává vyhodnocené výsledky
 vláknu zapisovače SQLite; samo měření zůstává read-only a chyba historie ho
 nezastaví (history_link.py).
@@ -59,6 +62,7 @@ from .history_link import open_history
 from .mounts import RootMountMonitor
 from .nas_monitor import NasMonitor
 from .network_monitor import NetworkMonitor
+from .root_device import identify_root_device
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
 from .user_state import UserState
 from .web import DEFAULT_PORT, HISTORY_FAILED, LOOPBACK, check_port, start_web, stop_web, web_access
@@ -378,7 +382,7 @@ def history_results(monitor, results, now, observed_utc, validity_seconds):
 
 def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now, sleep=time.sleep,
              output=print_now, history_link=None, stopper=None, tick_seconds=None, board=None, user_state=None,
-             heartbeat=None):
+             heartbeat=None, display=None):
     """Hlavní smyčka měření. Běží do Ctrl+C nebo SIGTERM a vrací poslední výsledky.
 
     `config` je CollectorConfig, `evaluator` AlarmEvaluator s pravidly [alarms].
@@ -401,6 +405,8 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
     zánik potvrzení a soubor zapíše jen při skutečné změně.
     `heartbeat` (heartbeat.Heartbeat, M6-5) v každém taktu jen porovná čas; v termínu
     složí veřejný stav z týchž výsledků a předá ho vláknu přenosu, nic nečeká.
+    `display` (oled_device.OledDisplay, M7-S9) z týchž výsledků v každém taktu
+    vykreslí obraz OLED a předá ho vláknu zápisu; sám nic neměří a na I²C nečeká.
     """
     interval = config.interval_seconds
     tick = interval if tick_seconds is None else tick_seconds
@@ -471,6 +477,8 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
                 heartbeat.tick(results, now, observed_utc)
             if board is not None:
                 board.publish(results, now, observed_utc)
+            if display is not None:
+                display.tick(results, now, observed_utc)
             measurements += 1
             current = significant(results, now)
             if text is not None or current != printed or now >= next_summary:
@@ -528,6 +536,26 @@ def start_history(config, output=print_now):
            + (f" ({note})" if note else ""))
     output(f"Historie: snímky {snapshot_note(config, link)}")
     return link
+
+
+def start_display(config, monitor, output=print_now):
+    """Skutečný OLED podle [oled] device (M7-S9); bez něj None.
+
+    Displej nesmí zastavit měření: chybějící Pillow ohlásí a měří se dál bez
+    displeje, chyby I²C řeší až vlákno zápisu (oled_device.OledDisplay).
+    """
+    if config.oled.device is None:
+        return None
+    try:
+        from .oled_device import OledDisplay  # Pillow jen se zapnutým displejem
+    except ImportError as error:
+        output(f"OLED: nelze spustit ({error}); měření pokračuje bez displeje.")
+        return None
+    display = OledDisplay(config.oled, monitor.labels, config.collector.validity_seconds, identify_root_device(),
+                          output=output)
+    output(f"OLED: SSD1306 na {config.oled.device}, adresa 0x{config.oled.address:02X}; spí do krátkého stisku, "
+           "do obsluhy tlačítka ho zastupuje SIGUSR1 (systemctl kill -s USR1 nexusstat.service).")
+    return display
 
 
 def main(argv=None):
@@ -593,7 +621,7 @@ def main(argv=None):
         print_now(f"Web: {scheme}://{access.bind}:{server.server_address[1]}/ jen pro čtení, {clients}; "
                   f"ukazuje výsledky této smyčky, sám nic neměří{admin_note}.")
     stopper = Stopper()
-    link = user_state = heartbeat = None
+    link = user_state = heartbeat = display = previous_wake = None
     try:
         stopper.install()
         link = start_history(config)
@@ -617,10 +645,14 @@ def main(argv=None):
                                   config.collector.validity_seconds, output=print_now)
             print_now(f"Heartbeat: https://{heartbeat.host}:{heartbeat.port}{heartbeat.path}, jen celkový stav a čas, "
                       "první za 60 s, pak po 300 s bez opakování; podpis HMAC-SHA256.")
+        display = start_display(config, monitor)
+        if display is not None and threading.current_thread() is threading.main_thread():
+            # Krátký stisk bez tlačítka (M7-S9); obsluha jen nastaví příznak pro příští takt.
+            previous_wake = signal.signal(signal.SIGUSR1, lambda number, frame: display.wake())
         print_now(live_note())
         run_loop(monitor, config.collector, AlarmEvaluator(config.alarms),
                  history_link=link, stopper=stopper, tick_seconds=LIVE_TICK_SECONDS, board=board,
-                 user_state=user_state, heartbeat=heartbeat)
+                 user_state=user_state, heartbeat=heartbeat, display=display)
     except KeyboardInterrupt:
         # Signál mimo smyčku (např. během spouštění historie): ukončení je
         # řízené i tady, jen bez řádku o počtu měření.
@@ -633,6 +665,10 @@ def main(argv=None):
             stop_web(server)
         if heartbeat is not None:
             heartbeat.close()
+        if display is not None:
+            display.close()  # displej zhasne; na zaseknuté I²C se nečeká déle než 2 s
+        if previous_wake is not None:
+            signal.signal(signal.SIGUSR1, previous_wake)
         if user_state is not None:
             user_state.close()
         if link is not None:

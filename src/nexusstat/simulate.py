@@ -161,11 +161,10 @@ def run(output_dir, config):
             save_png(image, output_dir / f"{step:02d}_t{now:03d}_{state.replace('/', '_')}.png")
 
 
-def run_live(output_dir, config):
-    """Snímek každé obrazovky ze skutečného měření. Čas je skutečný monotónní.
+def live_results(config):
+    """Skutečné výsledky jednoho živého snímku: (výsledky s doplněnými službami, monotónní čas).
 
-    `config` je celá konfigurace: [oled] pro automat, [collector] pro platnost
-    výsledků, [network] pro sledované rozhraní, [services] pro AnimeDB, NAS a zálohy.
+    Sdílí ho simulate --live a krátká zkouška skutečného displeje (python3 -m nexusstat.oled_device).
     """
     monitor = live_monitor(config)
     # Kolektory měří ve svých intervalech (SCHED-2): síť po 1 s, CPU po 5 s.
@@ -183,6 +182,33 @@ def run_live(output_dir, config):
     # kontroly (M7-S9A) a do symbolu NEXUS ani STATUS se nepočítá.
     results = complete_service_results(results, observed_utc, now + config.collector.validity_seconds,
                                        monitored=monitor.labels)
+    return results, now
+
+
+def screens(oled_config, render_screen, now, results, wall_time, root_device):
+    """Obrazovky kolotoče a STATUS v jediném okamžiku `now`: [(název, obraz)].
+
+    Všechny ve stejném `now`, aby žádný snímek neukazoval výsledky po vypršení platnosti.
+    """
+    images = []
+    for page in CAROUSEL_PAGES:
+        controller = OledController(oled_config, pages=(page,))
+        controller.press(now, 0)
+        images.append((page, render_screen(controller, now, results, wall_time, root_device)))
+    controller = OledController(oled_config)
+    controller.press(now, 0)
+    controller.press(now, len(active_problems(results, now)))  # druhý stisk otevře STATUS
+    images.append(("STATUS", render_screen(controller, now, results, wall_time, root_device)))
+    return images
+
+
+def run_live(output_dir, config):
+    """Snímek každé obrazovky ze skutečného měření. Čas je skutečný monotónní.
+
+    `config` je celá konfigurace: [oled] pro automat, [collector] pro platnost
+    výsledků, [network] pro sledované rozhraní, [services] pro AnimeDB, NAS a zálohy.
+    """
+    results, now = live_results(config)
     for result in results:
         print(f"{result.id:<17} {result.state.value:<8} {result.summary}")
     # Zařízení ROOT jen jednou za běh (M5-S3), ne pro každý snímek; jen pro řádek ROOT DEV.
@@ -192,17 +218,8 @@ def run_live(output_dir, config):
     render_screen = load_renderer(output_dir)
     if render_screen is None:
         return
-    wall_time = datetime.now()
-    # Každou stránku kolotoče vykreslíme ve stejném okamžiku `now`, aby žádný
-    # snímek neukazoval výsledky po vypršení platnosti.
-    for page in CAROUSEL_PAGES:
-        controller = OledController(config.oled, pages=(page,))
-        controller.press(now, 0)
-        save_png(render_screen(controller, now, results, wall_time, root_device), output_dir / f"live_{page}.png")
-    controller = OledController(config.oled)
-    controller.press(now, 0)
-    controller.press(now, len(active_problems(results, now)))  # druhý stisk otevře STATUS
-    save_png(render_screen(controller, now, results, wall_time, root_device), output_dir / "live_STATUS.png")
+    for name, image in screens(config.oled, render_screen, now, results, datetime.now(), root_device):
+        save_png(image, output_dir / f"live_{name}.png")
 
 
 def main(argv=None):

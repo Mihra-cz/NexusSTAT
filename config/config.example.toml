@@ -7,6 +7,9 @@ height = 64   # podporováno pouze 64
 carousel_seconds = 300    # celé sekundy 1–3600
 page_seconds = 10         # celé sekundy 1–3600, nejvýše carousel_seconds
 status_idle_seconds = 30  # celé sekundy 1–3600
+# Skutečný displej SSD1306 přes I²C (M7-S9); bez klíče device se na hardware nic nezapisuje.
+# device = "/dev/i2c-1"
+# address = 0x3C   # 0x3C nebo 0x3D
 
 [collector]
 # Zápis do historie, její kontroly a plán snímků (výchozí 10 s; platnost jejich výsledků 3 × interval).

@@ -1,5 +1,13 @@
 # Changelog NexusSTAT
 
+## 2026-11-21 – M7-S9: ovladač skutečného OLED (lokálně hotový, na Nexusu neaktivovaný)
+
+- **Ověřený hardware (Nexus, jen čtení a dotaz adresy bez dat):** SSD1306 128 × 64 na `/dev/i2c-1`, adresa 0x3C odpovídá, 0x3D ne; adaptér podporuje prostý zápis I²C. Řadič, řídicí bajty (`0x00` příkazy, `0x40` data) a inicializace podle nainstalovaného Pironmanu 5; jeho kód se nepřebírá.
+- **Nový `oled_device.py`:** převod bitmapy (`frame_bytes`), řadič `Ssd1306` nad i2c-dev jen se standardní knihovnou a výstup `OledDisplay` pro měřicí smyčku. Kreslí stávající `render_screen()` z výsledků smyčky (žádné další měření, služby doplněné jako na webu, NEXUS `N/A`), zápis v jediném vlákně, jen poslední a změněný obraz, ve SLEEP displej vypnutý, chyba I²C nahlášena jednou a další pokus za 60 s. Krátký stisk do obsluhy tlačítka zastupuje `SIGUSR1`. Krátká zkouška displeje `python3 -m nexusstat.oled_device`.
+- **Zapojení:** `[oled] device` a `address` v konfiguraci (výchozí bez hardwaru), `run_loop(display=…)`, `run.start_display()` a obsluha `SIGUSR1` v `main()`; `simulate.py` sdílí živý snímek a obrazovky se zkouškou displeje. Bez `[oled] device` se nic nemění a Pillow se nenačítá.
+- **Testy:** nový `tests/test_oled_device.py` (převod bitmapy a zpětná kontrola po pixelech, přesná inicializační sekvence a zápis po stránkách, pět stránek ze skutečných výsledků shodných s `render_screen`, STATUS druhým probuzením, uspání po 300 s, žádný zápis stejného obrazu, chyba I²C a chybějící displej, chyba vykreslení, zablokované I²C nezdrží takt, čisté ukončení, smyčka měří jen jednou za takt, zkouška displeje) a testy `main()` (displej předán smyčce, SIGUSR1, zavření, obnova signálu, neplatné zařízení). Celá sada 1782 testů OK.
+- **Neprovedeno:** zkouška na skutečném displeji, změna služby (`20-oled.conf`, `[oled]` v konfiguraci) a nasazení zdrojů; postup a rollback v `OPERATIONS.md` (OLED na Nexusu).
+
 ## 2026-11-20 – M7-S9A: NEXUS bez kolektoru je N/A, zdravý systém je souhrnně OK
 
 - **Příčina:** `complete_service_results()` doplňoval chybějící `service.nexus` jako `UNKNOWN` („NEXUS: bez dat“), protože NEXUS na rozdíl od AnimeDB, NAS a BACKUP nebyl mezi volitelnými službami a vlastní kolektor nemá. Odtud `NEXUS NO DATA` ve STATUS a mezi aktivními závadami na webu, `?` na stránce NEXUS a `UNKNOWN` v záhlaví dashboardu i při zdravých měřeních. Záhlaví navíc bralo `overall_state()`, které u samých `INFO` vrací `INFO`, ne `OK`.

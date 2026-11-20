@@ -462,13 +462,47 @@ cd / && sudo -u nexusstat env PYTHONPATH=/srv/nexus/projects/nexusstat/src pytho
 - **Ověřeno bez skutečné zálohy:** přesný diff (jediný přidaný řádek), `bash -n`, stejný vlastník a práva (`root:root 0750`) a `restic backup --dry-run` nad `appdata/nexusstat` do dočasného lokálního repozitáře bez NAS: 5 položek z `history/` bez vyloučení, 0 s vyloučením, ostatních 20 položek zůstalo. Úloha od změny neběžela, první noční běh s vyloučením je ten následující.
 - **Rollback:** kopie originálu leží vedle skriptu s příponou `.orig-m7s8` (`root:root 0640`); obnova `sudo install -m 0750 -o root -g root <skript>.orig-m7s8 <skript>`.
 
+### OLED na Nexusu (M7-S9, připraveno, neaktivováno)
+
+- **Ověřený hardware:** SSD1306 128 × 64 na `/dev/i2c-1` (adaptér Synopsys DesignWare, prostý zápis I²C podporovaný), adresa 0x3C odpovídá (0x3D ne); řadič a inicializační sekvence podle nainstalovaného Pironmanu 5. Pironman je vypnutý, žádný kernelový ovladač na sběrnici 1 není navázaný. Ovladač nepotřebuje žádnou knihovnu kromě standardní a Pillow pro kreslení (na Nexusu systémové 11.1.0).
+- **Konfigurace** (do `/etc/nexusstat/config.toml`; bez `device` se na hardware nic nezapisuje):
+
+```toml
+[oled]
+device = "/dev/i2c-1"
+address = 0x3C
+```
+
+- **Minimální oprávnění:** služba má dnes `PrivateDevices=yes`, takže `/dev/i2c-1` vůbec nevidí. Drop-in `/etc/systemd/system/nexusstat.service.d/20-oled.conf` povolí jen tento uzel a skupinu `i2c` (žádné GPIO, SPI, input ani root; capabilities zůstávají prázdné):
+
+```ini
+[Service]
+# Skutečný OLED SSD1306 na I²C-1 (M7-S9): jen tento uzel zařízení a skupina i2c.
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=/dev/i2c-1 rw
+SupplementaryGroups=i2c
+```
+
+- **Krátká zkouška hardwaru před aktivací** (jako `mirek` ve skupině `i2c`, ze zdrojů commitu v dočasném adresáři; služba displej ovládat nemůže, protože má `PrivateDevices=yes`): nejdřív `sudo fuser -v /dev/i2c-1` (žádný proces) a `systemctl is-active pironman5` (`inactive`), potom
+
+```bash
+cd / && PYTHONPATH=/tmp/nexusstat-m7s9/src python3 -B -m nexusstat.oled_device --seconds 5
+```
+
+  Změří jeden živý snímek (read-only jako `simulate --live`), ukáže NEXUS, SYSTEM, STORAGE, NETWORK, SERVICES a STATUS po 5 s a displej vypne. Fyzicky ověřit čitelnost, orientaci, NEXUS bez symbolu a hodnoty proti dashboardu.
+- **Aktivace ve službě** (po schválení): zdroje `src/` z commitu M7-S9 s ověřením SHA-256, sekce `[oled]` v konfiguraci, drop-in `20-oled.conf`, `systemd-analyze verify`, `daemon-reload`, restart jen `nexusstat.service`. Journal má ukázat `OLED: SSD1306 na /dev/i2c-1, adresa 0x3C …` a `OLED: displej inicializován.`; displej zůstane zhasnutý.
+- **Diagnostické probuzení:** `sudo systemctl kill -s USR1 nexusstat.service` (krátký stisk): kolotoč pěti stránek po 10 s, po 300 s spánek; druhý signál během kolotoče otevře STATUS.
+- **Rollback (OLED vypnout, monitoring dál):** odebrat sekci `[oled]` (nebo jen `device`) z `/etc/nexusstat/config.toml` a smazat `20-oled.conf`, `daemon-reload` a restart služby; měření, web i historie poběží jako dnes. Návrat zdrojů: `src/` z předchozího commitu.
+- **Omezení:** po pádu procesu drží SSD1306 poslední obraz; při řízeném ukončení se vypne. Dva programy na jednom displeji by se přepisovaly, proto Pironman zůstává vypnutý a zkouška běží jen bez OLED ve službě.
+
 ### InfluxDB
 
 Zatím nevypínat. Používá ji jen Pironman (od M7-S2 vypnutý, do databáze už nikdo nezapisuje) a noční zálohovací úloha hostitele, která nejdřív připraví a zkontroluje online zálohu InfluxDB a uloží ji s Nexusem do Resticu. Vypnutí jen spolu s úpravou této úlohy: root přečte skript, zjistí jeho chování bez InfluxDB a odebere jen kroky InfluxDB; ostatní zálohy se nemění.
 
 ### Co zbývá pro OLED, RGB a tlačítko
 
-- **OLED:** ovladač SSD1306 (Adafruit SSD1306, nebo malá vrstva nad systémovým `python3-smbus2` 0.4.3), kreslení `render_screen()` mimo měřicí smyčku, vypnutí displeje ve SLEEP, izolace chyb I²C, zhasnutí při ukončení. Pironman je vypnutý, displej teď nikdo neovládá.
+- **OLED:** ovladač je hotový (M7-S9, viz OLED na Nexusu); zbývá krátká zkouška hardwaru, aktivace ve službě a místo `SIGUSR1` obsluha tlačítka.
 - **Tlačítko:** čtení `/dev/input/by-path/platform-pwr_button-event` s výhradním grabem (stačí standardní knihovna; `python3-evdev` v systému není), krátký stisk do `OledController`, dlouhý stisk podle schváleného návrhu (10s gesto reboot se neimplementuje).
 - **RGB:** ovladač Adafruit NeoPixel SPI (`/dev/spidev0.0`, 4 LED GRB), vlákno blikání, zhasnutí při startu a ukončení.
 - **Závislosti:** v systémovém Pythonu 3.13.5 jsou Pillow 11.1.0, `spidev` 3.6 a `smbus2`, Adafruit Blinka, SSD1306 a NeoPixel SPI ne. Systémový Python se nemění: buď venv projektu (umístění schválit), nebo malé ovladače nad systémovými balíčky.

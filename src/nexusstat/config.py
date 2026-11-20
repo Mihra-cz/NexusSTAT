@@ -16,6 +16,11 @@ from .core import is_finite_number
 DISPLAY_WIDTH = 128
 DISPLAY_HEIGHT = 64
 
+# Skutečný displej (M7-S9): SSD1306 na sběrnici I²C přes zařízení i2c-dev.
+# Řadič umí jen tyto dvě adresy; Pironman 5 má displej na 0x3C (ověřeno na Nexusu).
+OLED_DEVICE_PATTERN = re.compile(r"/dev/i2c-[0-9]{1,3}")
+OLED_ADDRESSES = (0x3C, 0x3D)
+
 # Horní mez chrání před překlepem (např. 3000 místo 300). OLED nemá svítit
 # hodiny a měření řidší než jednou za hodinu by diagnostice nic neřeklo.
 MAX_SECONDS = 3600
@@ -46,6 +51,8 @@ KNOWN_OLED_KEYS = {
     "carousel_seconds",
     "page_seconds",
     "status_idle_seconds",
+    "device",
+    "address",
 }
 KNOWN_COLLECTOR_KEYS = {"interval_seconds"}
 KNOWN_NETWORK_KEYS = {"interface"}
@@ -179,9 +186,18 @@ def _check_section(name, section, known_keys):
 
 @dataclass(frozen=True)
 class OledConfig:
+    """Časování automatu OLED a volitelně skutečný displej.
+
+    Bez `device` (výchozí) se nic nezapisuje na hardware: automat a obrazovky
+    slouží jen simulátoru. S `device` (např. "/dev/i2c-1") kreslí měřicí smyčka
+    na SSD1306 na adrese `address` (oled_device.py).
+    """
+
     carousel_seconds: int = 300
     page_seconds: int = 10
     status_idle_seconds: int = 30
+    device: str | None = None
+    address: int = 0x3C
 
     def __post_init__(self):
         # Validace přímo v konstruktoru: neplatná konfigurace nemůže vzniknout
@@ -191,6 +207,12 @@ class OledConfig:
         _check_seconds("status_idle_seconds", self.status_idle_seconds)
         if self.page_seconds > self.carousel_seconds:
             raise ConfigError("page_seconds nesmí být delší než carousel_seconds")
+        if self.device is not None and (not isinstance(self.device, str)
+                                        or not OLED_DEVICE_PATTERN.fullmatch(self.device)):
+            raise ConfigError(f"device musí být zařízení I²C ve tvaru /dev/i2c-N, ne {self.device!r}")
+        # bool je podtřída int, takže TOML `true` by jinak prošlo jako adresa 1.
+        if isinstance(self.address, bool) or self.address not in OLED_ADDRESSES:
+            raise ConfigError(f"address musí být 0x3C nebo 0x3D, ne {self.address!r}")
 
 
 @dataclass(frozen=True)
@@ -707,8 +729,8 @@ def oled_config_from_dict(section):
     if section.get("height", DISPLAY_HEIGHT) != DISPLAY_HEIGHT:
         raise ConfigError(f"podporovaná výška displeje je pouze {DISPLAY_HEIGHT}")
 
-    timing_keys = ("carousel_seconds", "page_seconds", "status_idle_seconds")
-    return OledConfig(**{key: section[key] for key in timing_keys if key in section})
+    keys = ("carousel_seconds", "page_seconds", "status_idle_seconds", "device", "address")
+    return OledConfig(**{key: section[key] for key in keys if key in section})
 
 
 def collector_config_from_dict(section):

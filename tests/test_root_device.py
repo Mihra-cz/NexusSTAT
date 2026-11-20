@@ -201,8 +201,9 @@ class RootDeviceTest(unittest.TestCase):
                     for alias in node.names}
         self.assertFalse({"subprocess", "socket", "glob", "shutil"} & imported)
         # Smyčka, kreslení, RGB ani historie identifikaci nevolají. Na požádání ji volá jen živý
-        # náhled při vytvoření LIVE, simulate --live jednou za běh (M5-S4) a web jednou při
-        # spuštění (M6-1); oled_text bere jen klíč.
+        # náhled při vytvoření LIVE, simulate --live jednou za běh (M5-S4), web jednou při
+        # spuštění (M6-1) a skutečný OLED (M7-S9): run.start_display jednou při spuštění a zkouška
+        # displeje oled_device jednou za běh; oled_text bere jen klíč.
         callers = []
         for path in source.parent.glob("*.py"):
             if path == source:
@@ -212,7 +213,7 @@ class RootDeviceTest(unittest.TestCase):
             names |= {node.id for node in nodes if isinstance(node, ast.Name)}
             if "identify_root_device" in names:
                 callers.append(path.name)
-        self.assertEqual(sorted(callers), ["preview.py", "simulate.py", "web.py"])
+        self.assertEqual(sorted(callers), ["oled_device.py", "preview.py", "run.py", "simulate.py", "web.py"])
 
     def test_manual_listing(self):
         output = io.StringIO()

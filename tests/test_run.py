@@ -974,6 +974,7 @@ class MainTest(unittest.TestCase):
             "neplatný interval": "[collector]\ninterval_seconds = 0\n",
             "neznámý klíč": "[collector]\nvalidity_seconds = 30\n",
             "neplatné OLED": "[oled]\npage_seconds = 0\n",
+            "neplatné zařízení OLED": '[oled]\ndevice = "/dev/sda"\n',
             "neznámá sekce": "[web]\nadmin_port = 8765\n",
             "neplatné rozhraní": '[network]\ninterface = "../eth0"\n',
             # Regrese: obří celé číslo shodilo main() tracebackem (OverflowError, kód 1).
@@ -1020,6 +1021,44 @@ class MainTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 main([])
         self.assertEqual(link.stops, 1)
+
+    def test_oled_is_off_without_device(self):
+        run_loop_mock, _ = self.run_main([])
+        self.assertIsNone(run_loop_mock.call_args.kwargs["display"])
+
+    def test_oled_display_is_passed_woken_by_sigusr1_and_closed(self):
+        class FakeDisplay:
+            def __init__(self, *args, **kwargs):
+                self.args, self.woken, self.closed = args, 0, 0
+
+            def wake(self):
+                self.woken += 1
+
+            def close(self):
+                self.closed += 1
+
+        created = []
+
+        def factory(*args, **kwargs):
+            created.append(FakeDisplay(*args, **kwargs))
+            return created[-1]
+
+        def loop(*args, **kwargs):
+            # Virtuální krátký stisk během běhu smyčky (systemctl kill -s USR1).
+            signal.getsignal(signal.SIGUSR1)(signal.SIGUSR1, None)
+
+        before = signal.getsignal(signal.SIGUSR1)
+        path = self.write_config('[oled]\ndevice = "/dev/i2c-1"\naddress = 0x3C\n')
+        with mock.patch("nexusstat.oled_device.OledDisplay", side_effect=factory), \
+                mock.patch("nexusstat.run.identify_root_device", return_value=None), \
+                mock.patch("nexusstat.run.run_loop", side_effect=loop) as run_loop_mock, \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            main(["--config", path])
+        [display] = created
+        self.assertIs(run_loop_mock.call_args.kwargs["display"], display)
+        self.assertEqual(display.args[0].device, "/dev/i2c-1")
+        self.assertEqual((display.woken, display.closed), (1, 1))
+        self.assertEqual(signal.getsignal(signal.SIGUSR1), before)
 
     def test_signal_handlers_are_restored_after_the_loop(self):
         before = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}

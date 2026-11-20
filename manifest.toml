@@ -51,7 +51,7 @@ database_adoption = "manual-command-only" # python3 -m nexusstat.history adopt: 
 
 [integrations]
 pironman5 = "stopped-and-disabled 2026-11-20 (M7-S2, admin decision), still installed for rollback; side fans held by the kernel gpio-hog on GPIO6; OLED, RGB and button without function until NexusSTAT drivers"
-oled = "planned; offline-simulator-only (local tests, 5 carousel pages incl. NETWORK and since M5-S4 STORAGE instead of DISK); hardware-not-integrated; M7-S2 2026-11-20: Pironman stopped, the display is off until the NexusSTAT OLED driver"
+oled = "M7-S9 2026-11-21: SSD1306 driver oled_device.py implemented and tested without hardware (I2C /dev/i2c-1, address 0x3C verified on Nexus, standard library only), not yet activated on Nexus; previously planned; offline-simulator-only (local tests, 5 carousel pages incl. NETWORK and since M5-S4 STORAGE instead of DISK); hardware-not-integrated; M7-S2 2026-11-20: Pironman stopped, the display is off until the NexusSTAT OLED driver"
 oled_language = "english-ascii" # texty displeje z id, stavu, measurement a details (oled_text.py), ne ze summary; výjimka jen jednotky B/s, KB/s, MB/s; terminál a dokumentace česky
 network = "implemented-locally (v0.6, notebook only); not-deployed; SCHED-2: RX/TX every 1 s from kernel counters, interface, link and IPv4 every 60 s and at once after the interface vanishes or is re-created" # read-only: /sys/class/net, /proc/net/route, ioctl SIOCGIFADDR bez odesílání
 oled_font = "bundled X11 misc-fixed 8x13B + 6x13 (public domain, src/nexusstat/fonts)"
@@ -89,7 +89,7 @@ periodic_loop = "notebook: foreground terminal; Nexus since M7-S3: systemd servi
 verified_on = "x86_64 Linux Mint (unit tests + read-only run + periodic loop in terminal incl. network, illustrative test thresholds)"
 raspberry_pi_tested = "readonly-service" # M7-S1 ruční běh 45 s (strace bez zápisů, /dev a spojení); M7-S3 služba od 2026-11-20 se správnými hodnotami, 0 restartů; unittest na Pi neběžel, po restartu RPi neověřeno
 history_live_check = "2026-10-22 developer notebook: four short read-only runs into an explicitly created development database outside the repository (the last one after the review tightened the storage checks), 21 measurements, 126 samples in 6 series, 44 state changes, no loss events, every run clean_stop=1 after SIGTERM (exit 0), aggregation_state untouched"
-hardware_display_tested = false
+hardware_display_tested = false # M7-S9: krátká zkouška skutečného displeje připravená, neprovedená
 alarm_thresholds = "configurable (cpu_temp, disk_root); disabled-by-default; no-approved-values"
 alarm_actions = "none" # alarm jen mění stav a výpis; žádné vypínání ani řízení ventilátorů
 version_control = "git" # lokální repozitář od 2026-10-19, větev main; commity a push jen po schválení
