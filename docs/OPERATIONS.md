@@ -462,10 +462,10 @@ cd / && sudo -u nexusstat env PYTHONPATH=/srv/nexus/projects/nexusstat/src pytho
 - **Ověřeno bez skutečné zálohy:** přesný diff (jediný přidaný řádek), `bash -n`, stejný vlastník a práva (`root:root 0750`) a `restic backup --dry-run` nad `appdata/nexusstat` do dočasného lokálního repozitáře bez NAS: 5 položek z `history/` bez vyloučení, 0 s vyloučením, ostatních 20 položek zůstalo. Úloha od změny neběžela, první noční běh s vyloučením je ten následující.
 - **Rollback:** kopie originálu leží vedle skriptu s příponou `.orig-m7s8` (`root:root 0640`); obnova `sudo install -m 0750 -o root -g root <skript>.orig-m7s8 <skript>`.
 
-### OLED na Nexusu (M7-S9, připraveno, neaktivováno)
+### OLED na Nexusu (M7-S9, aktivní od 2026-11-21)
 
 - **Ověřený hardware:** SSD1306 128 × 64 na `/dev/i2c-1` (adaptér Synopsys DesignWare, prostý zápis I²C podporovaný), adresa 0x3C odpovídá (0x3D ne); řadič a inicializační sekvence podle nainstalovaného Pironmanu 5. Pironman je vypnutý, žádný kernelový ovladač na sběrnici 1 není navázaný. Ovladač nepotřebuje žádnou knihovnu kromě standardní a Pillow pro kreslení (na Nexusu systémové 11.1.0).
-- **Konfigurace** (do `/etc/nexusstat/config.toml`; bez `device` se na hardware nic nezapisuje):
+- **Konfigurace** (v `/etc/nexusstat/config.toml`; bez `device` se na hardware nic nezapisuje):
 
 ```toml
 [oled]
@@ -473,7 +473,7 @@ device = "/dev/i2c-1"
 address = 0x3C
 ```
 
-- **Minimální oprávnění:** služba má dnes `PrivateDevices=yes`, takže `/dev/i2c-1` vůbec nevidí. Drop-in `/etc/systemd/system/nexusstat.service.d/20-oled.conf` povolí jen tento uzel a skupinu `i2c` (žádné GPIO, SPI, input ani root; capabilities zůstávají prázdné):
+- **Minimální oprávnění:** jednotka sama má `PrivateDevices=yes`, takže `/dev/i2c-1` nevidí. Drop-in `/etc/systemd/system/nexusstat.service.d/20-oled.conf` (`root:root 0644`) povolí jen tento uzel a skupinu `i2c` (žádné GPIO, SPI, input ani root; capabilities zůstávají prázdné):
 
 ```ini
 [Service]
@@ -484,17 +484,26 @@ DeviceAllow=/dev/i2c-1 rw
 SupplementaryGroups=i2c
 ```
 
-- **Krátká zkouška hardwaru před aktivací** (jako `mirek` ve skupině `i2c`, ze zdrojů commitu v dočasném adresáři; služba displej ovládat nemůže, protože má `PrivateDevices=yes`): nejdřív `sudo fuser -v /dev/i2c-1` (žádný proces) a `systemctl is-active pironman5` (`inactive`), potom
+- **Hardwarová zkouška (2026-11-21):** jako `mirek` ve skupině `i2c` ze zdrojů commitu d3e07fc v dočasném adresáři, služba přitom s `PrivateDevices=yes`. Předem Pironman `inactive`/`disabled` bez procesu, `sudo fuser -v /dev/i2c-1` bez procesu a SHA-256 zdrojů shodné s commitem; potom
 
 ```bash
 cd / && PYTHONPATH=/tmp/nexusstat-m7s9/src python3 -B -m nexusstat.oled_device --seconds 5
 ```
 
-  Změří jeden živý snímek (read-only jako `simulate --live`), ukáže NEXUS, SYSTEM, STORAGE, NETWORK, SERVICES a STATUS po 5 s a displej vypne. Fyzicky ověřit čitelnost, orientaci, NEXUS bez symbolu a hodnoty proti dashboardu.
-- **Aktivace ve službě** (po schválení): zdroje `src/` z commitu M7-S9 s ověřením SHA-256, sekce `[oled]` v konfiguraci, drop-in `20-oled.conf`, `systemd-analyze verify`, `daemon-reload`, restart jen `nexusstat.service`. Journal má ukázat `OLED: SSD1306 na /dev/i2c-1, adresa 0x3C …` a `OLED: displej inicializován.`; displej zůstane zhasnutý.
-- **Diagnostické probuzení:** `sudo systemctl kill -s USR1 nexusstat.service` (krátký stisk): kolotoč pěti stránek po 10 s, po 300 s spánek; druhý signál během kolotoče otevře STATUS.
-- **Rollback (OLED vypnout, monitoring dál):** odebrat sekci `[oled]` (nebo jen `device`) z `/etc/nexusstat/config.toml` a smazat `20-oled.conf`, `daemon-reload` a restart služby; měření, web i historie poběží jako dnes. Návrat zdrojů: `src/` z předchozího commitu.
-- **Omezení:** po pádu procesu drží SSD1306 poslední obraz; při řízeném ukončení se vypne. Dva programy na jednom displeji by se přepisovaly, proto Pironman zůstává vypnutý a zkouška běží jen bez OLED ve službě.
+  Změřil jeden živý snímek (read-only jako `simulate --live`), ukázal NEXUS, SYSTEM, STORAGE, NETWORK, SERVICES a STATUS po 5 s a displej vypnul (kód 0, bez chyby I²C). Správce fyzicky potvrdil: displej svítí, všech pět stránek je čitelných, STATUS správně, řádky bez posunu a převrácení, po zkoušce zhasnutý. Služba běžela dál se stejným PID a 0 restarty, historie dál zapisovala. **S OLED ve službě se zkouška nespouští** (dva zapisovatelé by se přepisovali; `fuser` teď ukáže proces služby).
+- **Aktivace (2026-11-21):** skript správce se sudo a potvrzením `ANO`. Nejdřív ověřil SHA-256 jednotky, `10-web.conf`, `config.toml` (shodný s kandidátem M7-S7) a obou kandidátů, nasazené `src/` (8685065) a jeho zálohu `pre-m7-2026-11-20/src-8685065.tar`; `systemd-analyze verify` jednotky s oběma drop-iny prošel už při přípravě. Pak `src/` z d3e07fc (ověřeno SHA-256), `20-oled.conf`, `config.toml` se sekcí `[oled]` (`root:nexusstat 0640`), `daemon-reload` a restart jen `nexusstat.service`. Journal: `OLED: SSD1306 na /dev/i2c-1, adresa 0x3C …` a `OLED: displej inicializován.`, žádná chyba I²C; historie zapsala čisté ukončení a pokračuje novým během. Kandidáti `20-oled.conf` a `config.toml.m7s9` zůstávají v `pre-m7-2026-11-20/`.
+- **Ověřeno po aktivaci:** displej po startu spí. První `SIGUSR1` rozsvítil kolotoč, druhý během kolotoče otevřel STATUS, po 30 s se vrátil kolotoč a po dalších 300 s displej zhasl (fyzicky potvrdil správce). Služba 0 restartů, journal bez varování a chyb, z LAN `GET /` a `/history` 200 se záhlavím `NexusSTAT OK`, historie zapisuje dál (nový běh 3; od kontroly před aktivací +283 vzorků). Nasazené `src/` = d3e07fc bez `__pycache__`, Pironman `inactive`/`disabled` bez procesu, GPIO6 dál drží hog, throttling `0x0`.
+- **Diagnostické probuzení:** `sudo systemctl kill -s USR1 nexusstat.service` (krátký stisk): kolotoč pěti stránek po 10 s, po 300 s spánek; druhý signál během kolotoče otevře STATUS, po 30 s nečinnosti se vrátí kolotoč s novým oknem 300 s. **Jen s aktivním OLED a až po řádku `OLED: displej inicializován.`:** bez displeje (nebo ještě během startu) služba signál neobsluhuje, výchozí akce ji ukončí a systemd ji za 10 s spustí znovu (`Restart=on-failure`).
+- **Rollback (OLED vypnout, monitoring dál):**
+
+```bash
+sudo rm /etc/systemd/system/nexusstat.service.d/20-oled.conf
+sudo install -m 0640 -o root -g nexusstat /srv/nexus/appdata/nexusstat/pre-m7-2026-11-20/config.toml.m7s7 /etc/nexusstat/config.toml
+sudo systemctl daemon-reload && sudo systemctl restart nexusstat.service
+```
+
+  Při řízeném zastavení displej zhasne; měření, web i historie poběží jako před M7-S9. Zdroje mohou zůstat (bez `[oled] device` se ovladač nespustí); úplný návrat na 8685065: `tar -x -C /srv/nexus/projects/nexusstat -f /srv/nexus/appdata/nexusstat/pre-m7-2026-11-20/src-8685065.tar && rm /srv/nexus/projects/nexusstat/src/nexusstat/oled_device.py` a restart služby (v `src/` mezi nimi jen přibyl `oled_device.py`).
+- **Omezení:** po pádu procesu drží SSD1306 poslední obraz; při řízeném ukončení se vypne. Dva programy na jednom displeji by se přepisovaly, proto Pironman zůstává vypnutý a zkouška `oled_device` běží jen bez OLED ve službě.
 
 ### InfluxDB
 
@@ -502,7 +511,7 @@ Zatím nevypínat. Používá ji jen Pironman (od M7-S2 vypnutý, do databáze u
 
 ### Co zbývá pro OLED, RGB a tlačítko
 
-- **OLED:** ovladač je hotový (M7-S9, viz OLED na Nexusu); zbývá krátká zkouška hardwaru, aktivace ve službě a místo `SIGUSR1` obsluha tlačítka.
+- **OLED:** ovladač běží ve službě od M7-S9 (2026-11-21, viz OLED na Nexusu); zbývá obsluha tlačítka místo `SIGUSR1`.
 - **Tlačítko:** čtení `/dev/input/by-path/platform-pwr_button-event` s výhradním grabem (stačí standardní knihovna; `python3-evdev` v systému není), krátký stisk do `OledController`, dlouhý stisk podle schváleného návrhu (10s gesto reboot se neimplementuje).
 - **RGB:** ovladač Adafruit NeoPixel SPI (`/dev/spidev0.0`, 4 LED GRB), vlákno blikání, zhasnutí při startu a ukončení.
 - **Závislosti:** v systémovém Pythonu 3.13.5 jsou Pillow 11.1.0, `spidev` 3.6 a `smbus2`, Adafruit Blinka, SSD1306 a NeoPixel SPI ne. Systémový Python se nemění: buď venv projektu (umístění schválit), nebo malé ovladače nad systémovými balíčky.

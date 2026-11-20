@@ -52,7 +52,7 @@ NexusSTAT má převzít aplikační funkce Pironmanu po jednotlivých funkcích.
 | Funkce Pironmanu | Cíl v NexusSTAT | Stav dnes | Podmínka převzetí |
 | --- | --- | --- | --- |
 | Systémový monitoring | `system_monitor`, smyčka měření, alarmy | od M7-S3 služba systemd na Nexusu (read-only, výpis do journalu) | ověření po restartu RPi |
-| OLED (`OLEDAddon`) | `oled`, `oled_text`, `render` + `oled_device` (SSD1306 přes i2c-dev, standardní knihovna) | ovladač hotový a otestovaný bez hardwaru (M7-S9), na Nexusu neaktivovaný; displej zhasnutý | krátká HW zkouška a aktivace ve službě (jen `/dev/i2c-1`) |
+| OLED (`OLEDAddon`) | `oled`, `oled_text`, `render` + `oled_device` (SSD1306 přes i2c-dev, standardní knihovna) | aktivní na Nexusu od M7-S9 (2026-11-21, drop-in `20-oled.conf` jen s `/dev/i2c-1`); displej spí do `SIGUSR1` | probouzení tlačítkem místo `SIGUSR1` |
 | RGB (`WS2812Addon`) | rozhodovací logika RGB oddělená od ovladače (Adafruit NeoPixel SPI), chování schválené 2026-10-23 | jen schválený návrh; LED zhasnuté, neovládá je nic | jediný vlastník LED: Pironman vypnutý (M7-S2), HW test, rollback |
 | Tlačítko | obsluha události Linux input | pravidlo udev 71: logind `pwr_button` nesleduje, krátký stisk bez akce (M7-S2); obsluha nic | obsluha s výhradním grabem, rozhodnutí o dlouhém stisku |
 | Ventilátory (`FanAddon`) | hlavní CPU ventilátor: Linux řídí, NexusSTAT čte; boční: nezávislé řízení kernelovým gpio-hog + monitoring | hlavní CPU ventilátor read-only i na Nexusu (M7-S3), boční drží gpio-hog (M7-S2) | splněno: oba boční fyzicky ověřené 2026-11-20 po restartu i po zastavení Pironmanu |

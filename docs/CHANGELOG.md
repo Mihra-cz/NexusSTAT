@@ -1,5 +1,15 @@
 # Changelog NexusSTAT
 
+## 2026-11-21 – M7-S9: hardwarová zkouška a aktivace OLED na Nexusu
+
+- **Předpoklady:** Pironman `inactive`/`disabled` bez procesu, `/dev/i2c-1` (`root:i2c 0660`) nedrží žádný proces (`sudo fuser`), Pillow 11.1.0 v systémovém Pythonu. Zdroje commitu d3e07fc v dočasném adresáři ověřené SHA-256 po souborech.
+- **Zkouška hardwaru:** `python3 -B -m nexusstat.oled_device --seconds 5` jako `mirek` (skupina `i2c`, bez sudo) při běžící službě bez přístupu k zařízením: NEXUS, SYSTEM, STORAGE, NETWORK, SERVICES a STATUS, kód 0, bez chyby I²C. Správce fyzicky potvrdil čitelnost všech stránek, STATUS, orientaci bez posunu řádků a vypnutí po zkoušce. Služba dál běžela se stejným PID, historie zapisovala.
+- **Aktivace:** skript správce s ověřením SHA-256 jednotky, `10-web.conf`, `config.toml` a kandidátů; `src/` z d3e07fc (záloha předchozího `src/` 8685065 jako `pre-m7-2026-11-20/src-8685065.tar`), drop-in `20-oled.conf` (`PrivateDevices=no`, `DevicePolicy=closed`, `DeviceAllow=/dev/i2c-1 rw`, `SupplementaryGroups=i2c`) a sekce `[oled]` (`device = "/dev/i2c-1"`, `address = 0x3C`) v `/etc/nexusstat/config.toml`, `daemon-reload`, restart jen `nexusstat.service`. Journal `OLED: displej inicializován.`, historie čistě ukončila a pokračuje novým během.
+- **Ověřeno po aktivaci:** displej po startu spí; `SIGUSR1` rozsvítí kolotoč, druhý otevře STATUS, po 30 s se vrátí kolotoč a po 300 s displej zhasne (fyzicky potvrzeno). 0 restartů, journal bez varování a chyb, web z LAN 200 se záhlavím `NexusSTAT OK`, historie zapisuje dál (nový běh 3; od kontroly před aktivací +283 vzorků). GPIO6 dál drží hog, throttling `0x0`, Pironman beze změny.
+- **Upřesnění provozu:** `SIGUSR1` jen s aktivním OLED a po `OLED: displej inicializován.`; bez displeje ho služba neobsluhuje, signál ji ukončí a systemd ji za 10 s spustí znovu. Zkouška `oled_device` se s OLED ve službě nespouští. Rollback (drop-in pryč, `config.toml.m7s7` zpět, restart) v `OPERATIONS.md`.
+- **Doplněno:** M7-S9A (src 8685065) byla na Nexusu nasazena 2026-11-20 (záznam níže uváděl stav před nasazením).
+- **Beze změny:** kód a testy, jednotka `nexusstat.service`, `10-web.conf`, GPIO6, boot konfigurace, RGB, tlačítko, UFW, Restic, InfluxDB, AnimeDB, NAS, heartbeat, schéma SQLite.
+
 ## 2026-11-21 – M7-S9: ovladač skutečného OLED (lokálně hotový, na Nexusu neaktivovaný)
 
 - **Ověřený hardware (Nexus, jen čtení a dotaz adresy bez dat):** SSD1306 128 × 64 na `/dev/i2c-1`, adresa 0x3C odpovídá, 0x3D ne; adaptér podporuje prostý zápis I²C. Řadič, řídicí bajty (`0x00` příkazy, `0x40` data) a inicializace podle nainstalovaného Pironmanu 5; jeho kód se nepřebírá.
