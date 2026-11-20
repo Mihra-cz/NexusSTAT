@@ -2,7 +2,7 @@
 
 ## Skutečný stav
 
-Na Nexusu běží od 2026-11-20 (M7-S3) služba `nexusstat.service`: jediný proces `nexusstat.run` s výchozí konfigurací (bez historie, webu, heartbeatu a služeb), jen read-only měření a výpis do journalu, bez portu. Zdroje commitu `54648cc` jsou v `/srv/nexus/projects/nexusstat`. Pironman je zastavený a zakázaný a boční ventilátory drží kernelový gpio-hog na GPIO6 (M7-S2). Stav `testing`: chování po restartu Raspberry Pi a obnova zatím neověřeny. Provoz, rollback a další kroky jsou v sekci Nexus: nasazení M7-S1 až M7-S3. Příkazy v sekcích o budoucím provozu níže nejsou příkazem k nasazení.
+Na Nexusu běží od 2026-11-20 (M7-S3) služba `nexusstat.service`: jediný proces `nexusstat.run` s výchozí konfigurací (bez historie, webu, heartbeatu a služeb), jen read-only měření a výpis do journalu; od M7-S6 v témže procesu dashboard jen pro čtení v domácí LAN na portu 8765 (adresa Nexusu s rezervací DHCP, jediné pravidlo UFW). Administrace, heartbeat ani SQLite historie aktivované nejsou. Zdroje commitu `54648cc` jsou v `/srv/nexus/projects/nexusstat`. Pironman je zastavený a zakázaný a boční ventilátory drží kernelový gpio-hog na GPIO6 (M7-S2). Stav `testing`: chování po restartu Raspberry Pi a obnova zatím neověřeny. Provoz, rollback a další kroky jsou v sekci Nexus: nasazení M7-S1 až M7-S3. Příkazy v sekcích o budoucím provozu níže nejsou příkazem k nasazení.
 
 ## Lokální vývoj (simulace, read-only kolektory a pravidelné měření)
 
@@ -189,11 +189,13 @@ PYTHONPATH=src python3 -m nexusstat.run --web
 - Web ukazuje výsledky téže smyčky, sám nic neměří a nic nezapisuje: obnova stránky ani víc záložek nespustí žádnou kontrolu. Zařízení ROOT se zjistí jednou při spuštění.
 - Naslouchá jen na loopbacku, nejde ho otevřít z jiného počítače a firewall se nemění. Jen `GET`/`HEAD` na `/`; požadavky se nelogují.
 - Ukončení stejně jako smyčka (Ctrl+C nebo SIGTERM); server se zastaví s ní nejvýš do 0,5 s a port je hned volný. Nedokončený požadavek server zavře po 5 s; odpojení prohlížeče během obnovy se nevypisuje.
-- **Neotevírat v LAN** (ani přes SSH tunel nebo reverzní proxy pro jiné uživatele), dokud neproběhne samostatné bezpečnostní review a schválení pravidel firewallu (REQUIREMENTS.md, Web / přístup). Volby `--web-bind`, `--web-allow` a `--web-host` (M6-3) jsou připravené, ale použijí se až podle postupu níže.
+- **Neotevírat v LAN** (ani přes SSH tunel nebo reverzní proxy pro jiné uživatele), dokud neproběhne samostatné bezpečnostní review a schválení pravidel firewallu (REQUIREMENTS.md, Web / přístup). Na Nexusu otevřeno rozhodnutím správce v M7-S6 (2026-11-20), viz Web v domácí LAN. Volby `--web-bind`, `--web-allow` a `--web-host` (M6-3) jsou připravené, ale použijí se až podle postupu níže.
 - **Ochrany serveru (M6-3):** nejvýš 8 souběžných spojení a 20 nových spojení za sekundu, celkový termín spojení 10 s, hlavička nejvýš 8 KiB; nadbytečné a cizí spojení se hned zavře. Pomalý nebo zahlcující klient tak nezastaví měření, alarmy ani zapisovač historie, nejvýš krátce zdrží web.
 - **Historie (M6-2):** grafy na `http://127.0.0.1:8765/history` se ukážou jen se zapnutou sekcí `[history]` (jinak stránka napíše, že je historie vypnutá). Čtou SQLite jen pro čtení přes `open_reader` v krátké transakci a výsledek drží v paměti 30 s až 30 min podle rozsahu; hlavní stránka databázi nečte. Nedostupná databáze se ukáže jen na stránce historie (kód důvodu), měření ani dashboard nezastaví.
 
-### Budoucí otevření webu v LAN (M6-3, připravený postup, neprovedeno)
+### Otevření webu v LAN (M6-3; na Nexusu provedeno v M7-S6)
+
+Na Nexusu provedeno 2026-11-20 přes drop-in služby místo ručního spuštění v kroku 2; skutečný stav a rollback jsou v sekci Web v domácí LAN (M7-S5 a M7-S6).
 
 Nic z toho se teď neprovádí: Nexus, router ani firewall se nemění. Předpoklady jsou schválené bezpečnostní review, skutečná adresa Nexusu v LAN (`<IP_NEXUSU>`) a schválený rozsah klientů (`<LAN_ROZSAH>`, nejlépe jen domácí podsíť). Obě hodnoty zadá správce; neodvozují se z výchozí trasy ani se nevymýšlejí a do veřejného repozitáře nepatří.
 
@@ -265,7 +267,7 @@ Pro budoucí kolektory (M4, M7) a jen po schválení read-only ověřit zdroje d
 
 ## Nexus: nasazení M7-S1 až M7-S3 (stav 2026-11-20)
 
-Stav `testing`: na Nexusu běží služba `nexusstat.service` jen s read-only měřením a výpisem do journalu, bez portu, historie, heartbeatu a služeb (zdroje commitu `54648cc` v `/srv/nexus/projects/nexusstat`). Pironman je zastavený a zakázaný, ale nainstalovaný; oba boční ventilátory drží kernelový gpio-hog na GPIO6. OLED, RGB a tlačítko do převzetí NexusSTAT nefungují, web a historie na Nexusu neběží. InfluxDB běží dál. Chování po restartu Raspberry Pi se službou a bez Pironmanu ani obnova zatím ověřené nejsou.
+Stav `testing`: na Nexusu běží služba `nexusstat.service` s read-only měřením, výpisem do journalu a od M7-S6 s dashboardem jen pro čtení v domácí LAN, bez historie, heartbeatu, administrace a služeb (zdroje commitu `54648cc` v `/srv/nexus/projects/nexusstat`). Pironman je zastavený a zakázaný, ale nainstalovaný; oba boční ventilátory drží kernelový gpio-hog na GPIO6. OLED, RGB a tlačítko do převzetí NexusSTAT nefungují, web a historie na Nexusu neběží. InfluxDB běží dál. Chování po restartu Raspberry Pi se službou a bez Pironmanu ani obnova zatím ověřené nejsou.
 
 ### Služba nexusstat (M7-S3, běží od 2026-11-20)
 
@@ -393,7 +395,7 @@ Služba běží vždy pod `nexusstat`, nikdy jako root, bez capabilities. `Priva
 | --- | --- | --- |
 | měření `/proc`, `/sys` | žádné | `ProtectKernelTunables` jen zakáže zápis; nepoužít `ProcSubset=pid` (skryl by `/proc/stat`, `/proc/meminfo`, `/proc/net/route`) |
 | režim `/` | `ProtectSystem=full` | `strict` dává falešný `ROOT READ-ONLY` (viz výše) |
-| lokální web na 127.0.0.1 | `IPAddressAllow=localhost` | `IPAddressDeny=any` blokuje i loopback; návrh níže |
+| web (M7-S5, M7-S6) | `IPAddressAllow=localhost <LAN_ROZSAH>`, `After=network-online.target` | hotovo; `IPAddressDeny=any` blokuje i loopback |
 | historie, uživatelský stav | `ReadWritePaths=/srv/nexus/appdata/nexusstat/…`, adresář vlastní `nexusstat` | jinak bez zápisu |
 | stav hodin pro historii | bez `ProtectClock=` | blokoval by i dotaz `adjtimex` (`modes = 0`) |
 | OLED | `DeviceAllow=/dev/i2c-1 rw`, `SupplementaryGroups=i2c` | jen sběrnice 1 |
@@ -401,46 +403,33 @@ Služba běží vždy pod `nexusstat`, nikdy jako root, bez capabilities. `Priva
 | tlačítko | `DeviceAllow=/dev/input/by-path/platform-pwr_button-event r`, `SupplementaryGroups=input` | cgroup `DeviceAllow` pustí jen toto zařízení; zda systemd přijme cestu přes symlink, ověřit |
 | boční ventilátory, CPU FAN | žádné | GPIO drží jádro (hog) |
 | kontrola záloh | `AF_UNIX` (systemd po D-Bus) | bez sudo |
-| web v LAN | `IPAddressAllow=<LAN_ROZSAH>`, UFW zvlášť | až po bezpečnostním review |
 | AnimeDB, NAS, heartbeat | `IPAddressAllow=<adresa>` | heartbeat s proměnnou veřejnou adresou jen vědomě bez filtru IP |
 | dlouhý stisk = vypnutí | pravidlo polkit jen pro `nexusstat` a `org.freedesktop.login1.power-off` | jen je-li schváleno |
 
 Zařízení jdou zpřístupnit přes `PrivateDevices=no` s `DevicePolicy=closed` a `DeviceAllow=` (doporučeno), nebo `PrivateDevices=yes` s `BindPaths=` uzlů a `DeviceAllow=`; obojí ověřit `systemd-analyze security` a krátkým během.
 
-### Návrh: lokální web na 127.0.0.1:8765 (neprovedeno)
+### Web v domácí LAN (M7-S5 a M7-S6, běží)
 
-Existující web jen pro čtení (M6-1) běží v témže procesu a ukazuje výsledky jeho smyčky; nic neměří, nic nezapisuje a bez `--web-bind` naslouchá jen na `127.0.0.1`. Bez historie stránka `/history` jen vysvětlí, že je vypnutá. Minimální změna je drop-in `/etc/systemd/system/nexusstat.service.d/10-web.conf`:
+Dashboard jen pro čtení běží v témže procesu a ukazuje výsledky jeho smyčky; nic neměří a nic nezapisuje. M7-S5 ho zapnul na `127.0.0.1:8765`, M7-S6 (rozhodnutí správce 2026-11-20) ho přesunul na adresu Nexusu v domácí LAN. Ta má na routeru rezervaci DHCP (potvrdil správce). Skutečná adresa a rozsah jsou jen v konfiguraci Nexusu, zde `<IP_NEXUSU>` a `<LAN_ROZSAH>`.
+
+Drop-in `/etc/systemd/system/nexusstat.service.d/10-web.conf`:
 
 ```ini
+[Unit]
+Wants=network-online.target
+After=network-online.target
+
 [Service]
-# Lokální web jen pro čtení na 127.0.0.1:8765 v témže procesu (M6-1).
 ExecStart=
-ExecStart=/usr/bin/python3 -B -m nexusstat.run --web
-# IPAddressDeny=any z jednotky blokuje i loopback; povolí se jen on.
-IPAddressAllow=localhost
+ExecStart=/usr/bin/python3 -B -m nexusstat.run --web --web-bind <IP_NEXUSU> --web-allow <LAN_ROZSAH>
+IPAddressAllow=localhost <LAN_ROZSAH>
 ```
 
-Zapnutí (po schválení; služba se krátce restartuje, chlazení to neovlivní):
-
-```bash
-sudo mkdir -p /etc/systemd/system/nexusstat.service.d && sudo install -m 0644 10-web.conf /etc/systemd/system/nexusstat.service.d/10-web.conf && sudo systemctl daemon-reload && sudo systemctl restart nexusstat.service
-```
-
-Ověření na Nexusu (očekáváno `127.0.0.1:8765` jako jediný poslech, `200 text/html` a řádek `Web: http://127.0.0.1:8765/ jen pro čtení, jen z tohoto počítače` v journalu):
-
-```bash
-ss -ltn 'sport = :8765'
-```
-
-```bash
-curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' http://127.0.0.1:8765/
-```
-
-```bash
-journalctl -u nexusstat.service -n 5 --no-pager
-```
-
-Z notebooku jen pro správce přes tunel SSH (`ssh -L 8765:127.0.0.1:8765 nexus`, pak `http://localhost:8765/`); web hlavičku `localhost:8765` přijímá. UFW, router ani `--web-bind` se nemění. Rollback: `sudo rm /etc/systemd/system/nexusstat.service.d/10-web.conf && sudo systemctl daemon-reload && sudo systemctl restart nexusstat.service`.
+- **`After=network-online.target`:** web je vázaný na adresu LAN. Bez přidělené adresy by start skončil kódem 2 a s ním i měření (bez restartu kvůli `RestartPreventExitStatus=2`); totéž po změně adresy, proto rezervace DHCP.
+- **Síť:** `IPAddressDeny=any` z hlavní jednotky platí dál, povolený je jen loopback a domácí LAN. UFW má jediné nové pravidlo `sudo ufw allow proto tcp from <LAN_ROZSAH> to <IP_NEXUSU> port 8765 comment 'NexusSTAT read-only web'`; výchozí politika (`deny` příchozí) a pravidlo SSH se nezměnily. Starší pravidlo pro dashboard Pironmanu (TCP 34001) zůstalo, ačkoli Pironman neběží.
+- **Ověřeno 2026-11-20** z notebooku v LAN: `GET /` 200, `HEAD /` 200, `/history` 200 („Historie je vypnutá“), `POST /` 405, `/admin` 403 („Administrace je vypnutá“), cizí hlavička `Host` 403 (M7-S5). Naslouchá jen `<IP_NEXUSU>:8765`, na loopbacku už ne. Hodnoty odpovídají měření a časy měření na stránce dokládají, že web sám neměří. SSH funguje, journal je bez chyb, 0 restartů.
+- **Kandidáti** jsou v `pre-m7-2026-11-20/`: `10-web.conf` (jen loopback) a `10-web-lan.conf` (LAN).
+- **Rollback na loopback** (`P` = adresář zálohy): `sudo install -m 0644 "$P/10-web.conf" /etc/systemd/system/nexusstat.service.d/10-web.conf && sudo ufw delete allow proto tcp from <LAN_ROZSAH> to <IP_NEXUSU> port 8765 && sudo systemctl daemon-reload && sudo systemctl restart nexusstat.service`. Úplné vypnutí webu: smazat drop-in, `daemon-reload` a restart.
 
 ### InfluxDB
 

@@ -345,7 +345,9 @@ Stránka `http://127.0.0.1:8765/history` (odkaz „Historie“ z dashboardu) uka
 - Neimplementováno: přístup z LAN, administrace, heartbeat, `agg_1h` pro rozsahy nad 60 dní, události a změny stavu v grafech.
 - Ověřeno syntetickou SQLite mimo repozitář, testovacími HTTP požadavky na loopbacku a vizuálně ve vestavěném prohlížeči; Raspberry Pi ani Nexus neověřeny.
 
-## Read-only web pro domácí LAN (M6-3, připraveno lokálně, v LAN neotevřeno)
+## Read-only web pro domácí LAN (M6-3; od M7-S6 na Nexusu otevřeno)
+
+**M7-S6 (2026-11-20, rozhodnutí správce):** na Nexusu běží s `--web-bind <IP_NEXUSU> --web-allow <LAN_ROZSAH>` (adresa s rezervací DHCP), systemd povoluje jen loopback a tento rozsah a UFW má jediné nové pravidlo pro TCP 8765 z tohoto rozsahu na adresu Nexusu. Administrace (bez HTTPS) a heartbeat zůstávají vypnuté. Postup a rollback v `OPERATIONS.md`.
 
 Dashboard a historie zůstávají **bez přihlášení a jen pro čtení**. Výchozí chování se nemění: `nexusstat.run --web` naslouchá jen na `127.0.0.1`. Adresa v LAN se zapíná jen výslovně a s výslovně schváleným rozsahem klientů; skutečné otevření v LAN čeká na bezpečnostní review a schválení firewallu (OPERATIONS.md).
 
@@ -505,7 +507,7 @@ Priorita vzorů od nejvyšší: `CRITICAL` → automatická signalizace nepotvrz
 - **Formuláře a CSRF:** `POST` jen na `/admin/login`, `/admin/acknowledge`, `/admin/brightness` a `/admin/logout`; tělo jen `application/x-www-form-urlencoded` s jednou přesnou `Content-Length` do 1 KiB (bez `Transfer-Encoding`), přesně povolená pole, každé jednou, UTF-8. `Origin` se musí přesně rovnat `https://` a ověřené hlavičce `Host`; každá akce kromě přihlášení nese token CSRF relace. Parametry v adrese administrace se odmítají (tajemství nikdy v URL). Stránky administrace mají CSP s `form-action 'self'`, ostatní dál `form-action 'none'`; vše escapované, `no-store`, bez JavaScriptu.
 - **Odpověď rozlišuje provedeno (`200`), odmítnuto (`409`) a nejisté (`503`):** čeká se 3 s; nepřevezme-li smyčka požadavek včas, zruší se a teprve úspěšné zrušení dokládá, že se nic nezměnilo. Převzatý požadavek se dočká odpovědi ještě 2 s, jinak je výsledek nejistý (stránka vyzve k ověření), nikdy „neprovedeno“. Provedená akce uvádí, zda je uložená do souboru stavu.
 - **Potvrzení** nese závažnost, kterou správce na stránce viděl; zhoršenou závadu, `CRITICAL` (bez tlačítka), `UNKNOWN`, prošlá i simulovaná data odmítne vlastník stavu. Potvrzení nemění stav závady: OLED, dashboard i historie ji ukazují dál, ovlivní jen schválené chování RGB.
-- **Neověřeno a samostatně:** skutečné certifikáty a důvěra klientských zařízení, otevření v LAN (adresa, UFW), test na Raspberry Pi. Veřejný web administraci nikdy nenabízí.
+- **Neověřeno a samostatně:** skutečné certifikáty a důvěra klientských zařízení, test na Raspberry Pi; na Nexusu je administrace vypnutá (web v LAN od M7-S6 jen pro čtení přes HTTP). Veřejný web administraci nikdy nenabízí.
 
 ### Veřejný heartbeat (M6-5, odesílač lokálně, přijímač neexistuje)
 

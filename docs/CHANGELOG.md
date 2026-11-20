@@ -1,5 +1,12 @@
 # Changelog NexusSTAT
 
+## 2026-11-20 – M7-S5 a M7-S6: dashboard jen pro čtení v domácí LAN
+
+- **M7-S5:** drop-in `/etc/systemd/system/nexusstat.service.d/10-web.conf` přidal `--web` a `IPAddressAllow=localhost` (`IPAddressDeny=any` blokuje i loopback). Web běží v témže procesu na `127.0.0.1:8765`: `GET /` 200, `HEAD` 200, `/history` 200 s vypnutou historií, `POST` 405, `/admin` 403, cizí `Host` 403, hodnoty odpovídají systému a časy měření na stránce dokládají, že web sám neměří. `UNKNOWN` v záhlaví pochází jen ze zástupce `NEXUS NO DATA` bez vlastní kontroly.
+- **M7-S6 (rozhodnutí správce):** jediný LAN rozsah ověřený jednorázově (sítě Dockeru se nepočítají). Drop-in vyměněn za `--web-bind <IP_NEXUSU> --web-allow <LAN_ROZSAH>`, `IPAddressAllow=localhost <LAN_ROZSAH>` a `After=network-online.target`, protože web vázaný na adresu LAN bez ní při bootu nenaběhne a s ním ani měření. UFW má jediné nové pravidlo pro TCP 8765 z domácí LAN na adresu Nexusu; výchozí politika ani SSH se nezměnily. Adresa má na routeru rezervaci DHCP (potvrdil správce). Skutečná adresa a rozsah nejsou v repozitáři.
+- **Ověřeno z notebooku v LAN:** `GET /` 200, `HEAD` 200, `/history` 200, `POST` 405, `/admin` 403, naslouchá jen adresa Nexusu v LAN, SSH funguje, 0 restartů, journal bez chyb. GPIO6 dál drží hog v HIGH, throttling `0x0`, Pironman vypnutý; AnimeDB, Docker a InfluxDB běží bez restartu od bootu.
+- **Beze změny:** administrace (bez HTTPS vypnutá), heartbeat a SQLite historie nejsou aktivované; pravidlo UFW pro bývalý dashboard Pironmanu (TCP 34001) zůstalo.
+
 ## 2026-11-20 – M7-S2 a M7-S3: nezávislé chlazení, vypnutý Pironman a služba NexusSTAT (`testing`)
 
 - **Záloha (M7-S2A):** jediná záloha `/srv/nexus/appdata/nexusstat/pre-m7-2026-11-20/` jako `mirek` bez root (soubory jsou čitelné): `config.txt`, `cmdline.txt`, `config.json` a jednotka Pironmanu se SHA-256, vlastníky a právy, výpisy `gpioinfo` a `pinctrl` a kandidáti. Pironman neměl drop-iny. `tryboot` je bootloaderem nabízený, ale nepoužil se.
