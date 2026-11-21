@@ -28,10 +28,11 @@ společná s kontrolou NAS (services.OutageConfirmation).
 `progress.json` koordinátoru reorganizace, který vydává týž Nginx. Doložená
 probíhající operace (`active` true, `updated_at` čerstvé, bez rozporu) je
 INFO s details `health` = maintenance („MAINT“): ani výpadek, ani ověřené
-zdraví; řada potvrzování výpadku se jí přeruší. Bez dokladu (soubor chybí,
-koordinátor nic neřídí, STOP, nedostupný stav) platí potvrzování výpadku
-beze změny, takže skutečný výpadek se nikdy neschová. Zastaralý nebo
-neplatný doklad dá UNKNOWN, pokud zdraví nedoloží samo /health.
+zdraví; řada potvrzování výpadku se jí přeruší. Bez platného dokladu (soubor
+chybí, koordinátor nic neřídí, STOP, nedostupný, zastaralý nebo neplatný
+stav) platí potvrzování výpadku beze změny: krátce UNKNOWN, po potvrzení
+ERROR. Zastavený koordinátor se zastaralým souborem tak skutečný výpadek
+neschová.
 
 Od SCHED-1 se kontroluje jen jednou za `interval_seconds` (výchozí 15 min,
 run.Scheduled); po prvním neúspěchu nejvýš dva rychlé pokusy s odstupem 30 s
@@ -224,8 +225,9 @@ class AnimeDbMonitor:
     def probe(self):
         """(výsledek, popis, details) jedné kontroly; None = výpadek nepotvrdí ani nevyřeší.
 
-        Doložená údržba i nečitelný doklad u nedoloženého zdraví vrací None:
-        přeruší řadu potvrzování, takže z nich nikdy nevznikne ERROR ani OK.
+        Doložená údržba vrací None: přeruší řadu potvrzování, takže z ní nikdy
+        nevznikne ERROR ani OK. Zastaralý nebo neplatný doklad údržbu
+        nedokládá: výsledek /health jde do potvrzování beze změny, jen s poznámkou.
         """
         outcome, text, details = self.health()
         evidence = self.maintenance()
@@ -233,9 +235,7 @@ class AnimeDbMonitor:
             return None, "plánovaná údržba (reorganizace řízená koordinátorem)", {HEALTH: MAINTENANCE}
         if evidence in (STALE, INVALID):
             problem = "zastaralý" if evidence == STALE else "neplatný"
-            if outcome == UP:
-                return UP, f"{text} ({problem} stav reorganizace)", details
-            return None, f"{text}; {problem} stav reorganizace", {HEALTH: INVALID, CAUSE: f"status_{evidence}"}
+            return outcome, f"{text} ({problem} stav reorganizace)", details
         return outcome, text, details
 
     def maintenance(self):

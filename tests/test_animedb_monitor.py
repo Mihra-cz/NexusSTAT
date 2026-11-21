@@ -827,13 +827,24 @@ class MaintenanceTest(unittest.TestCase):
         }
         for name, status in bad.items():
             with self.subTest(name):
-                # Bez doloženého zdraví UNKNOWN a nikdy ERROR: řada výpadku se přeruší.
+                # Neplatný doklad údržbu nedokládá: krátce UNKNOWN, opakovaný výpadek je potvrzený ERROR.
                 down = self.states(*[(APP_DOWN, status)] * (DEFAULT_CONFIRM_COUNT + 1))
-                self.assertEqual({state for state, _ in down}, {State.UNKNOWN})
+                self.assertEqual([state for state, _ in down],
+                                 [State.UNKNOWN] * (DEFAULT_CONFIRM_COUNT - 1) + [State.ERROR] * 2)
                 # Zdraví doložené samotným /health má přednost: OK.
                 self.assertEqual(self.states((HEALTHY, status))[0], (State.OK, UP))
         self.assertEqual(self.states((APP_DOWN, progress(age=MAINTENANCE_FRESH_SECONDS)))[0],
                          (State.INFO, MAINTENANCE))  # hranice čerstvosti včetně
+
+    def test_stopped_coordinator_cannot_hide_an_outage_forever(self):
+        # Koordinátor se uprostřed reorganizace zastaví: progress.json zůstane active, ale zestárne.
+        stale = progress(age=MAINTENANCE_FRESH_SECONDS * 10)
+        results, _ = maintenance_checks(*[(APP_DOWN, progress())] * 2 + [(APP_DOWN, stale)] * DEFAULT_CONFIRM_COUNT
+                                        + [(APP_DOWN, progress())])
+        self.assertEqual([r.state for r in results],
+                         [State.INFO] * 2 + [State.UNKNOWN] * (DEFAULT_CONFIRM_COUNT - 1) + [State.ERROR, State.INFO])
+        self.assertIn("zastaralý stav reorganizace", results[DEFAULT_CONFIRM_COUNT + 1].summary)
+        self.assertEqual(results[DEFAULT_CONFIRM_COUNT + 1].details[HEALTH], DOWN)  # STATUS: ANIMEDB DOWN
 
     def test_evidence_parser(self):
         self.assertIsNone(maintenance_evidence(404, b"", WALL))

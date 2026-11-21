@@ -168,10 +168,10 @@ NexusSTAT zůstává jednoduchý stavový panel: pro AnimeDB je důležitá dost
 | --- | --- | --- | --- |
 | `200` a `{"status": "ok"}` | chybí (404), `active` false (NORMAL i STOP) | `OK` | `OK` |
 | cokoli | `version` 1, `active` true, `outcome` UNVERIFIED nebo NORMAL, `updated_at` nejvýš 60 s od hodin Nexusu | `INFO`, details `health` = maintenance | `MAINT` |
-| výpadek | chybí, `active` false (i STOP), nedostupný (i výpadek Nginxu) | potvrzování výpadku beze změny: `UNKNOWN` a po 3. kontrole `ERROR` | `UNKN`, `ERR` |
-| výpadek nebo neplatná odpověď | zastaralý, z budoucnosti, `active` true se STOP, neplatný JSON nebo pole | `UNKNOWN` (řada výpadku se přeruší) | `UNKN` |
+| výpadek | chybí, `active` false (i STOP), nedostupný (i výpadek Nginxu), zastaralý, z budoucnosti, `active` true se STOP, neplatný JSON nebo pole | potvrzování výpadku beze změny: `UNKNOWN` a po 3. kontrole `ERROR` | `UNKN`, `ERR` |
 | `200` a `{"status": "ok"}` | zastaralý nebo neplatný | `OK` (zdraví doložené aplikací), poznámka v popisu | `OK` |
 
+- Zastavený koordinátor (soubor zůstane `active`, ale zestárne) proto skutečný výpadek trvale neschová: neplatný doklad údržbu nedokládá a po potvrzení je `ERROR`.
 - Doložená údržba není závada ani ověřené zdraví: nejde do STATUS, nespustí alarm ani blikání RGB, přeruší řadu potvrzování výpadku a po návratu do NORMAL se zdraví posuzuje znovu. Řádek SERVICES ukáže `MAINT`, nikdy `OK`. Souhrn záhlaví, bílá LED a veřejný heartbeat berou `INFO` jako dosud (není závada).
 - NexusSTAT jen pasivně čte; nikdy nestartuje ani nerestartuje AnimeDB, nesahá na Docker, koordinátor, NAS ani databázi. Zastavená nebo neúspěšná operace (`STOP`) údržbu nedokládá a nedostupná aplikace pak vede ke skutečnému `ERROR`.
 
