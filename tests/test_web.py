@@ -105,17 +105,32 @@ class PageTest(unittest.TestCase):
         self.assertNotIn('class="s ok">OK</span></h1>', page)
         self.assertIn("NAS NO DATA", page)
 
-    def test_healthy_measurements_are_ok_with_nexus_na(self):
-        # M7-S9A: zdravá měření a NEXUS bez vlastního kolektoru = souhrnně OK, NEXUS N/A.
-        healthy = [result for result in results() if result.state in (State.INFO, State.OK)]
-        healthy += [check(CPU_USAGE_ID, State.INFO, 3), check(NAS_ID, State.OK)]
+    def test_healthy_measurements_are_ok_with_nexus_host_summary(self):
+        # M7-S11: NEXUS je souhrn kontrol hostitele, jen řádek k zobrazení (ne závada ani souhrn stránky).
+        healthy = [check(check_id, State.INFO, 3) for check_id in sorted(MONITORED - {NAS_ID, BACKUP_ID})]
+        healthy += [check(NAS_ID, State.OK), check(BACKUP_ID, State.OK)]
         page = render_page(board_with(healthy), 101.0)
         self.assertIn('<h1>NexusSTAT <span class="s ok">OK</span></h1>', page)
-        self.assertIn('<td>NEXUS</td><td class="v">N/A</td><td><span class="s na">N/A</span></td>', page)
+        self.assertIn('<td>NEXUS</td><td class="v">OK</td><td><span class="s ok">OK</span></td>', page)
         self.assertIn("Žádné aktivní závady.", page)
         self.assertNotIn("NEXUS NO DATA", page)
+        # Zapnutá kontrola hostitele bez výsledku: NEXUS UNKNOWN, ale bez druhé položky mezi závadami.
+        partial = [result for result in results() if result.state in (State.INFO, State.OK)]
+        partial += [check(CPU_USAGE_ID, State.INFO, 3), check(NAS_ID, State.OK)]
+        partial_page = render_page(board_with(partial), 101.0)
+        self.assertIn('<h1>NexusSTAT <span class="s ok">OK</span></h1>', partial_page)
+        self.assertIn('<td>NEXUS</td><td class="v">UNKN</td><td><span class="s unknown">UNKNOWN</span></td>',
+                      partial_page)
+        self.assertIn("Žádné aktivní závady.", partial_page)
         # Jednotlivé kontroly si stav nechávají: INFO zůstává INFO, jen souhrn je OK.
-        self.assertIn('<td>RAM</td><td class="v">24%</td><td><span class="s info">INFO</span></td>', page)
+        self.assertIn('<td>RAM</td><td class="v">24%</td><td><span class="s info">INFO</span></td>', partial_page)
+        # Skutečná závada hostitele: NEXUS ukáže její závažnost, mezi závadami je jen jednou (CPU TEMP).
+        warning = [check(CPU_TEMP_ID, State.WARNING, 74, "°C") if result.id == CPU_TEMP_ID else result
+                   for result in healthy]
+        warning_page = render_page(board_with(warning), 101.0)
+        self.assertIn('<td>NEXUS</td><td class="v">WARN</td><td><span class="s warning">WARNING</span></td>',
+                      warning_page)
+        self.assertEqual(warning_page.count("<li>"), 1)
 
     def test_web_header_and_oled_symbol_share_the_summary(self):
         cases = {

@@ -82,6 +82,9 @@ class CheckResult:
     `details` jsou krátké strojové údaje jako text ASCII (např. název síťového
     rozhraní nebo IPv4 adresa), které se do čísla převést nedají. Displej je
     čte místo `summary`; prahy je nečtou. Po vytvoření je nejde změnit.
+    `derived` označuje odvozený souhrn jen pro zobrazení (řádek NEXUS, M7-S11):
+    do celkového stavu, problémů STATUS ani dat se nepočítá, takže jedna závada
+    nevznikne dvakrát; skutečnou závadu nese dál původní výsledek.
     """
 
     id: str
@@ -92,6 +95,7 @@ class CheckResult:
     simulated: bool = field(kw_only=True)
     measurement: Measurement | None = field(default=None, kw_only=True)
     details: Mapping[str, str] = field(default_factory=dict, kw_only=True)
+    derived: bool = field(default=False, kw_only=True)
 
     def __post_init__(self):
         # Řetězec "OK" místo State.OK by tiše obešel řazení i vypršení.
@@ -110,6 +114,8 @@ class CheckResult:
             raise ValueError("expires_monotonic musí být konečné číslo")
         if not isinstance(self.simulated, bool):
             raise TypeError("simulated musí být True nebo False")
+        if not isinstance(self.derived, bool):
+            raise TypeError("derived musí být True nebo False")
         if self.measurement is not None and not isinstance(self.measurement, Measurement):
             raise TypeError("measurement musí být Measurement nebo None")
         # Neznámý stav s číslem by mohl dál vypadat jako platně naměřená hodnota.
@@ -153,7 +159,7 @@ def active_problems(results, now):
     Při stejné závažnosti řadí podle id, aby se pořadí na displeji mezi
     jednotlivými obnoveními nepřeskupovalo.
     """
-    current = [effective(result, now) for result in results]
+    current = [effective(result, now) for result in results if not result.derived]
     problems = [result for result in current if result.state in PROBLEM_STATES]
     return sorted(problems, key=lambda result: (SEVERITY_ORDER.index(result.state), result.id))
 
@@ -162,9 +168,9 @@ def overall_state(results, now):
     """Nejzávažnější aktuální stav ze všech výsledků.
 
     Bez výsledků nebo jen s N/A vrací UNKNOWN: když se nic nesleduje,
-    nesmí to vypadat jako OK.
+    nesmí to vypadat jako OK. Odvozené souhrny (`derived`) se nepočítají.
     """
-    states = {effective(result, now).state for result in results}
+    states = {effective(result, now).state for result in results if not result.derived}
     for state in SEVERITY_ORDER:
         if state in states:
             return state
@@ -183,5 +189,5 @@ def summary_state(results, now):
 
 
 def has_monitor_data(results):
-    """True, pokud existuje aspoň jeden sledovaný výsledek (cokoli kromě N/A)."""
-    return any(result.state is not State.NA for result in results)
+    """True, pokud existuje aspoň jeden sledovaný výsledek (cokoli kromě N/A a odvozeného souhrnu)."""
+    return any(result.state is not State.NA and not result.derived for result in results)

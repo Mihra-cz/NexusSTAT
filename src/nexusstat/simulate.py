@@ -178,10 +178,10 @@ def live_results(config):
             break
         time.sleep(LIVE_TICK_SECONDS)
         taken += LIVE_TICK_SECONDS
-    # Kolektor NEXUS zatím není: je N/A jako AnimeDB, NAS a BACKUP bez zapnuté
-    # kontroly (M7-S9A) a do symbolu NEXUS ani STATUS se nepočítá.
+    # NEXUS je odvozený souhrn hostitele (M7-S11), jen pro zobrazení: do symbolu
+    # NEXUS ani STATUS se nepočítá; AnimeDB, NAS a BACKUP bez zapnuté kontroly jsou N/A.
     results = complete_service_results(results, observed_utc, now + config.collector.validity_seconds,
-                                       monitored=monitor.labels)
+                                       monitored=monitor.labels, now=now)
     return results, now
 
 

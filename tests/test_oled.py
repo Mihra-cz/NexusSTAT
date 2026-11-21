@@ -319,11 +319,11 @@ class ServiceConsistencyTest(unittest.TestCase):
 
     def test_completion_adds_na_and_unknown_only_for_monitored(self):
         added = complete_service_results([], OBSERVED, 30)
-        # M7-S9A: NEXUS bez vlastního kolektoru je N/A jako vypnuté služby, ne umělé UNKNOWN.
+        # Bez času se souhrn hostitele NEXUS (M7-S11) nevyhodnotí: N/A, odvozený, ne umělé UNKNOWN.
         self.assertEqual([(r.id, r.state) for r in added], [
             (NEXUS_SERVICES_ID, State.NA), (ANIMEDB_ID, State.NA), (NAS_ID, State.NA), (BACKUP_ID, State.NA),
         ])
-        self.assertEqual(added[0].summary, "NEXUS: samostatná kontrola není implementovaná")
+        self.assertEqual((added[0].summary, added[0].derived), ("NEXUS: souhrn hostitele nevyhodnocen", True))
         # Od SERVICES-2 je NAS volitelná služba: bez zapnutého sledování N/A, se zapnutým UNKNOWN.
         self.assertEqual(added[2].summary, "NAS: sledování vypnuto")
         monitored = complete_service_results([], OBSERVED, 30, monitored={NAS_ID})
@@ -459,8 +459,9 @@ class SimulatorScenarioTest(unittest.TestCase):
                 contextlib.redirect_stdout(output):
             simulate.main(["/neexistujici-vystup", "--live"])
         lines = {line.split()[0]: line.split()[1] for line in output.getvalue().splitlines()}
+        # M7-S11: NEXUS je souhrn zdravých kontrol hostitele, vypnuté služby N/A.
         self.assertEqual({service_id: lines[service_id] for service_id in SERVICE_LABELS}, {
-            NEXUS_SERVICES_ID: "N/A", ANIMEDB_ID: "N/A", NAS_ID: "N/A", BACKUP_ID: "N/A",
+            NEXUS_SERVICES_ID: "OK", ANIMEDB_ID: "N/A", NAS_ID: "N/A", BACKUP_ID: "N/A",
         })
         identify.assert_called_once_with()  # zařízení ROOT jednou za běh, ne pro každý snímek
         self.assertEqual(lines["root_device"], "INFO")

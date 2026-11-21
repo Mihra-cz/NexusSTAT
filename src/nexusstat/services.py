@@ -1,8 +1,9 @@
 """Katalog služeb pro stránku SERVICES a společné potvrzování výpadku služby.
 
-Definice id výsledků služeb (služby Nexusu, AnimeDB, NAS, zálohy) a krátké
-názvy pro displej. Sám nesbírá žádná data. Skutečné kolektory služeb jsou
-zatím tři, všechny jen po výslovném zapnutí v konfiguraci: healthcheck AnimeDB
+Definice id výsledků služeb (souhrn hostitele Nexus, AnimeDB, NAS, zálohy) a
+krátké názvy pro displej. Sám nesbírá žádná data; řádek NEXUS je od M7-S11
+jen odvozený souhrn už změřených kontrol hostitele (host_summary). Skutečné
+kolektory služeb jsou zatím tři, všechny jen po výslovném zapnutí v konfiguraci: healthcheck AnimeDB
 přes HTTP /health (animedb_monitor.py, SERVICES-1), dostupnost NAS spojením
 TCP na port SMB (nas_monitor.py, SERVICES-2) a výsledek existující zálohovací
 úlohy ze systemd (backup_monitor.py, SERVICES-3). Sdílené SMB složky, repozitář
@@ -12,9 +13,9 @@ Resticu ani služby Nexusu se nečtou.
 import errno
 
 from .config import DEFAULT_CLEAR_COUNT, DEFAULT_CONFIRM_COUNT
-from .core import CheckResult, State
+from .core import CheckResult, State, effective, summary_state
 
-NEXUS_SERVICES_ID = "service.nexus"  # souhrn služeb hostitele Nexus
+NEXUS_SERVICES_ID = "service.nexus"  # souhrnný stav hostitele Nexus (odvozený, M7-S11)
 ANIMEDB_ID = "service.animedb"
 NAS_ID = "service.nas"  # dostupnost NAS; jiné kontroly NAS dostanou vlastní id
 BACKUP_ID = "service.backup"  # výsledek a stáří poslední zálohovací úlohy (systemd, ne obsah Resticu)
@@ -27,18 +28,21 @@ SERVICE_LABELS = {
     BACKUP_ID: "BACKUP",
 }
 
-# Služby, které se sledují jen po výslovném zapnutí v konfiguraci, a NEXUS, pro
-# který samostatná kontrola zatím není (M7-S9A). Bez zapnutého kolektoru jsou
-# N/A, tedy ani alarm, ani neznámý stav, a do celkového stavu se nepočítají;
-# N/A neznamená ověřeně zdravou službu. Zapnutý kolektor má vždy přednost: jeho
-# výsledek zůstává beze změny a bez výsledku je služba UNKNOWN, nikdy N/A
-# (complete_service_results, parametr `monitored`).
+# Služby, které se sledují jen po výslovném zapnutí v konfiguraci. Bez zapnutého
+# kolektoru jsou N/A, tedy ani alarm, ani neznámý stav, a do celkového stavu se
+# nepočítají; N/A neznamená ověřeně zdravou službu. Zapnutý kolektor má vždy
+# přednost: jeho výsledek zůstává beze změny a bez výsledku je služba UNKNOWN,
+# nikdy N/A (complete_service_results, parametr `monitored`).
 OPTIONAL_SERVICES = {
-    NEXUS_SERVICES_ID: "NEXUS: samostatná kontrola není implementovaná",
     ANIMEDB_ID: "AnimeDB: sledování vypnuto",
     NAS_ID: "NAS: sledování vypnuto",
     BACKUP_ID: "Záloha: sledování vypnuto",
 }
+
+# Kontroly hostitele, ze kterých se skládá NEXUS (M7-S11): měření Raspberry Pi.
+# Služby (AnimeDB, NAS, zálohy), kontroly historie ani NEXUS sám sem nepatří:
+# NEXUS je stav hostitele, ne souhrn všech ostatních služeb.
+HOST_CHECK_PREFIXES = ("system.", "disk.", "network.")
 
 # Výsledek jedné kontroly dostupnosti služby (AnimeDB, NAS); zároveň hodnota
 # `health` v details. Jen tyto pevné texty, takže historie zapíše řádek jen
@@ -143,12 +147,53 @@ class OutageConfirmation:
         return CONFIRM_RETRY_SECONDS if confirming else interval_seconds
 
 
-def complete_service_results(results, observed_utc, expires_monotonic, monitored=()):
+def host_summary(results, monitored, now, observed_utc):
+    """(stav, id kontrol s tímto stavem) hostitele Nexus v monotónním čase `now` (M7-S11).
+
+    Jen z už změřených kontrol hostitele (HOST_CHECK_PREFIXES), nic se neměří.
+    Stejné pravidlo jako souhrn webu (summary_state): závažnější stav má
+    přednost, prošlý výsledek je UNKNOWN, N/A se nepočítá a samé platné INFO
+    a OK je OK. Zapnutá kontrola hostitele (`monitored`) bez výsledku je
+    UNKNOWN; bez jediného výsledku hostitele je souhrn UNKNOWN.
+    """
+    host = [result for result in results if result.id.startswith(HOST_CHECK_PREFIXES) and not result.derived]
+    present = {result.id for result in host}
+    missing = sorted(check_id for check_id in monitored
+                     if check_id.startswith(HOST_CHECK_PREFIXES) and check_id not in present)
+    host += [CheckResult(check_id, State.UNKNOWN, f"{check_id}: bez dat", observed_utc, now, simulated=False)
+             for check_id in missing]
+    state = summary_state(host, now)
+    # U OK jsou to všechny platné kontroly (INFO je souhrnně OK), jinak ty s nejzávažnějším stavem.
+    matching = {State.OK, State.INFO} if state is State.OK else {state}
+    return state, sorted(result.id for result in host if effective(result, now).state in matching)
+
+
+def nexus_result(results, monitored, now, observed_utc, expires_monotonic):
+    """Řádek NEXUS: odvozený souhrn hostitele jen pro zobrazení (`derived`), nikdy druhý alarm."""
+    host = [result for result in results if result.id.startswith(HOST_CHECK_PREFIXES)]
+    if now is None:
+        # Bez času nejde platnost výsledků posoudit; souhrn se nevyhodnotí.
+        return CheckResult(NEXUS_SERVICES_ID, State.NA, "NEXUS: souhrn hostitele nevyhodnocen", observed_utc,
+                           expires_monotonic, simulated=False, derived=True)
+    state, culprits = host_summary(results, monitored, now, observed_utc)
+    if state is State.OK:
+        summary = f"NEXUS: hostitel v pořádku ({len(culprits)} kontrol)"
+    elif culprits:
+        summary = f"NEXUS: {state.value} podle {', '.join(culprits)}"
+    else:
+        summary = "NEXUS: žádná měření hostitele"
+    return CheckResult(NEXUS_SERVICES_ID, state, summary, observed_utc, expires_monotonic,
+                       simulated=any(result.simulated for result in host), derived=True)
+
+
+def complete_service_results(results, observed_utc, expires_monotonic, monitored=(), now=None):
     """Doplní služby z katalogu, pro které nepřišel žádný výsledek.
 
-    Sledovaná služba bez výsledku je UNKNOWN ("bez dat"), volitelná služba
-    bez zapnutého kolektoru N/A (od M7-S9A i NEXUS, který kolektor zatím
-    nemá). `monitored` jsou id kontrol, které měří některý zapnutý kolektor
+    NEXUS (od M7-S11) je odvozený souhrn kontrol hostitele v čase `now`
+    (nexus_result, jen pro zobrazení; bez `now` N/A), pokud ho neměří vlastní
+    kolektor (ten dnes neexistuje; jinak platí totéž co u ostatních služeb).
+    Sledovaná služba bez výsledku je UNKNOWN ("bez dat"), volitelná služba bez
+    zapnutého kolektoru N/A. `monitored` jsou id kontrol, které měří některý zapnutý kolektor
     (např. `labels` kolektorů z run.live_monitor):
     taková služba bez výsledku je UNKNOWN i tehdy, když je volitelná, protože
     sledování je zapnuté a stav neznáme.
@@ -163,6 +208,10 @@ def complete_service_results(results, observed_utc, expires_monotonic, monitored
     added = []
     for service_id, label in SERVICE_LABELS.items():
         if service_id in present:
+            continue
+        if service_id == NEXUS_SERVICES_ID and service_id not in monitored:
+            # Bez vlastního kolektoru NEXUS (dnes vždy) jen odvozený souhrn hostitele.
+            added.append(nexus_result(results, monitored, now, observed_utc, expires_monotonic))
             continue
         if service_id in OPTIONAL_SERVICES and service_id not in monitored:
             state, summary = State.NA, OPTIONAL_SERVICES[service_id]

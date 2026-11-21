@@ -307,9 +307,10 @@ class ScenarioTest(unittest.TestCase):
     def test_unconnected_services_match_reality(self):
         session, _ = make_session("unconnected")
         now = session.clock.now()
-        # M7-S9A: NEXUS bez kolektoru je N/A jako vypnuté služby: bez "?" a bez falešné závady.
+        # M7-S11: NEXUS je souhrn zdravého hostitele, vypnuté služby N/A: bez "?" a bez falešné závady.
         self.assertEqual(service_rows(session.results, now),
-                         [("NEXUS", "N/A"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
+                         [("NEXUS", "OK"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
+        self.assertEqual(active_problems(session.results, now), [])
         self.assertIsNone(home_symbol(session.results, now))
         self.assertEqual(active_problems(session.results, now), [])
 
@@ -403,7 +404,7 @@ class LiveTest(unittest.TestCase):
         now = session.clock.now()
         self.assertFalse(any(result.simulated for result in session.results))
         self.assertEqual(service_rows(session.results, now),
-                         [("NEXUS", "N/A"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
+                         [("NEXUS", "OK"), ("ANIMEDB", "N/A"), ("NAS", "N/A"), ("BACKUP", "N/A")])
 
     def test_live_applies_alarm_rules(self):
         config = Config(alarms=AlarmsConfig(cpu_temp=AlarmRule(True, 70, 80, 5)))

@@ -180,8 +180,8 @@ def scenario_many(sim):
 
 def scenario_unconnected(sim):
     # Fiktivní systém a síť, služby bez výsledku: doplnění je ukáže jako dnes
-    # ve skutečnosti s výchozí konfigurací (NEXUS bez kolektoru a AnimeDB, NAS
-    # a BACKUP se sledováním vypnutým N/A, M7-S9A).
+    # ve skutečnosti s výchozí konfigurací (NEXUS jako souhrn hostitele, M7-S11;
+    # AnimeDB, NAS a BACKUP se sledováním vypnutým N/A).
     return system_and_services(sim)[:4] + [root_mode(sim)] + network(sim, rx=1_234_000, tx=85_300)
 
 
@@ -478,7 +478,8 @@ class PreviewSession:
         self.monitored = measured
         # Služba se zapnutým kolektorem (LIVE, např. AnimeDB) bez výsledku je UNKNOWN, ne N/A.
         enabled = self.monitor.labels if self.monitor is not None else ()
-        self.results = complete_service_results(measured, observed_utc, now + self.validity, monitored=enabled)
+        self.results = complete_service_results(measured, observed_utc, now + self.validity, monitored=enabled,
+                                                now=now)
         # LIVE obnovuje v taktu živého měření (SCHED-2); kolektory samy měří jen ve
         # svých termínech. Fiktivní scénáře dál po intervalu kolektoru.
         self.next_refresh = now + (LIVE_TICK_SECONDS if self.is_live else self.interval)

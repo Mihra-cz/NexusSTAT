@@ -219,8 +219,9 @@ def render_page(board, now, admin=False):
         updated = "Zatím žádné měření."
     else:
         # Služby bez výsledku jako na OLED: sledovaná UNKNOWN, vypnutá N/A, nikdy OK.
+        # NEXUS se souhrnuje k okamžiku zobrazení, stejně jako se vyhodnocují ostatní řádky.
         results = complete_service_results(snapshot.results, snapshot.observed_utc,
-                                           snapshot.now + board.validity_seconds, monitored=board.monitored)
+                                           snapshot.now + board.validity_seconds, monitored=board.monitored, now=now)
         age = max(0.0, now - snapshot.now)
         valid = [effective(result, now) for result in results]
         latest = max((result.observed_utc for result in valid if is_valid(result)), default=None)

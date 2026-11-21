@@ -240,9 +240,10 @@ class OledDisplayTest(unittest.TestCase):
         self.assertEqual(shown, list(CAROUSEL_PAGES))
         frames = self.device.frames()
         self.assertEqual(len(set(frames)), 5)
-        # Každý obraz je přesně render_screen() nad výsledky smyčky s doplněnými službami (NEXUS N/A).
-        completed = complete_service_results(results, OBSERVED, START + 30)
+        # Každý obraz je přesně render_screen() nad výsledky smyčky s doplněnými službami
+        # (NEXUS jako souhrn hostitele v okamžiku taktu, M7-S11).
         for offset, page, frame in zip((0, 10, 20, 30, 40), CAROUSEL_PAGES, frames):
+            completed = complete_service_results(results, OBSERVED, START + offset + 30, now=START + offset)
             controller = OledController(DEVICE_CONFIG, pages=(page,))
             controller.press(START + offset, 0)
             expected = frame_bytes(render_screen(controller, START + offset, completed, WALL_TIME, None))

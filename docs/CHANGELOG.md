@@ -1,5 +1,12 @@
 # Changelog NexusSTAT
 
+## 2026-11-21 – M7-S11: NEXUS jako souhrnný stav hostitele
+
+- **Změna:** řádek NEXUS na stránce SERVICES (OLED i web) už není `N/A`, ale odvozený souhrn stávajících kontrol hostitele `system.*`, `disk.*` a `network.*` (`services.host_summary()`, `nexus_result()`): `effective()` + `summary_state()`, tedy samé platné `INFO`/`OK` = `OK`, jinak nejzávažnější stav, prošlá nebo zapnutá bez výsledku `UNKNOWN`, `N/A` se ignoruje, bez měření hostitele `UNKNOWN`. AnimeDB, NAS, BACKUP, historie ani NEXUS sám se nezahrnují. Nic se neměří navíc.
+- **Bez druhého alarmu:** nový příznak `CheckResult.derived`; `overall_state()`, `active_problems()` a `has_monitor_data()` odvozený řádek přeskočí, takže záhlaví webu, symbol NEXUS, STATUS, počet stisků a veřejný heartbeat se počítají přesně jako dřív. RGB a historie dostávají jen měřené výsledky. Zapnutý kolektor NEXUS (dnes žádný) by měl přednost jako u ostatních služeb.
+- **Zapojení:** `complete_service_results(..., now=)`; čas předávají OLED, web (k okamžiku zobrazení), heartbeat, živý náhled a simulátor. Pravidla RGB, OLED, potvrzování, schéma SQLite a kontrakt heartbeatu beze změny.
+- **Testy:** nový `tests/test_services.py` (zdravý hostitel OK, CPU WARNING, ROOT ERROR, CRITICAL, prošlé a chybějící měření UNKNOWN s přednostní vážnější závadou, bez měření UNKNOWN, N/A bez falešné závady, AnimeDB, NAS, historie ani záloha hostitele nemění, celkový stav zahrnuje hostitele i služby, STATUS a RGB bez duplicity, heartbeat beze změny, precedence kolektoru, příznak `derived`); 6 testů, které kódovaly NEXUS `N/A`, upravených na souhrn.
+
 ## 2026-11-21 – M7-S10: nasazení tlačítka a RGB, převzetí hardwaru Pironmanu 5 dokončené
 
 - **Nasazení jedním řízeným průchodem:** kontroly SHA-256 (jednotka, `10-web.conf`, `20-oled.conf`, `config.toml` = kandidát M7-S9, nasazené `src/` = d3e07fc se zálohou `pre-m7-2026-11-20/src-d3e07fc.tar`), Pironman vypnutý, LED a tlačítko volné (`fuser`), logind tlačítko nesleduje. Pak zkouška LED, `src/` z 7ad340b, drop-in `30-button-rgb.conf` (`DeviceAllow` pro `pwr_button` jen čtení a `/dev/spidev0.0`, skupiny `input` a `spi`), `config.toml` se sekcemi `[button]` a `[rgb]`, `daemon-reload` a restart jen `nexusstat.service`.

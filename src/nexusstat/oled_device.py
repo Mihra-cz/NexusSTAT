@@ -215,7 +215,7 @@ class OledDisplay:
         try:
             # Služby se doplní jako na webu, takže displej i web ukazují tytéž stavy.
             shown = complete_service_results(results, observed_utc, now + self._validity_seconds,
-                                             monitored=self._monitored)
+                                             monitored=self._monitored, now=now)
             if self._woken:
                 self._woken = False
                 # Probouzecí stisk se pozná až po uplatnění časovačů: i stisk po

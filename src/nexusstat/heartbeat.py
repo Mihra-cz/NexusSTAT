@@ -2,7 +2,7 @@
 
 Veřejný stav počítají stávající pravidla (complete_service_results, effective
 v overall_state) nad výsledky měřicí smyčky, stejně jako souhrn lokálního webu
-a OLED: NEXUS bez vlastní kontroly je N/A a nepočítá se (M7-S9A). Zapnutá
+a OLED: odvozený souhrn hostitele NEXUS se nepočítá (M7-S11). Zapnutá
 kontrola bez výsledku a prošlý výsledek jsou UNKNOWN, vypnuté (N/A) se
 nepočítají, INFO i OK jsou veřejně OK. Potvrzení závad veřejný stav nemění
 a simulovaná data nikdy nejsou OK.
@@ -65,13 +65,13 @@ def public_state(results, now, observed_utc, monitored, validity_seconds):
 
     `results` jsou výsledky taktu smyčky, `monitored` id kontrol zapnutých
     kolektorů (labels). Služby doplní complete_service_results stejně jako na
-    lokálním webu (zapnutá bez výsledku UNKNOWN, vypnutá a NEXUS bez kontroly
-    N/A, která se nepočítá). Pro ostatní sledované kontroly platí
+    lokálním webu (zapnutá bez výsledku UNKNOWN, vypnutá N/A, která se nepočítá;
+    odvozený souhrn NEXUS se nepočítá také, M7-S11). Pro ostatní sledované kontroly platí
     totéž: chybí-li výsledek, počítá se UNKNOWN (pojistka, kolektory dnes vždy
     vracejí všechny své kontroly).
     """
     expires = now + validity_seconds
-    counted = complete_service_results(results, observed_utc, expires, monitored=monitored)
+    counted = complete_service_results(results, observed_utc, expires, monitored=monitored, now=now)
     seen = {result.id for result in counted}
     counted += [CheckResult(check_id, State.UNKNOWN, "bez dat", observed_utc, expires, simulated=False)
                 for check_id in sorted(set(monitored) - seen - set(SERVICE_LABELS))]
