@@ -1,5 +1,12 @@
 # Changelog NexusSTAT
 
+## 2026-11-21 – M7-S12: finalizace nasazení na Nexusu a zmrazení
+
+- **Nasazený stav:** `nexusstat.service` se zdroji de65fec: měření hostitele, NEXUS jako odvozený souhrn, OLED, tlačítko a RGB místo Pironmanu (gpio-hog na GPIO6), LAN dashboard, SQLite historie, kontroly AnimeDB (s `MAINT` z `progress.json` koordinátoru) a NAS, drop-in `40-animedb.conf` pro síť Dockeru AnimeDB. Heartbeat, administrace a kontrola BACKUP (`N/A`) vypnuté.
+- **InfluxDB:** jiný uživatel než Pironman a noční záloha neexistuje; ze zálohy hostitele odebrán jen staging InfluxDB (diff, `bash -n`, dry-run do dočasného lokálního repozitáře), originál ponechán; `influxdb.service` vypnutá, balíček a data ponechané.
+- **UFW:** odstraněno jen pravidlo dashboardu Pironmanu TCP 34001; SSH, dashboard, výchozí politiky a ostatní pravidla beze změny.
+- **Stav projektu:** `testing` (chování po restartu RPi a obnova neověřené). Noční běh upravené zálohy se ověří až po jeho proběhnutí. Vývoj je zmrazený po dobu reorganizace AnimeDB.
+
 ## 2026-11-21 – M7-S11: AnimeDB rozlišuje zdraví a řízenou údržbu
 
 - **Zjištěno read-only (AnimeDB 3077abc na Nexusu):** port vlastní Nginx (edge), `/health` jde přímo na aplikační `/health` (dokládá aplikaci), při nedostupné aplikaci Nginx vrací `503` se stránkou služby. Koordinátor reorganizace zveřejňuje `progress.json` přes Nginx (`/_service/progress.json`, statický soubor) s `active`, `outcome`, `updated_at` (heartbeat po 5 s) a fázemi; dnes soubor neexistuje (404).

@@ -548,9 +548,21 @@ sudo systemctl daemon-reload && sudo systemctl restart nexusstat.service
   Při řízeném zastavení LED zhasnou a tlačítko se uvolní; OLED dál probudí `SIGUSR1`. Zdroje mohou zůstat (bez `[button]` a `[rgb]` se nové moduly nenačtou).
 - **Omezení:** WS2812 po pádu procesu drží poslední barvu. Tlačítko i LED smí ovládat jediný proces: Pironman zůstává vypnutý a zkouška `rgb_device` běží jen bez RGB ve službě. Krátký stisk se uplatní v nejbližším taktu (do 1 s).
 
-### InfluxDB
+### InfluxDB (vypnutá od M7-S12)
 
-Zatím nevypínat. Používá ji jen Pironman (od M7-S2 vypnutý, do databáze už nikdo nezapisuje) a noční zálohovací úloha hostitele, která nejdřív připraví a zkontroluje online zálohu InfluxDB a uloží ji s Nexusem do Resticu. Vypnutí jen spolu s úpravou této úlohy: root přečte skript, zjistí jeho chování bez InfluxDB a odebere jen kroky InfluxDB; ostatní zálohy se nemění.
+- **Zjištěno 2026-11-21:** jediným zapisovatelem byl Pironman (čítač zápisů InfluxDB je od jeho vypnutí beze změny, poslední bod v databázi `pironman5` z 2026-11-20); jiný klient, služba ani crontab ji nepoužívá. Noční záloha hostitele ji jen kopírovala: samostatný skript stagingu (`influxd backup -portable` přes 127.0.0.1:8088 do `/var/lib/nexus-backup-staging/influxdb`) a tato cesta v příkazu Resticu.
+- **Změna (schválil správce):** ze zálohovacího skriptu hostitele odebráno jen volání stagingu, jeho výpis a cesta stagingu v Resticu; `/etc`, `/srv/nexus`, `/usr/local/sbin`, všechny výjimky (heslo Resticu, živá DB AnimeDB, rozpracované denní zálohy AnimeDB, živá historie NexusSTAT), cíl NAS, tag, retence a timery beze změny. Ověřeno přesným diffem, `bash -n`, vlastníkem a právy (`root:root 0750`) a `restic backup --dry-run` se stejnými cestami do dočasného lokálního repozitáře bez NAS (`/etc`, `/srv/nexus` a `/usr/local/sbin` zahrnuté, staging a výjimky nulové). Originál zůstal vedle skriptu s příponou `.orig-m7s12`. Pak `systemctl disable --now influxdb.service`: `inactive`/`disabled`, porty 8086 a 8088 zavřené.
+- **Zachováno pro návrat:** balíček, data `/var/lib/influxdb`, skript stagingu i poslední připravená kopie ve stagingu (ta se už nezálohuje). Starší snapshoty Resticu s InfluxDB zůstávají podle retence; protože `forget` seskupuje podle cest, tvoří vlastní skupinu, ze které se drží nejvýš 7 denních, 4 týdenní a 3 měsíční.
+- **Rollback:** `sudo install -m 0750 -o root -g root <skript>.orig-m7s12 <skript>` a `sudo systemctl enable --now influxdb.service`.
+- **Neověřeno dnes:** první noční běh upravené zálohy proběhne v noci; jeho výsledek ukáže `systemctl status` jednotky zálohy (kontrola BACKUP v NexusSTAT zůstává `N/A`).
+
+### UFW po Pironmanu (M7-S12)
+
+Odstraněno jediné pravidlo `allow from <LAN_ROZSAH> to any port 34001 proto tcp` (dashboard Pironmanu, `pm_dashboard` port 34001; nikdo na portu nenaslouchal). Smazáno podle přesné specifikace, ne podle čísla, po čerstvém výpisu. UFW zůstává aktivní, výchozí politiky beze změny (`deny` příchozí, `allow` odchozí, `deny` směrované), zbývají pravidla SSH 22/tcp a NexusSTAT 8765/tcp z domácí LAN; SSH i dashboard ověřené z LAN. Rollback: `sudo ufw allow from <LAN_ROZSAH> to any port 34001 proto tcp`.
+
+### Zmrazení provozu (po M7-S12)
+
+NexusSTAT je funkčně dokončený a během reorganizace AnimeDB se nemění: žádné zásahy do NexusSTAT, systemd, Dockeru, NAS, sítě ani zálohování kromě skutečné závady nebo výslovného schválení. NexusSTAT zůstává pasivní diagnostikou: AnimeDB smí ukazovat `MAINT`, `UNKNOWN` nebo skutečný `ERROR` podle důkazů a nikdy ji ani nic jiného automaticky nerestartuje. Provozní poznámky: chování po restartu Raspberry Pi a obnova historie neověřené; monitoring AnimeDB závisí na síti Dockeru povolené v `40-animedb.conf`.
 
 ### Co zbývá pro OLED, RGB a tlačítko
 
