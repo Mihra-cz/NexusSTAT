@@ -19,7 +19,7 @@ from .fan_monitor import CPU_FAN_ID, FAN_ON, FAN_STATE, SOURCE, SOURCE_REQUEST
 from .mounts import FSTYPE, MODE, ROOT_MODE_ID
 from .network_monitor import ADDRESS, BYTES_PER_SECOND, INTERFACE, IPV4_ID, LINK, LINK_ID, RX_RATE_ID, TX_RATE_ID
 from .root_device import BUS
-from .services import BACKUP_ID, DOWN, HEALTH, INVALID, NAS_ID, SERVICE_LABELS, UP
+from .services import BACKUP_ID, DOWN, HEALTH, INVALID, MAINTENANCE, NAS_ID, SERVICE_LABELS, UP
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID
 
 # Krátký text stavu pro STATUS, stránku SERVICES a hodnotu bez čísla.
@@ -82,6 +82,9 @@ FAULT_TEXT = {
 # (UNKNOWN) FAILING; neplatná odpověď INVALID odliší neznámý výsledek kontroly
 # od výpadku. Potvrzený výpadek kontroly s hláškou ve FAULT_TEXT (NAS) ukáže
 # tu hlášku (NAS OFFLINE), ne DOWN.
+# Řádek SERVICES při doložené řízené údržbě AnimeDB (M7-S11), stejně krátký jako ostatní stavy.
+MAINTENANCE_TEXT = "MAINT"
+
 HEALTH_TEXT = {
     (State.ERROR, DOWN): "DOWN",
     (State.UNKNOWN, DOWN): "FAILING",
@@ -297,7 +300,9 @@ def service_rows(results, now):
     for service_id, label in SERVICE_LABELS.items():
         result = current.get(service_id)
         state = result.state if result is not None else State.UNKNOWN
-        rows.append((label, STATE_TEXT[state]))
+        # Doložená řízená údržba (M7-S11) je INFO, ale nesmí vypadat jako běžný provoz.
+        maintenance = state is State.INFO and result.details.get(HEALTH) == MAINTENANCE
+        rows.append((label, MAINTENANCE_TEXT if maintenance else STATE_TEXT[state]))
     return rows
 
 

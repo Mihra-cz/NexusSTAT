@@ -7,23 +7,27 @@ odpovědí HTTP a čas je simulovaný (monotónní sekundy jako čísla), nic se
 import errno
 import io
 import itertools
+import json
 import os
 import socket
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from unittest import mock
 
 from nexusstat import __version__, rgb
 from nexusstat.alarms import AlarmEvaluator
-from nexusstat.animedb_monitor import CAUSE, DOWN, HEALTH, INVALID, MAX_BODY_BYTES, UP, AnimeDbMonitor
+from nexusstat.animedb_monitor import (CAUSE, DOWN, HEALTH, INVALID, MAINTENANCE_FRESH_SECONDS, MAX_BODY_BYTES,
+                                       STATUS_MAX_BYTES, UP, AnimeDbMonitor, maintenance_evidence)
 from nexusstat.config import (DEFAULT_CLEAR_COUNT, DEFAULT_CONFIRM_COUNT, AlarmRule, AlarmsConfig, AnimeDbConfig,
-                              CollectorConfig, Config, ServicesConfig)
+                              CollectorConfig, Config, ConfigError, ServicesConfig)
 from nexusstat.core import CheckResult, State, active_problems, effective
 from nexusstat.oled import ALERT_SYMBOL, UNKNOWN_SYMBOL, home_symbol
 from nexusstat.oled_text import service_rows, status_texts
 from nexusstat.preview import LIVE, PreviewSession, SessionClock
 from nexusstat.run import COLLECTOR_FAILURE, Collectors, Scheduled, live_monitor, run_loop
-from nexusstat.services import ANIMEDB_ID, complete_service_results
+from nexusstat.heartbeat import public_state
+from nexusstat.services import ANIMEDB_ID, MAINTENANCE, NEXUS_SERVICES_ID, complete_service_results
 from nexusstat.system_monitor import LABELS as SYSTEM_LABELS
 
 OBSERVED = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
@@ -724,6 +728,151 @@ class PreviewTest(unittest.TestCase):
         session.press()
         self.assertEqual(session.led_frame().color, rgb.WHITE)  # N/A bílou neblokuje
         self.assertIn("AnimeDB N/A (sledování vypnuto)", session.source_text())
+
+
+
+# --- Řízená údržba přes progress.json koordinátoru reorganizace (M7-S11) ---
+
+STATUS_URL = "http://192.0.2.10:8080/_service/progress.json"  # tentýž vstup (Nginx) jako URL
+WALL = 1_800_000_000.0  # Unix čas, se kterým koordinátor porovnává updated_at
+# Nginx vrací při nedostupné aplikaci 503 se stránkou služby (error_page), ne JSON.
+APP_DOWN = http(503, b"<!doctype html><title>AnimeDB</title>", "Service Unavailable",
+                {"Content-Type": "text/html"})
+NO_STATUS = http(404, b"<html>404</html>", "Not Found", {"Content-Type": "text/html"})
+
+
+def progress(active=True, outcome="UNVERIFIED", age=5, **changes):
+    """progress.json jako ho zapisuje koordinátor AnimeDB (jen pole, která NexusSTAT čte, a pár dalších)."""
+    data = {"version": 1, "run_id": "0" * 32, "stage": "execution", "active": active, "outcome": outcome,
+            "app_ready": False, "updated_at": WALL - age, "protection_mode": "manual_one_shot",
+            "phases": [{"id": "manifest", "state": "PASS"}, {"id": "rename", "state": "WORK"}]}
+    data.update(changes)
+    return http(200, json.dumps(data).encode())
+
+
+def maintenance_checks(*pairs):
+    """Výsledky po sobě jdoucích kontrol; každá je dvojice (odpověď /health, odpověď progress.json)."""
+    network = FakeNetwork(*[step for pair in pairs for step in pair])
+    monitor = AnimeDbMonitor(VALIDITY, URL, TIMEOUT, connect=network, clock=FakeClock(), status_url=STATUS_URL,
+                             wall_clock=lambda: WALL)
+    return [monitor.collect(NOW + INTERVAL * index, OBSERVED)[0] for index in range(len(pairs))], network
+
+
+class MaintenanceTest(unittest.TestCase):
+    """Nginx dostupný, AnimeDB zdravá a koordinátor řídí údržbu jsou tři různé věci."""
+
+    def states(self, *pairs):
+        results, _ = maintenance_checks(*pairs)
+        return [(result.state, result.details.get(HEALTH)) for result in results]
+
+    def test_normal_app_is_ok_and_status_is_read_from_the_same_edge(self):
+        results, network = maintenance_checks((HEALTHY, NO_STATUS), (HEALTHY, progress(False, "NORMAL")))
+        self.assertEqual([(r.state, r.details) for r in results], [(State.OK, {HEALTH: UP})] * 2)
+        self.assertEqual([address for address, _ in network.calls], [("192.0.2.10", 8080)] * 4)
+        self.assertTrue(network.sockets[0].sent.startswith(b"GET /health HTTP/1.1"))
+        self.assertTrue(network.sockets[1].sent.startswith(b"GET /_service/progress.json HTTP/1.1"))
+
+    def test_without_status_url_nothing_changes(self):
+        network = FakeNetwork(HEALTHY)
+        [result] = monitor_for(network).collect(NOW, OBSERVED)
+        self.assertEqual((result.state, len(network.calls)), (State.OK, 1))  # jediný GET jako dřív
+
+    def test_nginx_up_backend_down_without_maintenance_is_confirmed_error(self):
+        for name, status in (("bez souboru", NO_STATUS), ("koordinátor nic neřídí", progress(False, "NORMAL")),
+                             ("STOP koordinátoru", progress(False, "STOP"))):
+            with self.subTest(name):
+                self.assertEqual([state for state, _ in self.states(*[(APP_DOWN, status)] * DEFAULT_CONFIRM_COUNT)],
+                                 [State.UNKNOWN] * (DEFAULT_CONFIRM_COUNT - 1) + [State.ERROR])
+
+    def test_nginx_down_is_never_hidden_as_maintenance(self):
+        # Bez Nginxu není dostupný ani progress.json: žádný doklad, potvrzený výpadek.
+        self.assertEqual(self.states(*[(REFUSED, REFUSED)] * DEFAULT_CONFIRM_COUNT)[-1], (State.ERROR, DOWN))
+
+    def test_planned_maintenance_is_info_not_ok_nor_alarm(self):
+        results, _ = maintenance_checks(*[(APP_DOWN, progress())] * 5)
+        self.assertEqual({(r.state, r.details.get(HEALTH)) for r in results}, {(State.INFO, MAINTENANCE)})
+        self.assertIn("plánovaná údržba", results[-1].summary)
+        rows = dict(service_rows(complete_service_results(results[-1:], OBSERVED, NOW + VALIDITY, now=NOW), NOW))
+        self.assertEqual(rows["ANIMEDB"], "MAINT")  # ne OK ani INFO jako běžný provoz
+        # Údržba není závada: STATUS, symbol ani RGB ji nehlásí, žádné blikání.
+        self.assertEqual(active_problems(results, NOW), [])
+        for awake in (False, True):
+            signal = rgb.rgb_signal(results[-1:], rgb.Acknowledgements(), awake, False, NOW)
+            self.assertNotIn(signal.kind, rgb.BLINKING)
+
+    def test_maintenance_with_app_already_answering_is_still_maintenance(self):
+        # Koordinátor ještě ověřuje restart aplikace (app_initializing): běžný provoz ještě není doložen.
+        self.assertEqual(self.states((HEALTHY, progress(stage="app_initializing")))[0], (State.INFO, MAINTENANCE))
+
+    def test_maintenance_interrupts_outage_confirmation_and_normal_returns_ok(self):
+        steps = [(APP_DOWN, NO_STATUS)] * (DEFAULT_CONFIRM_COUNT - 1) + [(APP_DOWN, progress())] * 3
+        steps += [(APP_DOWN, NO_STATUS), (HEALTHY, progress(False, "NORMAL"))]
+        states = [state for state, _ in self.states(*steps)]
+        self.assertEqual(states[:DEFAULT_CONFIRM_COUNT - 1], [State.UNKNOWN] * (DEFAULT_CONFIRM_COUNT - 1))
+        self.assertEqual(states[DEFAULT_CONFIRM_COUNT - 1:-2], [State.INFO] * 3)  # nikdy ERROR během údržby
+        self.assertEqual(states[-2:], [State.UNKNOWN, State.OK])  # řada začala znovu, návrat do NORMAL = OK
+
+    def test_stale_or_invalid_evidence(self):
+        bad = {
+            "zastaralý": progress(age=MAINTENANCE_FRESH_SECONDS + 1),
+            "z budoucnosti": progress(age=-(MAINTENANCE_FRESH_SECONDS + 1)),
+            "rozpor active a STOP": progress(True, "STOP"),
+            "chybný JSON": http(200, b"{"),
+            "jiná verze": progress(version=2),
+            "bez updated_at": http(200, json.dumps({"version": 1, "active": True, "outcome": "UNVERIFIED"}).encode()),
+            "active není bool": progress(active="yes"),
+            "neznámý outcome": progress(outcome="DONE"),
+            "chyba serveru": http(500, b"x"),
+            "příliš velký": http(200, b" " * (STATUS_MAX_BYTES + 1)),
+        }
+        for name, status in bad.items():
+            with self.subTest(name):
+                # Bez doloženého zdraví UNKNOWN a nikdy ERROR: řada výpadku se přeruší.
+                down = self.states(*[(APP_DOWN, status)] * (DEFAULT_CONFIRM_COUNT + 1))
+                self.assertEqual({state for state, _ in down}, {State.UNKNOWN})
+                # Zdraví doložené samotným /health má přednost: OK.
+                self.assertEqual(self.states((HEALTHY, status))[0], (State.OK, UP))
+        self.assertEqual(self.states((APP_DOWN, progress(age=MAINTENANCE_FRESH_SECONDS)))[0],
+                         (State.INFO, MAINTENANCE))  # hranice čerstvosti včetně
+
+    def test_evidence_parser(self):
+        self.assertIsNone(maintenance_evidence(404, b"", WALL))
+        self.assertIsNone(maintenance_evidence(200, json.dumps({"version": 1, "active": False, "outcome": "STOP",
+                                                                 "updated_at": 1.0}).encode(), WALL))
+        self.assertEqual(maintenance_evidence(200, json.dumps({"version": 1, "active": True, "outcome": "NORMAL",
+                                                               "updated_at": WALL}).encode(), WALL), "active")
+
+    def test_nexus_nas_and_heartbeat_are_unchanged(self):
+        [maintenance], _ = maintenance_checks((APP_DOWN, progress()))
+        # Podvržená síť dává simulated=True a heartbeat simulaci nikdy nehlásí jako OK;
+        # tady jde jen o mapování stavů.
+        maintenance = replace(maintenance, simulated=False)
+        system = FakeSystem().collect(NOW, OBSERVED)
+        completed = complete_service_results(system + [maintenance], OBSERVED, NOW + VALIDITY,
+                                             monitored=set(SYSTEM_LABELS) | {ANIMEDB_ID}, now=NOW)
+        nexus = {r.id: r for r in completed}[NEXUS_SERVICES_ID]
+        self.assertEqual((nexus.state, nexus.derived), (State.OK, True))  # hostitel, ne AnimeDB
+        self.assertEqual(public_state(system + [maintenance], NOW, OBSERVED, set(SYSTEM_LABELS) | {ANIMEDB_ID},
+                                      VALIDITY), "OK")  # INFO je veřejně OK jako dřív
+        error = CheckResult(ANIMEDB_ID, State.ERROR, "x", OBSERVED, NOW + VALIDITY, simulated=False)
+        self.assertEqual(public_state(system + [error], NOW, OBSERVED, set(SYSTEM_LABELS) | {ANIMEDB_ID},
+                                      VALIDITY), "ERROR")
+
+    def test_status_url_configuration(self):
+        config = AnimeDbConfig(enabled=True, url=URL, status_url=STATUS_URL)
+        self.assertEqual(config.status_url, STATUS_URL)
+        for status_url in ("http://192.0.2.11:8080/_service/progress.json",  # jiný vstup
+                           "http://192.0.2.10:9000/_service/progress.json",  # jiný port
+                           "http://192.0.2.10:8080/_service/status", "https://192.0.2.10:8080/progress.json"):
+            with self.subTest(status_url=status_url):
+                with self.assertRaises(ConfigError):
+                    AnimeDbConfig(enabled=True, url=URL, status_url=status_url)
+        with self.assertRaises(ConfigError):
+            AnimeDbConfig(status_url=STATUS_URL)  # bez url
+        monitor = live_monitor(Config(services=ServicesConfig(AnimeDbConfig(enabled=True, url=URL,
+                                                                            status_url=STATUS_URL))))
+        [health] = [m.monitor for m in monitor.monitors if isinstance(getattr(m, "monitor", None), AnimeDbMonitor)]
+        self.assertEqual(health.status_url, STATUS_URL)
 
 
 if __name__ == "__main__":

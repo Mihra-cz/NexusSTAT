@@ -113,6 +113,10 @@ enabled = false
 [services.animedb]
 enabled = false
 # url = "http://192.0.2.10:8080/health"
+# Řízená údržba (M7-S11): veřejný progress.json koordinátoru reorganizace na témže
+# vstupu (stejná adresa a port jako url). Doložená probíhající operace je MAINT
+# (INFO), ne výpadek; bez klíče se údržba nerozpoznává.
+# status_url = "http://192.0.2.10:8080/_service/progress.json"
 timeout_seconds = 2
 interval_seconds = 900
 

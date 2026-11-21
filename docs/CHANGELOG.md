@@ -1,5 +1,11 @@
 # Changelog NexusSTAT
 
+## 2026-11-21 – M7-S11: AnimeDB rozlišuje zdraví a řízenou údržbu
+
+- **Zjištěno read-only (AnimeDB 3077abc na Nexusu):** port vlastní Nginx (edge), `/health` jde přímo na aplikační `/health` (dokládá aplikaci), při nedostupné aplikaci Nginx vrací `503` se stránkou služby. Koordinátor reorganizace zveřejňuje `progress.json` přes Nginx (`/_service/progress.json`, statický soubor) s `active`, `outcome`, `updated_at` (heartbeat po 5 s) a fázemi; dnes soubor neexistuje (404).
+- **Změna:** volitelný `[services.animedb] status_url` (stejný vstup jako `url`). Doložená probíhající operace = `INFO` „MAINT“ (ne výpadek, ne OK), přeruší řadu potvrzování; bez dokladu (404, `active` false, STOP, nedostupný Nginx) beze změny potvrzovaný `ERROR`; zastaralý nebo neplatný doklad `UNKNOWN`, pokud zdraví nedoloží `/health`. Žádná nová závažnost, alarm ani akce; NexusSTAT AnimeDB jen čte.
+- **Testy:** 11 nových offline testů s podvrženými odpověďmi (NORMAL OK, backend dole bez údržby, údržba s vypnutou aplikací, bez RGB alarmu a duplicity, potvrzovaný výpadek, STOP, zastaralá a neplatná evidence, návrat do NORMAL, výpadek Nginxu, NEXUS, heartbeat, konfigurace). Celá sada 1848 testů OK.
+
 ## 2026-11-21 – M7-S11: NEXUS jako souhrnný stav hostitele
 
 - **Změna:** řádek NEXUS na stránce SERVICES (OLED i web) už není `N/A`, ale odvozený souhrn stávajících kontrol hostitele `system.*`, `disk.*` a `network.*` (`services.host_summary()`, `nexus_result()`): `effective()` + `summary_state()`, tedy samé platné `INFO`/`OK` = `OK`, jinak nejzávažnější stav, prošlá nebo zapnutá bez výsledku `UNKNOWN`, `N/A` se ignoruje, bez měření hostitele `UNKNOWN`. AnimeDB, NAS, BACKUP, historie ani NEXUS sám se nezahrnují. Nic se neměří navíc.

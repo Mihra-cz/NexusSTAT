@@ -275,9 +275,11 @@ def live_monitor(config):
         # Healthcheck se volá jen při výslovně zapnutém sledování (SERVICES-1);
         # jinak kolektor vůbec nevznikne, nic se nepřipojuje a AnimeDB zůstává N/A.
         # Výsledek platí do další plánované kontroly a ještě obvyklou platnost.
+        # Se status_url (M7-S11) rozpozná i řízenou údržbu koordinátorem reorganizace.
         monitors.append(Scheduled(AnimeDbMonitor(
             validity_seconds=animedb.interval_seconds + validity, url=animedb.url,
-            timeout_seconds=animedb.timeout_seconds, interval_seconds=animedb.interval_seconds), validity))
+            timeout_seconds=animedb.timeout_seconds, interval_seconds=animedb.interval_seconds,
+            status_url=animedb.status_url), validity))
     nas = config.services.nas
     if nas.enabled:
         # Pokus o spojení TCP jen při výslovně zapnutém sledování (SERVICES-2);

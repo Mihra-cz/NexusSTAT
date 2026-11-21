@@ -69,7 +69,7 @@ KNOWN_RULE_KEYS = {"enabled", "warning", "error", "hysteresis", "confirm_count",
 # zálohy od SERVICES-3). Další služby se přidají až s vlastním kolektorem, ne
 # předem jako nefunkční volby.
 KNOWN_SERVICES_KEYS = {"animedb", "nas", "backup"}
-KNOWN_ANIMEDB_KEYS = {"enabled", "url", "timeout_seconds", "interval_seconds"}
+KNOWN_ANIMEDB_KEYS = {"enabled", "url", "status_url", "timeout_seconds", "interval_seconds"}
 KNOWN_NAS_KEYS = {"enabled", "host", "port", "timeout_seconds", "interval_seconds"}
 KNOWN_BACKUP_KEYS = {"enabled", "unit", "timer", "timeout_seconds"}
 KNOWN_USER_STATE_KEYS = {"path"}
@@ -81,6 +81,8 @@ KNOWN_HEARTBEAT_KEYS = {"enabled", "url", "secret_file", "ca_file"}
 HEALTH_TIMEOUT_DEFAULT = 2
 HEALTH_TIMEOUT_MAX = 5
 HEALTH_PATH_SUFFIX = "/health"
+# Veřejný souhrn koordinátoru reorganizace AnimeDB, který statický soubor vydává Nginx (M7-S11).
+STATUS_PATH_SUFFIX = "/progress.json"
 MAX_URL_LENGTH = 256
 
 # Kontrola NAS (SERVICES-2): port SMB přímo přes TCP. Limit spojení je stejný
@@ -562,15 +564,15 @@ def check_heartbeat_url(url):
     return parts
 
 
-def check_health_url(url):
-    """Ověří adresu healthchecku a vrátí ji rozloženou (urlsplit).
+def check_health_url(url, suffix=HEALTH_PATH_SUFFIX, name="url"):
+    """Ověří adresu healthchecku (nebo s `suffix` stavu údržby) a vrátí ji rozloženou (urlsplit).
 
     Jen `http://<IP adresa>[:port]/…/health`: název hostitele by se překládal
     přes DNS bez časového limitu a https by potřebovalo samostatné rozhodnutí
     o certifikátech. Bez přihlašovacích údajů, query a fragmentu a jen
     tisknutelné ASCII bez mezer, aby adresa šla beze změny do požadavku HTTP.
     """
-    problem = f"url musí být http://<IP adresa>[:port]/…/health, ne {url!r}"
+    problem = f"{name} musí být http://<IP adresa>[:port]/…{suffix}, ne {url!r}"
     if not isinstance(url, str) or not 0 < len(url) <= MAX_URL_LENGTH or not all("!" <= ch <= "~" for ch in url):
         raise ConfigError(problem)
     try:
@@ -580,7 +582,7 @@ def check_health_url(url):
     except ValueError:
         raise ConfigError(problem) from None
     if (parts.scheme != "http" or "@" in parts.netloc or "?" in url or "#" in url or port == 0
-            or not parts.path.endswith(HEALTH_PATH_SUFFIX)):
+            or not parts.path.endswith(suffix)):
         raise ConfigError(problem)
     return parts
 
@@ -608,18 +610,27 @@ class AnimeDbConfig:
     jen do lokální konfigurace mimo Git. Dostupnost endpointu se tu
     nekontroluje (mění se za běhu), jen tvar adresy a limit.
     `interval_seconds` je odstup skutečných kontrol (SCHED-1, výchozí 15 min).
+    `status_url` (M7-S11, volitelné) je veřejný `progress.json` koordinátoru
+    reorganizace na témže vstupu jako `url`: doložená řízená údržba je pak
+    informace (MAINT), ne výpadek. Bez něj se údržba nerozpoznává.
     """
 
     enabled: bool = False
     url: str | None = None
     timeout_seconds: float = HEALTH_TIMEOUT_DEFAULT
     interval_seconds: int = ANIMEDB_INTERVAL_DEFAULT
+    status_url: str | None = None  # na konci, aby zůstalo dosavadní pořadí polí
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
             raise ConfigError(f"enabled musí být true nebo false, ne {self.enabled!r}")
         if self.url is not None:
             check_health_url(self.url)
+        if self.status_url is not None:
+            status = check_health_url(self.status_url, STATUS_PATH_SUFFIX, "status_url")
+            # Tentýž vstup (Nginx) jako /health: jiný cíl by potřeboval vlastní rozhodnutí i oprávnění.
+            if self.url is None or status.netloc != urlsplit(self.url).netloc:
+                raise ConfigError("status_url musí mířit na stejnou adresu a port jako url")
         check_health_timeout(self.timeout_seconds)
         check_service_interval(self.interval_seconds)
         if self.enabled and self.url is None:

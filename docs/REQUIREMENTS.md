@@ -158,6 +158,23 @@ NexusSTAT zůstává jednoduchý stavový panel: pro AnimeDB je důležitá dost
 - Od SERVICES-2 je potvrzování výpadku ve sdílené třídě `services.OutageConfirmation`, kterou používá i kontrola NAS; chování healthchecku AnimeDB se tím nezměnilo.
 - Ověřeno jen syntetickými odpověďmi HTTP v testech, ne proti běžící AnimeDB.
 
+### Řízená údržba AnimeDB (M7-S11)
+
+- **Skutečný vstup (ověřeno read-only na Nexusu a v kódu AnimeDB 3077abc):** publikovaný port vlastní kontejner Nginx (edge). `/health` jde přes `location /` přímo na aplikační `/health`, takže `{"status": "ok"}` dokládá aplikaci, ne jen Nginx; při nedostupné aplikaci vrací Nginx `503` se stránkou služby (HTML). Koordinátor reorganizace zapisuje veřejný souhrn `progress.json`, který Nginx vydává jako statický soubor `/_service/progress.json` (bez aplikace, databáze i NAS); během operace obnovuje `updated_at` každých 5 s.
+- **Volitelný `status_url`** (`[services.animedb]`, jen stejná adresa a port jako `url`, cesta končí `/progress.json`). Bez něj se nic nemění.
+- **Rozhodnutí kontroly:** po `/health` jediný další `GET` na `status_url`.
+
+| `/health` | `progress.json` | Stav | SERVICES |
+| --- | --- | --- | --- |
+| `200` a `{"status": "ok"}` | chybí (404), `active` false (NORMAL i STOP) | `OK` | `OK` |
+| cokoli | `version` 1, `active` true, `outcome` UNVERIFIED nebo NORMAL, `updated_at` nejvýš 60 s od hodin Nexusu | `INFO`, details `health` = maintenance | `MAINT` |
+| výpadek | chybí, `active` false (i STOP), nedostupný (i výpadek Nginxu) | potvrzování výpadku beze změny: `UNKNOWN` a po 3. kontrole `ERROR` | `UNKN`, `ERR` |
+| výpadek nebo neplatná odpověď | zastaralý, z budoucnosti, `active` true se STOP, neplatný JSON nebo pole | `UNKNOWN` (řada výpadku se přeruší) | `UNKN` |
+| `200` a `{"status": "ok"}` | zastaralý nebo neplatný | `OK` (zdraví doložené aplikací), poznámka v popisu | `OK` |
+
+- Doložená údržba není závada ani ověřené zdraví: nejde do STATUS, nespustí alarm ani blikání RGB, přeruší řadu potvrzování výpadku a po návratu do NORMAL se zdraví posuzuje znovu. Řádek SERVICES ukáže `MAINT`, nikdy `OK`. Souhrn záhlaví, bílá LED a veřejný heartbeat berou `INFO` jako dosud (není závada).
+- NexusSTAT jen pasivně čte; nikdy nestartuje ani nerestartuje AnimeDB, nesahá na Docker, koordinátor, NAS ani databázi. Zastavená nebo neúspěšná operace (`STOP`) údržbu nedokládá a nedostupná aplikace pak vede ke skutečnému `ERROR`.
+
 ## Kontrola dostupnosti NAS (SERVICES-2, implementováno lokálně, nenasazeno)
 
 Jediná kontrola `service.nas` odpovídá na jedinou otázku: **přijímá služba SMB na NAS spojení TCP?** Kontroluje se jen pokus o spojení na port SMB (výchozí 445); nevzniká vlastní alarmový systém ani nový stav RGB a nepřidává se druhé měření NAS ani nová stránka OLED.

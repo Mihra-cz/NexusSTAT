@@ -52,6 +52,7 @@ CAUSE = "cause"  # proč výpadek nebo neplatná odpověď: refused, timeout, un
 UP = "ok"
 DOWN = "down"
 INVALID = "invalid"
+MAINTENANCE = "maintenance"  # doložená řízená údržba AnimeDB (M7-S11): informace, ne výpadek ani zdraví
 
 # Chyby spojení, které dokládají nedostupnost adresy nebo sítě (ne chybu na této straně).
 UNREACHABLE_ERRNOS = (errno.EHOSTUNREACH, errno.ENETUNREACH)
