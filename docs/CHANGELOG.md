@@ -1,5 +1,13 @@
 # Changelog NexusSTAT
 
+## 2026-11-21 – M7-S10: nasazení tlačítka a RGB, převzetí hardwaru Pironmanu 5 dokončené
+
+- **Nasazení jedním řízeným průchodem:** kontroly SHA-256 (jednotka, `10-web.conf`, `20-oled.conf`, `config.toml` = kandidát M7-S9, nasazené `src/` = d3e07fc se zálohou `pre-m7-2026-11-20/src-d3e07fc.tar`), Pironman vypnutý, LED a tlačítko volné (`fuser`), logind tlačítko nesleduje. Pak zkouška LED, `src/` z 7ad340b, drop-in `30-button-rgb.conf` (`DeviceAllow` pro `pwr_button` jen čtení a `/dev/spidev0.0`, skupiny `input` a `spi`), `config.toml` se sekcemi `[button]` a `[rgb]`, `daemon-reload` a restart jen `nexusstat.service`.
+- **RGB:** zkouška LED pod `mirek` (služba tehdy SPI neměla) a provoz ve službě fyzicky potvrdil správce: tlumená bílá jen při probuzeném OLED ve zdravém stavu, oranžová, červená, kód 2× s pauzou, CRITICAL, všechny čtyři LED stejně, zhasnutí s OLED.
+- **Tlačítko:** krátký stisk probudil OLED, druhý otevřel STATUS, po 30 s se vrátil kolotoč, po 300 s OLED i LED zhasly; záložní `SIGUSR1` funguje. Dlouhé stisky se nezkoušely. Zařízení drží jen proces služby, systemd přijal `DeviceAllow` přes cestu `by-path`.
+- **Stav po nasazení:** služba 0 restartů a 0 varování, web z LAN 200 (`NexusSTAT OK`), historie pokračuje novým během, GPIO6 hog, throttling `0x0`. Chlazení, boot konfigurace, Pironman (vypnutý, nainstalovaný), AnimeDB, Docker, NAS, Restic, InfluxDB, UFW, heartbeat a konfigurace webu beze změny.
+- **Převzetí hardwaru Pironmanu 5 je dokončené:** chlazení (M7-S2), monitoring (M7-S3), OLED (M7-S9), tlačítko a RGB (M7-S10). Rollback tlačítka a RGB v `OPERATIONS.md`.
+
 ## 2026-11-21 – M7-S10: tlačítko a RGB LED (ovladače hotové lokálně)
 
 - **Zjištěno na Nexusu (read-only):** tlačítko `pwr_button` je `/dev/input/by-path/platform-pwr_button-event` (dnes `event5`, `root:input 0660`, jen `KEY_POWER`), logind ho nesleduje (pravidlo 71). LED jsou na `/dev/spidev0.0` (`root:spi 0660`); Pironman je ovládal přes Adafruit NeoPixel SPI (4 LED GRB, 6,4 MHz, bit jako bajt `0b11000000`/`0b11110000`, 80 µs klidu). Účet `nexusstat` nebyl ve skupinách `input` ani `spi`.

@@ -400,8 +400,8 @@ Služba běží vždy pod `nexusstat`, nikdy jako root, bez capabilities. `Priva
 | uživatelský stav | soubor v `appdata/nexusstat`, adresář pro `nexusstat` | zatím jen v paměti |
 | stav hodin pro historii | bez `ProtectClock=` | blokoval by i dotaz `adjtimex` (`modes = 0`) |
 | OLED | `DeviceAllow=/dev/i2c-1 rw`, `SupplementaryGroups=i2c` | jen sběrnice 1; hotovo (M7-S9, `20-oled.conf`) |
-| RGB | `DeviceAllow=/dev/spidev0.0 rw`, `SupplementaryGroups=spi` | bez `/dev/gpiomem*` a `/dev/gpiochip*`: malý ovladač nad spidev místo Adafruit (Blinka); M7-S10 `30-button-rgb.conf` |
-| tlačítko | `DeviceAllow=/dev/input/by-path/platform-pwr_button-event r`, `SupplementaryGroups=input` | cgroup `DeviceAllow` pustí jen toto zařízení; M7-S10 `30-button-rgb.conf`, cestu přes symlink ověří nasazení |
+| RGB | `DeviceAllow=/dev/spidev0.0 rw`, `SupplementaryGroups=spi` | bez `/dev/gpiomem*` a `/dev/gpiochip*`: malý ovladač nad spidev místo Adafruit (Blinka); hotovo (M7-S10, `30-button-rgb.conf`) |
+| tlačítko | `DeviceAllow=/dev/input/by-path/platform-pwr_button-event r`, `SupplementaryGroups=input` | cgroup `DeviceAllow` pustí jen toto zařízení; hotovo (M7-S10, `30-button-rgb.conf`), systemd cestu přes symlink přijal |
 | boční ventilátory, CPU FAN | žádné | GPIO drží jádro (hog) |
 | kontrola záloh | `AF_UNIX` (systemd po D-Bus) | bez sudo |
 | AnimeDB, NAS, heartbeat | `IPAddressAllow=<adresa>` | heartbeat s proměnnou veřejnou adresou jen vědomě bez filtru IP |
@@ -505,7 +505,7 @@ sudo systemctl daemon-reload && sudo systemctl restart nexusstat.service
   Při řízeném zastavení displej zhasne; měření, web i historie poběží jako před M7-S9. Zdroje mohou zůstat (bez `[oled] device` se ovladač nespustí); úplný návrat na 8685065: `tar -x -C /srv/nexus/projects/nexusstat -f /srv/nexus/appdata/nexusstat/pre-m7-2026-11-20/src-8685065.tar && rm /srv/nexus/projects/nexusstat/src/nexusstat/oled_device.py` a restart služby (v `src/` mezi nimi jen přibyl `oled_device.py`).
 - **Omezení:** po pádu procesu drží SSD1306 poslední obraz; při řízeném ukončení se vypne. Dva programy na jednom displeji by se přepisovaly, proto Pironman zůstává vypnutý a zkouška `oled_device` běží jen bez OLED ve službě.
 
-### Tlačítko a RGB na Nexusu (M7-S10)
+### Tlačítko a RGB na Nexusu (M7-S10, aktivní od 2026-11-21)
 
 - **Zjištěno (read-only, 2026-11-21):** tlačítko `pwr_button` (jen `KEY_POWER`, bez opakování klávesy) má stálou cestu `/dev/input/by-path/platform-pwr_button-event` (dnes `event5`, `root:input 0660`). Logind ho nesleduje (pravidlo udev 71; v `Watching system buttons` chybí) a `HandlePowerKey` je výchozí. LED jsou na `/dev/spidev0.0` (`root:spi 0660`, ovladač `spidev`); Pironman je ovládal přes Adafruit NeoPixel SPI na SPI0: 4 LED, pořadí GRB, 6,4 MHz. Účet `nexusstat` nebyl ve skupinách `input` ani `spi`.
 - **Konfigurace** (v `/etc/nexusstat/config.toml` vedle `[oled]`; bez `device` se tlačítko nečte a na LED se nic nezapisuje):
@@ -536,6 +536,7 @@ cd / && PYTHONPATH=/tmp/nexusstat-m7s10/src python3 -B -m nexusstat.rgb_device -
 
   Ukáže zhasnuto, tlumenou bílou, oranžovou, červenou, syntetický kód WARNING 2× a CRITICAL a LED zhasne. Jen syntetické vzory, žádná skutečná závada.
 - **Aktivace:** `src/` z commitu M7-S10 s ověřením SHA-256, `30-button-rgb.conf`, `config.toml` s `[button]` a `[rgb]`, `daemon-reload` a restart jen `nexusstat.service`. Journal má ukázat `Tlačítko: … výhradně převzaté.` a `RGB: LED inicializované.`. Krátký stisk probudí OLED a při zdravém stavu rozsvítí LED tlumeně bíle, další otevře STATUS; uspání OLED bílou zhasne. Dlouhé stisky se nezkouší.
+- **Ověřeno (2026-11-21, jeden řízený průchod skriptem správce):** předem Pironman `inactive`/`disabled` bez procesu, LED ani tlačítko nedržel žádný proces, logind tlačítko nesledoval a SHA-256 jednotky, drop-inů, konfigurace, zálohy `src-d3e07fc.tar` i zdrojů 7ad340b souhlasily. Zkouška LED pod `mirek` bez sudo: tlumená bílá, oranžová, červená, oranžový kód 2× s pauzou, rychlé červené CRITICAL, všechny čtyři LED stejně a na konci zhasnuté (fyzicky potvrdil správce). Po aktivaci journal `Tlačítko: … výhradně převzaté.`, `OLED: displej inicializován.`, `RGB: LED inicializované.`, žádná chyba; `/dev/i2c-1`, `/dev/spidev0.0` a `/dev/input/event5` drží jen proces služby (`nexusstat`), systemd přijal `DeviceAllow` přes stálou cestu `by-path`. Krátký stisk probudil OLED a rozsvítil LED tlumeně bíle, druhý otevřel STATUS, po 30 s se vrátil kolotoč a po 300 s zhasl OLED i LED současně; záložní `SIGUSR1` OLED i bílou znovu rozsvítil. Služba 0 restartů, 0 varování, web z LAN 200 se záhlavím `NexusSTAT OK`, historie pokračuje během 4, GPIO6 drží hog, throttling `0x0`.
 - **Rollback (tlačítko a RGB vypnout, OLED a monitoring dál):**
 
 ```bash
@@ -553,6 +554,7 @@ Zatím nevypínat. Používá ji jen Pironman (od M7-S2 vypnutý, do databáze u
 
 ### Co zbývá pro OLED, RGB a tlačítko
 
+- **Převzetí hardwaru Pironmanu 5 je dokončené (M7-S10, 2026-11-21):** chlazení (gpio-hog), monitoring, OLED, tlačítko a RGB běží bez Pironmanu; Pironman zůstává nainstalovaný jen kvůli rollbacku.
 - **OLED:** ovladač běží ve službě od M7-S9 (2026-11-21, viz OLED na Nexusu); probouzí ho tlačítko (M7-S10), záložně `SIGUSR1`.
 - **Tlačítko:** krátký stisk hotový (M7-S10, `button.py`, viz Tlačítko a RGB na Nexusu); dlouhý stisk (řízené vypnutí) jen po samostatném rozhodnutí, 10s gesto reboot se neimplementuje.
 - **RGB:** hotové (M7-S10, `rgb_device.py`): malý ovladač nad spidev (`/dev/spidev0.0`, 4 LED GRB), vlákno přehrávání, zhasnutí při startu a ukončení.
