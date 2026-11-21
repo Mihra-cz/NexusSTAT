@@ -7,8 +7,8 @@ o závažnosti dál rozhodují kolektory, AlarmEvaluator a effective(). Pravidla
 jsou v docs/REQUIREMENTS.md (RGB LED a potvrzování závad).
 
 Čas je monotónní `now` jako v oled.py, takže testy na bliknutí nečekají.
-Hardwarový ovladač zatím neexistuje; potvrzení a jas trvale ukládá
-user_state.py (M6-4A).
+Na skutečné LED signál přehrává rgb_device.py (M7-S10); potvrzení a jas
+trvale ukládá user_state.py (M6-4A).
 """
 
 from dataclasses import dataclass
@@ -329,8 +329,8 @@ class RgbLeds:
     """
 
     def __init__(self, alarms_config=None, brightness=BRIGHTNESS_DEFAULT, acks=None):
-        # Budoucí ovladač dostane potvrzení vlastníka (user_state.UserState.acks),
-        # simulátor si drží vlastní jen v paměti.
+        # Výstup na LED (rgb_device.RgbOutput) dostane potvrzení vlastníka
+        # (user_state.UserState.acks), simulátor si drží vlastní jen v paměti.
         self.acks = Acknowledgements(alarms_config) if acks is None else acks
         self.brightness = check_brightness(brightness)
         self.replay = False

@@ -30,8 +30,10 @@ podepsaný odchozí HTTPS heartbeat jen s celkovým stavem a časem (heartbeat.p
 Bez sekce [history] (výchozí stav) nic nezapisuje, neotevírá port, nepřistupuje
 k displeji, mountům NAS ani jinému hardwaru a do sítě posílá jen zapnuté kontroly AnimeDB a NAS.
 S [oled] device (M7-S9, výchozí bez něj) kreslí tytéž výsledky na skutečný OLED
-SSD1306 přes I²C (oled_device.py); displej spí do krátkého stisku, který zatím
-zastupuje signál SIGUSR1. Se zapnutou historií
+SSD1306 přes I²C (oled_device.py); displej spí do krátkého stisku fyzického
+tlačítka ([button] device, M7-S10, button.py) nebo záložního signálu SIGUSR1.
+S [rgb] device (M7-S10) ukazují tytéž výsledky a stav OLED i čtyři LED WS2812
+na SPI (rgb_device.py, pravidla rgb.py). Se zapnutou historií
 ([history] enabled = true s výslovnou cestou) předává vyhodnocené výsledky
 vláknu zapisovače SQLite; samo měření zůstává read-only a chyba historie ho
 nezastaví (history_link.py).
@@ -62,6 +64,7 @@ from .history_link import open_history
 from .mounts import RootMountMonitor
 from .nas_monitor import NasMonitor
 from .network_monitor import NetworkMonitor
+from .rgb import BRIGHTNESS_DEFAULT
 from .root_device import identify_root_device
 from .system_monitor import CPU_TEMP_ID, CPU_USAGE_ID, DISK_ROOT_ID, MEMORY_ID, SystemMonitor
 from .user_state import UserState
@@ -382,7 +385,7 @@ def history_results(monitor, results, now, observed_utc, validity_seconds):
 
 def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now, sleep=time.sleep,
              output=print_now, history_link=None, stopper=None, tick_seconds=None, board=None, user_state=None,
-             heartbeat=None, display=None):
+             heartbeat=None, display=None, leds=None):
     """Hlavní smyčka měření. Běží do Ctrl+C nebo SIGTERM a vrací poslední výsledky.
 
     `config` je CollectorConfig, `evaluator` AlarmEvaluator s pravidly [alarms].
@@ -407,6 +410,8 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
     složí veřejný stav z týchž výsledků a předá ho vláknu přenosu, nic nečeká.
     `display` (oled_device.OledDisplay, M7-S9) z týchž výsledků v každém taktu
     vykreslí obraz OLED a předá ho vláknu zápisu; sám nic neměří a na I²C nečeká.
+    `leds` (rgb_device.RgbOutput, M7-S10) z týchž výsledků a téhož stavu OLED
+    rozhodne signál LED a předá ho vláknu přehrávání; na SPI nečeká.
     """
     interval = config.interval_seconds
     tick = interval if tick_seconds is None else tick_seconds
@@ -479,6 +484,11 @@ def run_loop(monitor, config, evaluator, clock=time.monotonic, utc_clock=utc_now
                 board.publish(results, now, observed_utc)
             if display is not None:
                 display.tick(results, now, observed_utc)
+            if leds is not None:
+                # Stav OLED po tomto taktu: LED a displej se tak nikdy nerozcházejí.
+                leds.tick(results, now, awake=display is not None and display.awake,
+                          woke=display is not None and display.woke,
+                          brightness=BRIGHTNESS_DEFAULT if user_state is None else user_state.brightness)
             measurements += 1
             current = significant(results, now)
             if text is not None or current != printed or now >= next_summary:
@@ -554,14 +564,48 @@ def start_display(config, monitor, output=print_now):
     display = OledDisplay(config.oled, monitor.labels, config.collector.validity_seconds, identify_root_device(),
                           output=output)
     output(f"OLED: SSD1306 na {config.oled.device}, adresa 0x{config.oled.address:02X}; spí do krátkého stisku, "
-           "do obsluhy tlačítka ho zastupuje SIGUSR1 (systemctl kill -s USR1 nexusstat.service).")
+           "záložně SIGUSR1 (systemctl kill -s USR1 nexusstat.service).")
     return display
+
+
+def start_button(config, display, output=print_now):
+    """Fyzické tlačítko podle [button] device (M7-S10); bez něj None.
+
+    Krátký stisk jde do OLED stejnou cestou jako SIGUSR1 (`display.wake`).
+    Chybějící zařízení ani oprávnění měření nezastaví (button.PowerButton).
+    """
+    if config.button.device is None:
+        return None
+    if display is None:
+        output("Tlačítko: OLED neběží, tlačítko se nečte; měření pokračuje.")
+        return None
+    from .button import SHORT_PRESS_SECONDS, PowerButton
+
+    output(f"Tlačítko: {config.button.device}; krátký stisk (puštění do {SHORT_PRESS_SECONDS:g} s) "
+           "ovládá OLED, podržení nic nedělá.")
+    return PowerButton(config.button.device, display.wake, output=output)
+
+
+def start_leds(config, user_state, output=print_now):
+    """Čtyři LED WS2812 podle [rgb] device (M7-S10); bez něj None.
+
+    Potvrzení závad zůstávají u vlastníka (`user_state.acks`), jas také; chyby
+    SPI řeší až vlákno přehrávání (rgb_device.RgbOutput).
+    """
+    if config.rgb.device is None:
+        return None
+    from .rgb_device import RgbOutput
+
+    output(f"RGB: 4 × WS2812 na {config.rgb.device}, jas {user_state.brightness} %; signál podle rgb.py "
+           "ze stejných výsledků a stavu OLED.")
+    return RgbOutput(config.rgb, config.alarms, user_state.acks, output=output)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Pravidelné read-only měření systému a sítě NexusSTAT")
     parser.add_argument("--config", type=Path,
-                        help="TOML se sekcemi [collector], [network], [alarms], [oled], [history] a [services]")
+                        help="TOML se sekcemi [collector], [network], [alarms], [oled], [button], [rgb], "
+                             "[history] a [services]")
     parser.add_argument("--web", action="store_true",
                         help=f"lokální web jen pro čtení (výchozí jen http://{LOOPBACK}:PORT/ z tohoto počítače)")
     parser.add_argument("--web-port", type=int, default=DEFAULT_PORT, metavar="PORT",
@@ -621,7 +665,7 @@ def main(argv=None):
         print_now(f"Web: {scheme}://{access.bind}:{server.server_address[1]}/ jen pro čtení, {clients}; "
                   f"ukazuje výsledky této smyčky, sám nic neměří{admin_note}.")
     stopper = Stopper()
-    link = user_state = heartbeat = display = previous_wake = None
+    link = user_state = heartbeat = display = button = leds = previous_wake = None
     try:
         stopper.install()
         link = start_history(config)
@@ -647,12 +691,14 @@ def main(argv=None):
                       "první za 60 s, pak po 300 s bez opakování; podpis HMAC-SHA256.")
         display = start_display(config, monitor)
         if display is not None and threading.current_thread() is threading.main_thread():
-            # Krátký stisk bez tlačítka (M7-S9); obsluha jen nastaví příznak pro příští takt.
+            # Záložní krátký stisk (M7-S9); obsluha jen nastaví příznak pro příští takt.
             previous_wake = signal.signal(signal.SIGUSR1, lambda number, frame: display.wake())
+        button = start_button(config, display)
+        leds = start_leds(config, user_state)
         print_now(live_note())
         run_loop(monitor, config.collector, AlarmEvaluator(config.alarms),
                  history_link=link, stopper=stopper, tick_seconds=LIVE_TICK_SECONDS, board=board,
-                 user_state=user_state, heartbeat=heartbeat, display=display)
+                 user_state=user_state, heartbeat=heartbeat, display=display, leds=leds)
     except KeyboardInterrupt:
         # Signál mimo smyčku (např. během spouštění historie): ukončení je
         # řízené i tady, jen bez řádku o počtu měření.
@@ -665,8 +711,12 @@ def main(argv=None):
             stop_web(server)
         if heartbeat is not None:
             heartbeat.close()
+        if button is not None:
+            button.close()  # žádné další stisky; zařízení se uvolní
         if display is not None:
             display.close()  # displej zhasne; na zaseknuté I²C se nečeká déle než 2 s
+        if leds is not None:
+            leds.close()  # LED zhasnou; na zaseknuté SPI se nečeká déle než 2 s
         if previous_wake is not None:
             signal.signal(signal.SIGUSR1, previous_wake)
         if user_state is not None:

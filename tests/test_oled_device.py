@@ -261,6 +261,28 @@ class OledDisplayTest(unittest.TestCase):
         display.tick(results, START + 1, OBSERVED)
         self.assertIs(display.controller.mode, Mode.STATUS)
 
+    def test_awake_and_woke_follow_the_controller(self):
+        # RGB (M7-S10) bere stav OLED z těchto dvou údajů po každém taktu.
+        display = self.display()
+        display.tick(measured(), START, OBSERVED)
+        self.assertEqual((display.awake, display.woke), (False, False))
+        display.wake()
+        display.tick(measured(), START + 1, OBSERVED)
+        self.assertEqual((display.awake, display.woke), (True, True))
+        display.tick(measured(START + 2), START + 2, OBSERVED)
+        self.assertEqual((display.awake, display.woke), (True, False))
+        display.wake()  # stisk v kolotoči otevře STATUS, neprobouzí
+        display.tick(measured(START + 3), START + 3, OBSERVED)
+        self.assertEqual((display.controller.mode, display.woke), (Mode.STATUS, False))
+        display.tick(measured(START + 400), START + 400, OBSERVED)
+        self.assertEqual((display.awake, display.woke), (False, False))
+        display.wake()
+        display.tick(measured(START + 401), START + 401, OBSERVED)
+        self.assertEqual((display.awake, display.woke), (True, True))
+        display.wake()  # stisk po uplynutí okna bez taktu mezi: automat by ještě ukazoval CAROUSEL
+        display.tick(measured(START + 1000), START + 1000, OBSERVED)
+        self.assertEqual((display.awake, display.woke), (True, True))
+
     def test_unchanged_frame_is_not_rewritten(self):
         display = self.display()
         display.wake()

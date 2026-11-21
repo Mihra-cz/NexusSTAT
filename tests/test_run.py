@@ -18,6 +18,7 @@ from nexusstat.config import AlarmRule, AlarmsConfig, CollectorConfig, OledConfi
 from nexusstat.core import CheckResult, Measurement, State, active_problems, effective, overall_state
 from nexusstat.oled import UNKNOWN_SYMBOL, Mode, OledController, home_symbol
 from nexusstat.oled_text import page_rows
+from nexusstat.rgb import Acknowledgements
 from nexusstat.config import Config, HistoryConfig, NetworkConfig, SnapshotConfig
 from nexusstat.fan_monitor import LABELS as FAN_LABELS, FanMonitor
 from nexusstat.mounts import ROOT_MODE_ID, RootMountMonitor
@@ -975,6 +976,9 @@ class MainTest(unittest.TestCase):
             "neznámý klíč": "[collector]\nvalidity_seconds = 30\n",
             "neplatné OLED": "[oled]\npage_seconds = 0\n",
             "neplatné zařízení OLED": '[oled]\ndevice = "/dev/sda"\n',
+            "tlačítko bez OLED": '[button]\ndevice = "/dev/input/by-path/platform-pwr_button-event"\n',
+            "tlačítko jako eventN": '[oled]\ndevice = "/dev/i2c-1"\n[button]\ndevice = "/dev/input/event5"\n',
+            "neplatné zařízení RGB": '[rgb]\ndevice = "/dev/i2c-1"\n',
             "neznámá sekce": "[web]\nadmin_port = 8765\n",
             "neplatné rozhraní": '[network]\ninterface = "../eth0"\n',
             # Regrese: obří celé číslo shodilo main() tracebackem (OverflowError, kód 1).
@@ -1059,6 +1063,63 @@ class MainTest(unittest.TestCase):
         self.assertEqual(display.args[0].device, "/dev/i2c-1")
         self.assertEqual((display.woken, display.closed), (1, 1))
         self.assertEqual(signal.getsignal(signal.SIGUSR1), before)
+
+    def test_button_and_leds_are_off_without_devices(self):
+        run_loop_mock, _ = self.run_main([])
+        self.assertIsNone(run_loop_mock.call_args.kwargs["leds"])
+
+    def test_button_and_leds_start_with_devices_share_state_and_close(self):
+        class Fake:
+            def __init__(self, *args, **kwargs):
+                self.args, self.kwargs, self.woken, self.closed = args, kwargs, 0, 0
+
+            def wake(self):
+                self.woken += 1
+
+            def close(self):
+                self.closed += 1
+
+        created = {}
+
+        def factory(name):
+            def make(*args, **kwargs):
+                created[name] = Fake(*args, **kwargs)
+                return created[name]
+            return make
+
+        text = ('[oled]\ndevice = "/dev/i2c-1"\n[button]\ndevice = "/dev/input/by-path/platform-pwr_button-event"\n'
+                '[rgb]\ndevice = "/dev/spidev0.0"\n')
+        stdout = io.StringIO()
+        with mock.patch("nexusstat.oled_device.OledDisplay", side_effect=factory("display")), \
+                mock.patch("nexusstat.button.PowerButton", side_effect=factory("button")), \
+                mock.patch("nexusstat.rgb_device.RgbOutput", side_effect=factory("leds")), \
+                mock.patch("nexusstat.run.identify_root_device", return_value=None), \
+                mock.patch("nexusstat.run.run_loop") as run_loop_mock, \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(stdout):
+            main(["--config", self.write_config(text)])
+        display, button, leds = created["display"], created["button"], created["leds"]
+        self.assertIs(run_loop_mock.call_args.kwargs["display"], display)
+        self.assertIs(run_loop_mock.call_args.kwargs["leds"], leds)
+        # Tlačítko jde do OLED stejnou cestou jako SIGUSR1; LED dostanou potvrzení vlastníka stavu.
+        device, on_press = button.args
+        self.assertEqual(device, "/dev/input/by-path/platform-pwr_button-event")
+        on_press()
+        self.assertEqual(display.woken, 1)
+        rgb_config, alarms_config, acks = leds.args
+        self.assertEqual(rgb_config.device, "/dev/spidev0.0")
+        self.assertIsInstance(acks, Acknowledgements)
+        self.assertEqual((button.closed, display.closed, leds.closed), (1, 1, 1))
+        self.assertIn("Tlačítko: /dev/input/by-path/platform-pwr_button-event", stdout.getvalue())
+        self.assertIn("RGB: 4 × WS2812 na /dev/spidev0.0, jas 20 %", stdout.getvalue())
+
+    def test_button_is_not_read_when_oled_does_not_start(self):
+        text = '[oled]\ndevice = "/dev/i2c-1"\n[button]\ndevice = "/dev/input/by-path/platform-pwr_button-event"\n'
+        stdout = io.StringIO()
+        with mock.patch("nexusstat.run.start_display", return_value=None), \
+                mock.patch("nexusstat.button.PowerButton") as button, contextlib.redirect_stdout(stdout):
+            self.run_main(["--config", self.write_config(text)])
+        button.assert_not_called()
+        self.assertIn("Tlačítko: OLED neběží", stdout.getvalue())
 
     def test_signal_handlers_are_restored_after_the_loop(self):
         before = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}

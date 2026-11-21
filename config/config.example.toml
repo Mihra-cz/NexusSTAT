@@ -11,6 +11,15 @@ status_idle_seconds = 30  # celé sekundy 1–3600
 # device = "/dev/i2c-1"
 # address = 0x3C   # 0x3C nebo 0x3D
 
+[button]
+# Fyzické tlačítko Pironmanu 5 (M7-S10): krátký stisk ovládá OLED, jen s [oled] device.
+# Jen stálá cesta z udev, ne /dev/input/eventN; bez klíče device se tlačítko nečte.
+# device = "/dev/input/by-path/platform-pwr_button-event"
+
+[rgb]
+# Čtyři LED WS2812 na SPI (M7-S10); bez klíče device se na LED nic nezapisuje.
+# device = "/dev/spidev0.0"
+
 [collector]
 # Zápis do historie, její kontroly a plán snímků (výchozí 10 s; platnost jejich výsledků 3 × interval).
 # Živé měření má od SCHED-2 takt 1 s a pevné intervaly kolektorů (síť 1 s, CPU/RAM/teplota 5 s,

@@ -15,9 +15,11 @@ obraz a předá ho jedinému vláknu zápisu; na I²C nikdy nečeká. Vlákno za
 jen poslední obraz (starší se zahodí) a stejný obraz znovu nezapisuje. Chyba
 I²C nebo chybějící displej zařízení zavře a další pokus je nejdřív za
 RETRY_SECONDS; měření, web i historie běží dál. Displej spí, dokud ho nevzbudí
-krátký stisk (REQUIREMENTS, OLED body 1 a 9); do obsluhy tlačítka ho zastupuje
-signál SIGUSR1 (`systemctl kill -s USR1 nexusstat.service`). Při řízeném
-ukončení se displej vypne; po pádu procesu drží SSD1306 poslední obraz.
+krátký stisk (REQUIREMENTS, OLED body 1 a 9): fyzické tlačítko (button.py,
+M7-S10) nebo záložní signál SIGUSR1 (`systemctl kill -s USR1 nexusstat.service`).
+Po každém taktu `awake` a `woke` říkají RGB, zda OLED nespí a zda ho právě
+probudil stisk. Při řízeném ukončení se displej vypne; po pádu procesu drží
+SSD1306 poslední obraz.
 
 Krátká zkouška displeje mimo službu (jen když běžící služba displej neovládá):
   PYTHONPATH=src python3 -m nexusstat.oled_device [--device /dev/i2c-1] [--address 0x3C] [--seconds 3]
@@ -164,8 +166,8 @@ class Ssd1306:
 class OledDisplay:
     """Výstup měřicí smyčky na skutečný displej: automat a vykreslení v taktu, zápis ve vlákně.
 
-    `tick()` volá jen měřicí smyčka, `wake()` obsluha SIGUSR1 (krátký stisk bez
-    tlačítka), `close()` ukončení. `write_once()` je jeden krok vlákna zápisu;
+    `tick()` volá jen měřicí smyčka, `wake()` vlákno tlačítka nebo obsluha
+    SIGUSR1 (krátký stisk), `close()` ukončení. `write_once()` je jeden krok vlákna zápisu;
     testy ho volají přímo (bez vlákna) se simulovaným časem.
     """
 
@@ -193,6 +195,8 @@ class OledDisplay:
         self._failing = False
         self._render_failing = False
         self._woken = False
+        self.awake = False  # po taktu: OLED nespí (CAROUSEL nebo STATUS)
+        self.woke = False  # po taktu: tento takt OLED probudil stisk
         self.writes = self.failures = 0
         self._thread = None
         if start:
@@ -200,20 +204,26 @@ class OledDisplay:
             self._thread.start()
 
     def wake(self):
-        """Krátký stisk bez tlačítka (SIGUSR1); uplatní se v příštím taktu smyčky."""
+        """Krátký stisk (tlačítko nebo SIGUSR1); uplatní se v příštím taktu smyčky."""
         # Jen příznak: obsluha signálu nesmí sahat na automat uprostřed taktu.
         self._woken = True
 
     def tick(self, results, now, observed_utc):
         """Takt smyčky: výpis výsledku zápisu, probuzení, časovače automatu a obraz pro vlákno."""
         self._report()
+        self.woke = False
         try:
             # Služby se doplní jako na webu, takže displej i web ukazují tytéž stavy.
             shown = complete_service_results(results, observed_utc, now + self._validity_seconds,
                                              monitored=self._monitored)
             if self._woken:
                 self._woken = False
+                # Probouzecí stisk se pozná až po uplatnění časovačů: i stisk po
+                # uplynutí okna kolotoče probouzí (press() je uplatní stejně).
+                self.controller.update(now)
+                asleep = self.controller.mode is Mode.SLEEP
                 self.controller.press(now, len(active_problems(shown, now)))
+                self.woke = asleep and self.controller.mode is not Mode.SLEEP
             self.controller.update(now)
             frame = None
             if self.controller.mode is not Mode.SLEEP:
@@ -226,6 +236,7 @@ class OledDisplay:
                              "měření pokračuje.")
             self._render_failing = True
             frame = None  # raději zhasnout než ukazovat zastaralý obraz
+        self.awake = self.controller.mode is not Mode.SLEEP
         with self._cond:
             if frame != self._wanted:
                 self._wanted = frame

@@ -1,6 +1,6 @@
 """Načtení a validace konfiguračního TOML.
 
-Sekce [oled], [collector], [network], [alarms], [history] a [services].
+Sekce [oled], [button], [rgb], [collector], [network], [alarms], [history] a [services].
 """
 
 import ipaddress
@@ -20,6 +20,10 @@ DISPLAY_HEIGHT = 64
 # Řadič umí jen tyto dvě adresy; Pironman 5 má displej na 0x3C (ověřeno na Nexusu).
 OLED_DEVICE_PATTERN = re.compile(r"/dev/i2c-[0-9]{1,3}")
 OLED_ADDRESSES = (0x3C, 0x3D)
+# Tlačítko a RGB (M7-S10). Tlačítko jen stálou cestou z udev (by-path, by-id):
+# číslo /dev/input/eventN se mezi starty může změnit. RGB je zařízení spidev.
+BUTTON_DEVICE_PATTERN = re.compile(r"/dev/input/by-(path|id)/[A-Za-z0-9_:@-][A-Za-z0-9_.:@-]*")
+RGB_DEVICE_PATTERN = re.compile(r"/dev/spidev[0-9]{1,2}\.[0-9]{1,2}")
 
 # Horní mez chrání před překlepem (např. 3000 místo 300). OLED nemá svítit
 # hodiny a měření řidší než jednou za hodinu by diagnostice nic neřeklo.
@@ -54,6 +58,8 @@ KNOWN_OLED_KEYS = {
     "device",
     "address",
 }
+KNOWN_BUTTON_KEYS = {"device"}
+KNOWN_RGB_KEYS = {"device"}
 KNOWN_COLLECTOR_KEYS = {"interval_seconds"}
 KNOWN_NETWORK_KEYS = {"interface"}
 KNOWN_HISTORY_KEYS = {"enabled", "path", "snapshot"}
@@ -133,7 +139,8 @@ DEFAULT_CLEAR_COUNT = 2
 
 # Načítané sekce. Ostatní ([web], [storage], ...) jsou chyba,
 # dokud je kód skutečně nepoužívá, jinak by se tiše ignorovaly.
-KNOWN_SECTIONS = {"oled", "collector", "network", "alarms", "history", "services", "user_state", "heartbeat"}
+KNOWN_SECTIONS = {"oled", "button", "rgb", "collector", "network", "alarms", "history", "services", "user_state",
+                  "heartbeat"}
 
 # Role databáze historie v tomto kroku: jen vývojová databáze na notebooku.
 # Konfigurace roli nenastavuje, takže produkční databázi nelze zapnout omylem
@@ -213,6 +220,34 @@ class OledConfig:
         # bool je podtřída int, takže TOML `true` by jinak prošlo jako adresa 1.
         if isinstance(self.address, bool) or self.address not in OLED_ADDRESSES:
             raise ConfigError(f"address musí být 0x3C nebo 0x3D, ne {self.address!r}")
+
+
+@dataclass(frozen=True)
+class ButtonConfig:
+    """Fyzické tlačítko Pironmanu 5 (M7-S10, button.py); bez `device` (výchozí) se nečte.
+
+    Krátký stisk ovládá OLED stejně jako SIGUSR1, jiná funkce tlačítka není.
+    """
+
+    device: str | None = None
+
+    def __post_init__(self):
+        if self.device is not None and (not isinstance(self.device, str)
+                                        or not BUTTON_DEVICE_PATTERN.fullmatch(self.device)):
+            raise ConfigError("device musí být stálá cesta /dev/input/by-path/… nebo /dev/input/by-id/… "
+                              f"(ne /dev/input/eventN, číslo se může změnit), ne {self.device!r}")
+
+
+@dataclass(frozen=True)
+class RgbConfig:
+    """Čtyři LED WS2812 Pironmanu 5 na SPI (M7-S10, rgb_device.py); bez `device` (výchozí) se nezapisuje."""
+
+    device: str | None = None
+
+    def __post_init__(self):
+        if self.device is not None and (not isinstance(self.device, str)
+                                        or not RGB_DEVICE_PATTERN.fullmatch(self.device)):
+            raise ConfigError(f"device musí být zařízení SPI ve tvaru /dev/spidevB.C, ne {self.device!r}")
 
 
 @dataclass(frozen=True)
@@ -709,8 +744,14 @@ class Config:
     services: ServicesConfig = field(default_factory=ServicesConfig)
     user_state: UserStateConfig = field(default_factory=UserStateConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
+    # Na konci, aby zůstalo dosavadní pořadí polí (Config(oled, collector, …)).
+    button: ButtonConfig = field(default_factory=ButtonConfig)
+    rgb: RgbConfig = field(default_factory=RgbConfig)
 
     def __post_init__(self):
+        # Tlačítko má jedinou funkci, krátký stisk pro OLED; bez displeje by stisk nic nedělal.
+        if self.button.device is not None and self.oled.device is None:
+            raise ConfigError("[button] device ovládá jen OLED: bez [oled] device nemá funkci")
         # Vytížení CPU jde do historie jako měření za celé okno zápisu (SCHED-2).
         # Okno je přesné jen tehdy, když zápis padne do taktu s měřením CPU (po
         # 5 s): při 7 nebo 11 s by hodnota s časem zápisu pokrývala jiný úsek
@@ -731,6 +772,16 @@ def oled_config_from_dict(section):
 
     keys = ("carousel_seconds", "page_seconds", "status_idle_seconds", "device", "address")
     return OledConfig(**{key: section[key] for key in keys if key in section})
+
+
+def button_config_from_dict(section):
+    _check_section("button", section, KNOWN_BUTTON_KEYS)
+    return ButtonConfig(**section)
+
+
+def rgb_config_from_dict(section):
+    _check_section("rgb", section, KNOWN_RGB_KEYS)
+    return RgbConfig(**section)
 
 
 def collector_config_from_dict(section):
@@ -825,6 +876,8 @@ def load_config(path):
         raise ConfigError(f"nepodporované sekce (zatím neimplementováno): {', '.join(sorted(unknown))}")
     return Config(
         oled=oled_config_from_dict(data.get("oled", {})),
+        button=button_config_from_dict(data.get("button", {})),
+        rgb=rgb_config_from_dict(data.get("rgb", {})),
         collector=collector_config_from_dict(data.get("collector", {})),
         alarms=alarms_config_from_dict(data.get("alarms", {})),
         network=network_config_from_dict(data.get("network", {})),
